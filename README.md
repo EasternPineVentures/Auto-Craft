@@ -277,6 +277,13 @@ python -m autocraft input-test --action key-tap --key w --hold 0.05 --yes
    command exits non-zero. Re-running is harmless.
 5. Press `F8` at any time to abort and release everything.
 
+**Expect exactly one brief input and then nothing.** `input-test` sends a single
+bounded action and exits; it is a smoke test that proves the actuator reaches
+the game, not a controller. `--hold 0.05` is a 50 ms tap, so the character takes
+one short step. To see something more legible, lengthen the hold — `--hold 1.0`
+walks for a full second (holds are clamped to `max_key_hold_seconds`, 2.0 by
+default). Re-run the command as many times as you like; each run is one action.
+
 The countdown is 10 seconds by default. If that is tight on a first run, allow
 more time with `--focus-delay 20`, or pass `--focus-delay 0` to skip the wait
 entirely once you know the game already has focus.
@@ -536,19 +543,23 @@ noticed between steps, so a step that blocks inside the capture or input backend
 delays the response. A guaranteed asynchronous kill switch needs extra OS work
 (a low-level keyboard hook, or a watchdog process) and is not implemented.
 
-**Input injection has not been exercised against the game.** See the Tests
-section: nothing in the test suite sends real input, and `input-test` refuses to
-run without an explicit `--yes`. The SendInput path is therefore verified by
-construction and by unit tests against a fake backend, not by having actually
-moved a character.
+**Input injection is verified on one machine, by one bounded action.** The test
+suite still never sends real input — the `SendInput` path is covered by unit
+tests against a fake backend — so the live evidence is a manual smoke test, not
+an automated one. That smoke test has now passed: `input-test` moved a character
+in Luanti 5.17.0, reporting `executed: true` and `duration: 0.051s` for
+`--hold 0.05`, with `released inputs: none` and exit code `0`.
 
-The read-only half of that boundary *has* been exercised against a live Luanti
-5.17.0 window: window discovery, client-area geometry, `capture`, and the
-foreground and minimised checks all behave as documented. The first live
-`input-test` attempt refused at the post-countdown focus check because the
-launching shell still held focus when the handoff elapsed. The refusal worked
-exactly as intended, which is why the default countdown is now 10 seconds and
-`--focus-delay` exists.
+The read-only half of the boundary was exercised first, against the same live
+window: window discovery, client-area geometry, `capture`, and the foreground
+and minimised checks all behave as documented. An earlier `input-test` attempt
+refused at the post-countdown focus check because the launching shell still held
+focus when the handoff elapsed. The refusal worked exactly as intended, which is
+why the default countdown is now 10 seconds and `--focus-delay` exists.
+
+What is *not* verified: only the keyboard path has been sent to the game, not
+the mouse path; and no sustained or repeated input has been exercised, because
+`input-test` sends exactly one bounded action by design.
 
 ---
 
