@@ -475,7 +475,7 @@ class TestInputTestFocusOrdering:
         )
 
         assert _run_input_test("--yes") == 1
-        assert "not the foreground window" in capsys.readouterr().out
+        assert "not the foreground window" in capsys.readouterr().err
         assert harness.guard.authorize_calls, "the guard must be consulted before injecting"
         assert harness.executor.actions == []
 
@@ -558,6 +558,9 @@ class TestInputTestFocusOrdering:
         harness = _install_smoke_harness(
             monkeypatch, tmp_path, [_focused_status(), _focused_status()]
         )
+        # A real countdown must exist for the interrupt to land inside it; the
+        # harness otherwise zeroes the handoff, which skips the wait entirely.
+        monkeypatch.setattr(cli, "FOCUS_HANDOFF_SECONDS", 5.0)
 
         def interrupted(seconds: float) -> None:
             raise KeyboardInterrupt
@@ -586,6 +589,116 @@ class TestInputTestFocusOrdering:
 
         assert _run_input_test() == 3
         assert "refusing to send input without --yes" in capsys.readouterr().out
+
+
+class TestFocusDelay:
+    """The handoff window is operator-tunable, but never unbounded or malformed."""
+
+    def test_focus_delay_overrides_the_configured_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        sleeps: list[float] = []
+        _install_smoke_harness(
+            monkeypatch, tmp_path, [_focused_status(), _focused_status()]
+        )
+        monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+
+        assert _run_input_test("--yes", "--focus-delay", "2.5") == 0
+
+        assert sleeps == [2.5]
+        assert "sending in 2.5s" in capsys.readouterr().out
+
+    def test_the_configured_default_is_used_without_the_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        sleeps: list[float] = []
+        _install_smoke_harness(
+            monkeypatch, tmp_path, [_focused_status(), _focused_status()]
+        )
+        monkeypatch.setattr(cli, "FOCUS_HANDOFF_SECONDS", 3.0)
+        monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+
+        assert _run_input_test("--yes") == 0
+
+        assert sleeps == [3.0]
+        assert "sending in 3s" in capsys.readouterr().out
+
+    def test_a_zero_focus_delay_skips_the_wait_entirely(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        sleeps: list[float] = []
+        _install_smoke_harness(
+            monkeypatch, tmp_path, [_focused_status(), _focused_status()]
+        )
+        monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+
+        assert _run_input_test("--yes", "--focus-delay", "0") == 0
+
+        assert sleeps == []
+
+    @pytest.mark.parametrize("value", ["-1", "nan", "inf", "-0.5"])
+    def test_a_malformed_focus_delay_is_a_usage_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys, value: str
+    ) -> None:
+        # Rejected before the window layer is consulted at all: the operator
+        # asked for something impossible, so the message must not depend on
+        # whatever the desktop happens to look like right now.
+        harness = _install_smoke_harness(
+            monkeypatch, tmp_path, [_focused_status(), _focused_status()]
+        )
+
+        assert _run_input_test("--yes", "--focus-delay", value) == 2
+
+        captured = capsys.readouterr()
+        assert "invalid --focus-delay" in captured.err
+        assert "nothing was sent" not in captured.out
+        assert harness.locator.status_calls == []
+        assert harness.executor.actions == []
+        assert harness.guard.authorize_calls == []
+
+    def test_the_default_is_used_when_the_flag_is_absent(self) -> None:
+        parser = cli.build_parser()
+        assert parser.parse_args(["input-test"]).focus_delay is None
+        assert parser.parse_args(["input-test", "--focus-delay", "20"]).focus_delay == 20.0
+
+
+class TestRerunHint:
+    """The suggested re-run must be copy-pasteable and faithful to the flags."""
+
+    def _hint(self, *argv: str) -> str:
+        parser = cli.build_parser()
+        return cli._rerun_hint(parser.parse_args(["input-test", *argv]))
+
+    def test_key_hint_echoes_the_key_and_hold(self) -> None:
+        hint = self._hint("--action", "key-tap", "--key", "w", "--hold", "0.05")
+        assert hint == "autocraft input-test --action key-tap --key w --hold 0.05 --yes"
+
+    def test_mouse_hint_echoes_the_delta(self) -> None:
+        hint = self._hint("--action", "mouse-move", "--dx", "10", "--dy", "-5")
+        assert hint == "autocraft input-test --action mouse-move --dx 10 --dy -5 --yes"
+
+    def test_the_hint_includes_an_explicit_focus_delay(self) -> None:
+        hint = self._hint("--focus-delay", "20")
+        assert "--focus-delay 20" in hint
+        assert hint.endswith("--yes")
+
+    def test_the_hint_omits_the_focus_delay_when_it_was_not_set(self) -> None:
+        assert "--focus-delay" not in self._hint()
+
+    def test_the_dry_run_prints_the_exact_hint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        _install_smoke_harness(
+            monkeypatch, tmp_path, [_focused_status(), _focused_status()]
+        )
+
+        assert _run_input_test("--action", "key-tap", "--key", "w", "--hold", "0.05") == 3
+
+        captured = capsys.readouterr()
+        assert "refusing to send input without --yes" in captured.out
+        assert (
+            "autocraft input-test --action key-tap --key w --hold 0.05 --yes" in captured.out
+        )
 
 
 class TestParserSurface:

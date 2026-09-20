@@ -233,7 +233,7 @@ Touching the game is always explicit.
 | `capture` | no | Saves exactly one client-area frame. Prints the path and dimensions. |
 | `observe` | no | Observes for a bounded time. Reports frames captured, achieved FPS, dropped/failed frames, and focus state. |
 | `loop` | no | Runs the bounded agent loop with the no-op policy. |
-| `input-test` | **yes** | Explicit smoke test. Prints the bounded action, requires `--yes`, gives you a few seconds to focus the game, re-verifies that exact window is foreground, sends one tiny bounded action and then releases everything. |
+| `input-test` | **yes** | Explicit smoke test. Prints the bounded action, requires `--yes`, gives you 10 seconds (`--focus-delay`) to focus the game, re-verifies that exact window is foreground, sends one tiny bounded action and then releases everything. |
 | `keys` | no | Lists every supported key name. |
 | `config` | no | Prints the effective configuration and where it came from. |
 | `observer` | no | Serves the local read-only observer page. Never enables control. |
@@ -255,6 +255,35 @@ is no "run forever" option, by design.
 it starts the page and publishes that run's state to it. It does not change
 what the command does, and it never enables input. If the port is already
 busy, the run continues and the page is simply unavailable.
+
+### The first input smoke test
+
+This is the only command that touches the game, and the only one where the
+order of operations matters:
+
+```powershell
+python -m autocraft input-test --action key-tap --key w --hold 0.05 --yes
+```
+
+1. Run it from a shell in this repository, with the game already running.
+2. It prints exactly what it intends to send, and refuses outright if the
+   target window is missing or minimised.
+3. It then starts a countdown. **Click into the game during the countdown.**
+   The shell is the foreground window when you launch the command — that is
+   expected, and it is exactly why the foreground check happens *after* the
+   handoff rather than before it.
+4. Immediately before sending, it re-queries the window and requires that
+   exact window to be foreground. If focus is wrong, nothing is sent and the
+   command exits non-zero. Re-running is harmless.
+5. Press `F8` at any time to abort and release everything.
+
+The countdown is 10 seconds by default. If that is tight on a first run, allow
+more time with `--focus-delay 20`, or pass `--focus-delay 0` to skip the wait
+entirely once you know the game already has focus.
+
+Leaving off `--yes` is a safe dry run: it prints the action, prints the exact
+command to repeat it for real, and exits with code `3` without ever
+constructing any injection machinery.
 
 ---
 
@@ -395,7 +424,7 @@ requires an explicit `--yes`, states clearly what it is about to do, sends
 exactly one small action, releases it, and exits. It checks foreground in the
 only order that works from a shell: locate and vet the target, print the bounded
 action, demand `--yes` *before* any injection machinery is constructed, and only
-then start a short countdown for you to focus the game. After the countdown it
+then start a countdown for you to focus the game. After the countdown it
 re-queries the window and refuses unless that exact window is foreground; the
 guard then re-checks foreground again inside the actuator call itself, so focus
 moving in between is still caught. Every refusal path injects nothing and every
@@ -442,6 +471,12 @@ covered:
   the post-countdown re-query refuses on lost focus, a vanished target, a
   newly-minimised target, or a changed window handle — with zero input sent
   on every refusal path
+- the focus handoff itself: the configured default applies when no flag is
+  given, `--focus-delay` overrides it, `0` skips the wait, and a negative,
+  `nan` or `inf` delay is a usage error rejected before the window layer is
+  consulted
+- the re-run hint: the command `input-test` prints back is built from the
+  operator's own flags, so it cannot drift from what they asked for
 - the capture-rate warning
 - the display contract: exact snapshot keys, strict-JSON round-trip, frame
   downscaling and JPEG encoding
@@ -455,7 +490,7 @@ covered:
 - the memory-honesty property: no thought may reference a memory that is not
   in its context
 
-The suite is 515 tests and runs in about 20 seconds. Everything that talks to
+The suite is 528 tests and runs in about 20 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -506,6 +541,14 @@ section: nothing in the test suite sends real input, and `input-test` refuses to
 run without an explicit `--yes`. The SendInput path is therefore verified by
 construction and by unit tests against a fake backend, not by having actually
 moved a character.
+
+The read-only half of that boundary *has* been exercised against a live Luanti
+5.17.0 window: window discovery, client-area geometry, `capture`, and the
+foreground and minimised checks all behave as documented. The first live
+`input-test` attempt refused at the post-countdown focus check because the
+launching shell still held focus when the handoff elapsed. The refusal worked
+exactly as intended, which is why the default countdown is now 10 seconds and
+`--focus-delay` exists.
 
 ---
 

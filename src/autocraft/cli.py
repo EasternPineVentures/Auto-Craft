@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -132,6 +133,63 @@ def _print_table(rows: Sequence[tuple[str, Any]]) -> None:
         print(f"  {label.ljust(width)} : {value}")
 
 
+#: Remaining seconds below which the countdown stops ticking. Guards against a
+#: final epsilon tick from float subtraction.
+_COUNTDOWN_EPSILON = 1e-6
+
+
+def _is_interactive(stream: Any) -> bool:
+    """Whether ``stream`` is a terminal, tolerating streams that cannot say."""
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _focus_countdown(seconds: float, *, stream: Any) -> None:
+    """Wait out the focus handoff, counting down when attached to a terminal.
+
+    A silent wait is indistinguishable from a hang, and the operator is looking
+    at the game window rather than the shell, so they need to see that the
+    command is still alive and how long is left. Off a terminal (pipes,
+    redirected logs, the test suite) this degrades to one plain sleep so no
+    carriage-return noise ends up in captured output.
+    """
+    if seconds <= 0:
+        return
+    if not _is_interactive(stream):
+        stream.write(f"  sending in {seconds:g}s...\n")
+        stream.flush()
+        time.sleep(seconds)
+        return
+    remaining = seconds
+    while remaining > _COUNTDOWN_EPSILON:
+        stream.write(f"\r  sending in {remaining:>4.1f}s...   ")
+        stream.flush()
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
+    stream.write("\r" + " " * 32 + "\r")
+    stream.flush()
+
+
+def _rerun_hint(args: argparse.Namespace) -> str:
+    """The exact ``input-test`` invocation that repeats this run for real.
+
+    Echoing the operator's own flags back means the suggested command is
+    copy-pasteable and cannot drift from what they actually asked for.
+    """
+    parts = ["autocraft", "input-test", "--action", args.action]
+    if args.action == "key-tap":
+        parts += ["--key", args.key, "--hold", f"{args.hold:g}"]
+    else:
+        parts += ["--dx", str(args.dx), "--dy", str(args.dy)]
+    if args.focus_delay is not None:
+        parts += ["--focus-delay", f"{args.focus_delay:g}"]
+    parts.append("--yes")
+    return " ".join(parts)
+
+
 def _status_lines(status: TargetStatus) -> list[tuple[str, Any]]:
     window = status.window
     region = window.region if window is not None else None
@@ -195,6 +253,20 @@ def cmd_status(args: argparse.Namespace) -> int:
                 )
         else:
             print("All matching windows: none")
+        print()
+        print("Verdict")
+        if not status.found:
+            print("  not ready - no window matched the title patterns above.")
+            print("  start the game, or adjust target_title_patterns in the config.")
+        elif status.window is not None and status.window.minimized:
+            print("  not ready - the target window is minimized; restore it first.")
+        else:
+            print("  ready - the game window was found and can be captured.")
+            if not status.is_foreground:
+                print("  note - 'input allowed: no' is expected here: this terminal has focus,")
+                print("         and the foreground lock only permits input while the game is")
+                print("         focused. input-test gives you a countdown to switch to it.")
+            print("  next - autocraft input-test --action key-tap --key w --hold 0.05 --yes")
         return 0 if status.found else 1
     finally:
         runtime.close()
@@ -516,10 +588,12 @@ def cmd_observe(args: argparse.Namespace) -> int:
 
 
 #: Seconds the operator gets to bring the game window forward in ``input-test``.
-#: Long enough to alt-tab comfortably, short enough that the operator is not
-#: left wondering whether the command has hung. Overridable so tests need no
-#: real delay.
-FOCUS_HANDOFF_SECONDS = 5.0
+#: A first run is awkward: the operator has to read the message, find the game
+#: window and click into it, all while the shell that launched the command is
+#: covering it. Ten seconds is comfortable for that without leaving the operator
+#: wondering whether the command has hung. Overridable with ``--focus-delay``,
+#: and patched to zero by the tests so no real delay is needed.
+FOCUS_HANDOFF_SECONDS = 10.0
 
 
 def _confirm_target_focus(locator: WindowLocator, *, expected_handle: int) -> tuple[bool, str]:
@@ -557,6 +631,16 @@ def cmd_input_test(args: argparse.Namespace) -> int:
     window to focus the game. Focus is re-checked after that handoff, and the
     guard independently re-checks it again inside the actuator call.
     """
+    # Argument validation comes first so a malformed handoff window is reported
+    # as a usage error regardless of what the window layer currently reports.
+    handoff = FOCUS_HANDOFF_SECONDS if args.focus_delay is None else args.focus_delay
+    if not math.isfinite(handoff) or handoff < 0:
+        print(
+            f"invalid --focus-delay {args.focus_delay!r}: expected a non-negative number of seconds",
+            file=sys.stderr,
+        )
+        return 2
+
     config, source = _load(args)
     config.ensure_directories()
     runtime = _build_runtime(config, config_source=source)
@@ -578,15 +662,30 @@ def cmd_input_test(args: argparse.Namespace) -> int:
         target_handle = status.window.handle
 
         print("INPUT SMOKE TEST")
-        print(f"  target    : {target_title!r} (0x{target_handle:X})")
-        print(f"  action    : {action.describe()}")
-        print(f"  press {config.emergency_stop_key.upper()} at any time to abort and release everything")
+        print()
         print("  this is the only AutoCraft command that sends input to the game")
+        print(f"  press {config.emergency_stop_key.upper()} at any time to abort and release everything")
+        print()
+        _print_table(
+            [
+                (
+                    "mode",
+                    "LIVE - one input action will be sent"
+                    if args.yes
+                    else "DRY RUN - nothing will be sent",
+                ),
+                ("target", repr(target_title)),
+                ("handle", f"0x{target_handle:X}"),
+                ("action", action.describe()),
+            ]
+        )
 
         if not args.yes:
             print()
             print("refusing to send input without --yes; nothing was sent")
-            print(f"re-run as: autocraft input-test --action {args.action} --yes")
+            print("to send it for real, re-run with --yes:")
+            print()
+            print(f"    {_rerun_hint(args)}")
             return 3
 
         guard = _build_guard(config, runtime.locator)
@@ -606,15 +705,21 @@ def cmd_input_test(args: argparse.Namespace) -> int:
             guard.release_all("input-test start")
 
             print()
-            print(f"  focus {target_title!r} now - sending in {FOCUS_HANDOFF_SECONDS:g}s")
-            print(f"  run id    : {recorder.run_id}")
-            time.sleep(FOCUS_HANDOFF_SECONDS)
+            _print_table([("run id", recorder.run_id)])
+            print()
+            print("  Focus the game window now.")
+            print("  It is checked again immediately before anything is sent.")
+            _focus_countdown(handoff, stream=sys.stdout)
 
             ready, refusal = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
             if not ready:
                 result_dict["blocked_reason"] = refusal
+                print()
+                sys.stdout.flush()
                 print(f"  refused: {refusal}", file=sys.stderr)
                 print("  nothing was sent", file=sys.stderr)
+                print(f"  hint: click into {target_title!r} during the countdown,", file=sys.stderr)
+                print("        or allow more time with --focus-delay 20", file=sys.stderr)
                 exit_code = 1
             else:
                 # Deliberate defence in depth, not duplicated bookkeeping: the
@@ -624,20 +729,33 @@ def cmd_input_test(args: argparse.Namespace) -> int:
                 decision = guard.authorize(action.describe())
                 if not decision.allowed:
                     result_dict["blocked_reason"] = decision.reason
-                    print(f"  blocked: {decision.reason}")
+                    print()
+                    sys.stdout.flush()
+                    print(f"  blocked: {decision.reason}", file=sys.stderr)
+                    print("  nothing was sent", file=sys.stderr)
                     exit_code = 1
                 else:
                     guard.wait_for_rate_limit()
                     result = executor.execute(action)
                     guard.note_action()
                     result_dict = result.to_dict()
-                    print(f"  attempted : {result.attempted}")
-                    print(f"  executed  : {result.executed}")
-                    print(f"  duration  : {result.duration:.3f}s")
+                    print()
+                    rows: list[tuple[str, Any]] = [
+                        ("attempted", result.attempted),
+                        ("executed", result.executed),
+                        ("duration", f"{result.duration:.3f}s"),
+                    ]
                     if result.blocked_reason:
-                        print(f"  blocked   : {result.blocked_reason}")
+                        rows.append(("blocked", result.blocked_reason))
                     if result.error:
-                        print(f"  error     : {result.error}")
+                        rows.append(("error", result.error))
+                    _print_table(rows)
+                    print()
+                    print(
+                        "  sent - the game has been given this input"
+                        if result.ok
+                        else "  not sent - the action did not complete"
+                    )
                     exit_code = 0 if result.ok else 1
         finally:
             # Every exit path releases, including Ctrl+C during the countdown and
@@ -658,8 +776,12 @@ def cmd_input_test(args: argparse.Namespace) -> int:
                 status="smoke-test", stop_reason="single bounded action completed"
             )
             print()
-            print("  released inputs :", ", ".join(released) or "none")
-            print("  telemetry       :", record.directory)
+            _print_table(
+                [
+                    ("released inputs", ", ".join(released) or "none"),
+                    ("telemetry", record.directory),
+                ]
+            )
             print()
             print("Nothing else will be sent. AutoCraft is idle.")
         return exit_code
@@ -882,6 +1004,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_input.add_argument("--hold", type=float, default=0.05, help="hold seconds for --action key-tap (default: 0.05)")
     p_input.add_argument("--dx", type=int, default=10, help="x delta for --action mouse-move (default: 10)")
     p_input.add_argument("--dy", type=int, default=0, help="y delta for --action mouse-move (default: 0)")
+    p_input.add_argument(
+        "--focus-delay",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "seconds to wait for you to focus the game before the final foreground "
+            f"check (default: {FOCUS_HANDOFF_SECONDS:g})"
+        ),
+    )
     p_input.add_argument("--yes", action="store_true", help="required confirmation; without it nothing is sent")
     p_input.set_defaults(func=cmd_input_test)
 
