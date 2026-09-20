@@ -669,7 +669,7 @@ either.
 | | Recorded set (unfocused, 60 frames) | Live run 2 (`…90360bf0`, 40 s) | Live run 1 (`…34371370`, 45 s) |
 |---|---|---|---|
 | warm-up | 20 frames | 20 frames | 20 frames |
-| scored frames | 39 | 36 | 45 |
+| scored frames | 40 | 36 | 45 |
 | `floor_share` | 0.996 | 0.000 | — |
 | fitted `movement_mean` | 0.0023 | 21.30 | — |
 | fitted `spread_mean` | 0.0035 | 33.33 | — |
