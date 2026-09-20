@@ -217,6 +217,30 @@ libraries are convenient, but for a first-person game they add latency,
 swallow input, or capture the wrong surface. Doing it directly keeps the
 behaviour inspectable and the failure modes honest.
 
+### Working from a git worktree
+
+`pip install -e .` writes one machine-wide `.pth` file naming the `src/`
+directory it was run in. If you keep several worktrees of this repository, that
+file points at whichever one you installed from last, and `python -m autocraft`
+resolves there from *any* directory — including a different worktree whose
+branch may not have the command you are typing. The symptom is a confusing
+`invalid choice: 'look-test' (choose from status, capture, ...)` for a command
+that plainly exists on your branch.
+
+Two ways to keep this straight:
+
+```powershell
+# Point this shell at the checkout you actually mean, for this session:
+$env:PYTHONPATH = "C:\path\to\this\worktree\src"
+
+# Or make one worktree the canonical install, and run from there:
+python -m pip install -e ".[dev]"
+```
+
+The test suite is unaffected either way: `pyproject.toml` sets
+`pythonpath = ["src"]`, so pytest always imports the worktree it is running in.
+Only `python -m autocraft` is affected.
+
 **Configuration**
 
 Copy `autocraft.example.toml` to `autocraft.toml` and edit. Every safety
@@ -773,6 +797,10 @@ one:
 ```powershell
 python -m autocraft look-test --dx 10 --dy 0 --steps 1
 ```
+
+(If that reports `invalid choice: 'look-test'`, you are running from a different
+worktree than the branch — see
+[Working from a git worktree](#working-from-a-git-worktree).)
 
 Everything beyond that — a continuous look stream, stability maps, a
 perception layer — is still not started. V0 stops at a foundation that is
