@@ -114,3 +114,54 @@ fit_frames = 20
 # instead of treating it as a change forever. Cells that are currently flagged
 # as changed keep their baseline, so real motion cannot desensitise the model.
 adapt_rate = 0.05
+
+
+[wake]
+# Settings for `autocraft wake-test` (WAKE-001): wake up, look around, notice a
+# visually salient region, turn toward it, centre it, and stop.
+#
+# wake-test DOES send mouse input. It refuses to run without --yes, it prints
+# its full movement budget first, and the emergency stop key works throughout.
+#
+# These values are budgets and thresholds, never promises. Every one of them is
+# a ceiling, because the milestone requires that a run always terminates. There
+# is deliberately no way to disable a bound.
+#
+# Cells per axis for the salience map. 8 is coarse on purpose: this layer is
+# attention, not measurement. It has to say *roughly where* something stands
+# out; the pixel-accurate part is done afterwards by template matching.
+salience_grid = 8
+# Cells per axis for the view fingerprint, which decides whether two looks are
+# the same view. A fingerprint says "this looks like a view I saw recently" and
+# never "this is the same place in the world".
+view_grid = 8
+# One deliberate look-around step, in mouse counts. A count is not a pixel:
+# LOOK-001 never measured how far a count moves the view, so the behaviour
+# re-measures after every single movement rather than assuming this reached
+# anywhere in particular.
+scan_counts = 60
+# SCANNING's movement budget. Twelve deliberate looks is enough to visit the
+# eight compass directions plus the starting view twice over.
+max_scan_moves = 12
+# How many candidate regions may be attempted before the run reports failure.
+# Three, because the point is to stop rather than to keep trying: one failed
+# target must not be allowed to consume the whole run.
+max_target_candidates = 3
+# CENTERING's movement budget *per candidate*. Eight closed-loop corrections is
+# enough to converge from anywhere on screen at any mapping LOOK-001 could not
+# rule out, with room for an overshoot and its correction.
+max_center_moves = 8
+# Total movement budget for the run, across scanning and every candidate. This
+# is the outermost bound and the one the safety story rests on.
+max_moves = 45
+# Wall-clock ceiling, in seconds. A movement budget alone does not bound time: a
+# window that took a second to capture would let 45 movements take 45 seconds.
+max_seconds = 120.0
+# How close to the frame centre, in pixels, counts as centred. This is a
+# tolerance the motor layer can actually hit, not a target it would dither
+# around forever.
+dead_zone_px = 12.0
+# Below this match confidence the selected region is treated as lost rather than
+# believed. This is the floor against inventing a target location: a matcher
+# always answers something, even when the region is gone.
+min_target_confidence = 0.35

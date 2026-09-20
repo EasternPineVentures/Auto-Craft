@@ -324,6 +324,7 @@ def test_snapshot_carries_every_field_the_specification_asks_for() -> None:
         "safety",
         "frame",
         "look",
+        "wake",
     }
     # The four flat read-outs the page shows at the top level, mapped onto the
     # nested groups that actually own them.

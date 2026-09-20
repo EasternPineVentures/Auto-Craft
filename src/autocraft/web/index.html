@@ -102,6 +102,52 @@
       </div>
     </section>
 
+    <!-- waking behaviour (WAKE-001) ------------------------------------ -->
+    <section class="panel panel-wake" aria-labelledby="h-wake">
+      <div class="panel-head">
+        <h2 id="h-wake">Waking behaviour</h2>
+        <div class="panel-head-right">
+          <span id="wake-status" class="badge badge-muted">not run</span>
+          <span id="wake-moves" class="mono muted">-</span>
+        </div>
+      </div>
+      <p class="empty-body" id="wake-empty">
+        No WAKE-001 run is showing. Run
+        <code>python -m autocraft wake-test --yes</code> to let the agent look
+        around, pick a region that stands out from its neighbours, and turn
+        toward it.
+      </p>
+      <div id="wake-body" hidden>
+        <div class="wake-headline">
+          <span class="wake-state mono" id="wake-state">STARTING</span>
+          <span class="wake-strategy mono muted" id="wake-strategy">-</span>
+        </div>
+        <dl class="kv kv-grid">
+          <div><dt>current target</dt><dd class="mono" id="wake-target">none</dd></div>
+          <div><dt>target offset</dt><dd class="mono" id="wake-offset">-</dd></div>
+          <div><dt>confidence</dt><dd class="mono" id="wake-confidence">-</dd></div>
+          <div><dt>unique views</dt><dd class="mono" id="wake-views">-</dd></div>
+          <div><dt>repeat guard</dt><dd class="mono" id="wake-guard">clear</dd></div>
+          <div><dt>recent event</dt><dd class="mono" id="wake-event">-</dd></div>
+        </dl>
+        <div class="wake-progress-wrap">
+          <div class="wake-progress-label">
+            <span>distance from centre</span>
+            <span class="mono muted" id="wake-progress-scale">-</span>
+          </div>
+          <div class="wake-progress" id="wake-progress" role="img"
+               aria-label="Measured distance from the centre of the view after each centring move"></div>
+          <p class="wake-progress-note mono muted" id="wake-progress-note">
+            no centring move has been measured yet
+          </p>
+        </div>
+        <p class="footnote" id="wake-note">
+          A "target" here means a region that differs from its neighbours and
+          nothing more. The agent recognises no objects.
+        </p>
+      </div>
+    </section>
+
     <!-- safety --------------------------------------------------------- -->
     <section class="panel panel-safety" aria-labelledby="h-safety">
       <div class="panel-head">

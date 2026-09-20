@@ -45,6 +45,16 @@ __all__ = [
     "DEFAULT_PERCEPTION_GRID",
     "DEFAULT_PERCEPTION_SIGMA",
     "DEFAULT_TARGET_TITLE_PATTERNS",
+    "DEFAULT_WAKE_DEAD_ZONE_PX",
+    "DEFAULT_WAKE_MAX_CENTER_MOVES",
+    "DEFAULT_WAKE_MAX_MOVES",
+    "DEFAULT_WAKE_MAX_SCAN_MOVES",
+    "DEFAULT_WAKE_MAX_SECONDS",
+    "DEFAULT_WAKE_MAX_TARGET_CANDIDATES",
+    "DEFAULT_WAKE_MIN_TARGET_CONFIDENCE",
+    "DEFAULT_WAKE_SALIENCE_GRID",
+    "DEFAULT_WAKE_SCAN_COUNTS",
+    "DEFAULT_WAKE_VIEW_GRID",
     "ENV_PREFIX",
     "SUPPORTED_IMAGE_FORMATS",
     "load_config",
@@ -166,6 +176,63 @@ DEFAULT_PERCEPTION_FIT_FRAMES: int = 20
 #: it either goes away or proves it is the new normal.
 DEFAULT_PERCEPTION_ADAPT_RATE: float = 0.05
 
+#: WAKE-001 settings. The behaviour layer decides where to look and how far to
+#: turn; these are its budgets and its thresholds. They are the *only* things
+#: that bound the run: every one of them is a ceiling, and the milestone requires
+#: that a run always terminates, so none of them may be disabled.
+
+#: Cells per axis for the salience map. Eight is deliberately coarse. This is
+#: attention, not measurement: it has to say *roughly where* something stands out,
+#: and the pixel-accurate part is done afterwards by template matching.
+DEFAULT_WAKE_SALIENCE_GRID: int = 8
+
+#: Cells per axis for the view fingerprint, which decides whether two looks are
+#: the same view. Same grid as the salience map for the same reason.
+DEFAULT_WAKE_VIEW_GRID: int = 8
+
+#: One scan step, in mouse counts. This is how far the camera is turned when
+#: deliberately looking around. It is a *count*, not a distance, because LOOK-001
+#: never measured how far a count moves the view; the policy re-measures after
+#: every scan step rather than assuming this reached anywhere in particular.
+DEFAULT_WAKE_SCAN_COUNTS: int = 60
+
+#: SCANNING's movement budget. Twelve deliberate looks is enough to visit the
+#: eight compass directions plus the starting view twice over.
+DEFAULT_WAKE_MAX_SCAN_MOVES: int = 12
+
+#: How many candidate regions may be attempted before the run gives up and says
+#: so. Three, because the point is to stop rather than to keep trying: one failed
+#: target must not be allowed to consume the whole run.
+DEFAULT_WAKE_MAX_TARGET_CANDIDATES: int = 3
+
+#: CENTERING's movement budget *per candidate*. Eight closed-loop corrections is
+#: enough to converge from anywhere on screen at any mapping the LOOK-001 floor
+#: admits, with room to spare for an overshoot and its correction.
+DEFAULT_WAKE_MAX_CENTER_MOVES: int = 8
+
+#: Total movement budget for the run, across scanning and every candidate.
+#: This is the outermost bound and the one the safety story rests on.
+DEFAULT_WAKE_MAX_MOVES: int = 45
+
+#: Wall-clock ceiling, in seconds, for a whole wake run. A movement budget alone
+#: does not bound time: a window that takes a second to capture would let 45
+#: movements take three quarters of a minute. Two minutes is comfortably more
+#: than a healthy run needs and short enough that a wedged one gives the operator
+#: their screen back.
+DEFAULT_WAKE_MAX_SECONDS: float = 120.0
+
+#: How close to the frame centre, in pixels, counts as centred. Twelve pixels is
+#: about one mouse count at the finest mapping LOOK-001 could not rule out, so it
+#: is a tolerance the motor layer can actually hit rather than a target it would
+#: dither around forever.
+DEFAULT_WAKE_DEAD_ZONE_PX: float = 12.0
+
+#: Below this match confidence the selected region is treated as lost and the
+#: run reacquires or abandons it. The value is a floor against inventing a target
+#: location: a matcher that always answers finds something even when the region is
+#: gone, and this is what stops that answer being believed.
+DEFAULT_WAKE_MIN_TARGET_CONFIDENCE: float = 0.35
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are missing, malformed or unsafe."""
@@ -227,6 +294,23 @@ class Config:
         perception_adapt_rate: Per frame, how far an unchanged cell's learned
             baseline drifts toward the current frame. Zero freezes the model at
             the end of its learning phase.
+        wake_salience_grid: Cells per axis for the salience map the attention
+            layer reads a frame through.
+        wake_view_grid: Cells per axis for the view fingerprint that decides
+            whether two looks are the same view.
+        wake_scan_counts: One deliberate look-around step, in mouse counts.
+        wake_max_scan_moves: SCANNING's movement budget.
+        wake_max_target_candidates: How many candidate regions may be attempted
+            before the run reports failure. One failed target may not consume the
+            whole run.
+        wake_max_center_moves: CENTERING's movement budget per candidate.
+        wake_max_moves: Total movement budget for the run.
+        wake_max_seconds: Wall-clock ceiling for the run. A movement budget alone
+            does not bound time.
+        wake_dead_zone_px: How close to the frame centre, in pixels, counts as
+            centred.
+        wake_min_target_confidence: Below this match confidence the selected
+            region is treated as lost rather than believed.
     """
 
     target_title_patterns: tuple[str, ...] = DEFAULT_TARGET_TITLE_PATTERNS
@@ -260,6 +344,16 @@ class Config:
     perception_floor: float = DEFAULT_PERCEPTION_FLOOR
     perception_fit_frames: int = DEFAULT_PERCEPTION_FIT_FRAMES
     perception_adapt_rate: float = DEFAULT_PERCEPTION_ADAPT_RATE
+    wake_salience_grid: int = DEFAULT_WAKE_SALIENCE_GRID
+    wake_view_grid: int = DEFAULT_WAKE_VIEW_GRID
+    wake_scan_counts: int = DEFAULT_WAKE_SCAN_COUNTS
+    wake_max_scan_moves: int = DEFAULT_WAKE_MAX_SCAN_MOVES
+    wake_max_target_candidates: int = DEFAULT_WAKE_MAX_TARGET_CANDIDATES
+    wake_max_center_moves: int = DEFAULT_WAKE_MAX_CENTER_MOVES
+    wake_max_moves: int = DEFAULT_WAKE_MAX_MOVES
+    wake_max_seconds: float = DEFAULT_WAKE_MAX_SECONDS
+    wake_dead_zone_px: float = DEFAULT_WAKE_DEAD_ZONE_PX
+    wake_min_target_confidence: float = DEFAULT_WAKE_MIN_TARGET_CONFIDENCE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_title_patterns", tuple(str(p) for p in self.target_title_patterns))
@@ -297,6 +391,16 @@ class Config:
         object.__setattr__(self, "perception_floor", float(self.perception_floor))
         object.__setattr__(self, "perception_fit_frames", int(self.perception_fit_frames))
         object.__setattr__(self, "perception_adapt_rate", float(self.perception_adapt_rate))
+        object.__setattr__(self, "wake_salience_grid", int(self.wake_salience_grid))
+        object.__setattr__(self, "wake_view_grid", int(self.wake_view_grid))
+        object.__setattr__(self, "wake_scan_counts", int(self.wake_scan_counts))
+        object.__setattr__(self, "wake_max_scan_moves", int(self.wake_max_scan_moves))
+        object.__setattr__(self, "wake_max_target_candidates", int(self.wake_max_target_candidates))
+        object.__setattr__(self, "wake_max_center_moves", int(self.wake_max_center_moves))
+        object.__setattr__(self, "wake_max_moves", int(self.wake_max_moves))
+        object.__setattr__(self, "wake_max_seconds", float(self.wake_max_seconds))
+        object.__setattr__(self, "wake_dead_zone_px", float(self.wake_dead_zone_px))
+        object.__setattr__(self, "wake_min_target_confidence", float(self.wake_min_target_confidence))
         self._validate()
 
     # -- derived paths ----------------------------------------------------
@@ -369,6 +473,16 @@ class Config:
             "perception_floor": self.perception_floor,
             "perception_fit_frames": self.perception_fit_frames,
             "perception_adapt_rate": self.perception_adapt_rate,
+            "wake_salience_grid": self.wake_salience_grid,
+            "wake_view_grid": self.wake_view_grid,
+            "wake_scan_counts": self.wake_scan_counts,
+            "wake_max_scan_moves": self.wake_max_scan_moves,
+            "wake_max_target_candidates": self.wake_max_target_candidates,
+            "wake_max_center_moves": self.wake_max_center_moves,
+            "wake_max_moves": self.wake_max_moves,
+            "wake_max_seconds": self.wake_max_seconds,
+            "wake_dead_zone_px": self.wake_dead_zone_px,
+            "wake_min_target_confidence": self.wake_min_target_confidence,
         }
 
     # -- validation -------------------------------------------------------
@@ -493,6 +607,71 @@ class Config:
                 "of the gap a quiet cell closes each frame, so a value above 1 would "
                 f"overshoot the current frame, got {self.perception_adapt_rate}"
             )
+        if self.wake_salience_grid < 1:
+            raise ConfigError(
+                f"wake_salience_grid must be at least 1, got {self.wake_salience_grid}"
+            )
+        if self.wake_salience_grid > 64:
+            raise ConfigError(
+                "wake_salience_grid must be at most 64; the salience map is attention, "
+                "not measurement, and a grid finer than the frame's own texture turns "
+                f"noise into candidates, got {self.wake_salience_grid}"
+            )
+        if self.wake_view_grid < 1:
+            raise ConfigError(f"wake_view_grid must be at least 1, got {self.wake_view_grid}")
+        if self.wake_view_grid > 64:
+            raise ConfigError(
+                "wake_view_grid must be at most 64; the view fingerprint compares how a "
+                "scene looks in coarse blocks, and a finer grid makes two looks of the "
+                f"same place look different, got {self.wake_view_grid}"
+            )
+        if self.wake_scan_counts < 1:
+            raise ConfigError(
+                f"wake_scan_counts must be at least 1, got {self.wake_scan_counts}"
+            )
+        if self.wake_scan_counts > self.max_mouse_delta:
+            raise ConfigError(
+                "wake_scan_counts must not exceed max_mouse_delta; the safety guard "
+                "refuses a larger movement, so a larger scan step would be a request "
+                f"that is always denied, got {self.wake_scan_counts} against "
+                f"{self.max_mouse_delta}"
+            )
+        if self.wake_max_scan_moves < 1:
+            raise ConfigError(
+                f"wake_max_scan_moves must be at least 1, got {self.wake_max_scan_moves}"
+            )
+        if self.wake_max_target_candidates < 1:
+            raise ConfigError(
+                "wake_max_target_candidates must be at least 1; a run that may not "
+                f"attempt a single target cannot succeed, got {self.wake_max_target_candidates}"
+            )
+        if self.wake_max_center_moves < 1:
+            raise ConfigError(
+                f"wake_max_center_moves must be at least 1, got {self.wake_max_center_moves}"
+            )
+        if self.wake_max_moves < self.wake_max_scan_moves + self.wake_max_center_moves:
+            raise ConfigError(
+                "wake_max_moves must leave room for at least one candidate: it must be "
+                f"at least wake_max_scan_moves + wake_max_center_moves "
+                f"({self.wake_max_scan_moves} + {self.wake_max_center_moves}), "
+                f"got {self.wake_max_moves}"
+            )
+        if self.wake_max_seconds <= 0:
+            raise ConfigError(
+                "wake_max_seconds must be greater than 0; a wake run has to be bounded "
+                f"in time as well as in movements, got {self.wake_max_seconds}"
+            )
+        if self.wake_dead_zone_px < 0:
+            raise ConfigError(
+                f"wake_dead_zone_px must not be negative, got {self.wake_dead_zone_px}"
+            )
+        if not 0.0 <= self.wake_min_target_confidence <= 1.0:
+            raise ConfigError(
+                "wake_min_target_confidence must be between 0 and 1; it is compared "
+                "against a matcher's own score, so a value outside that range would "
+                f"either lose every target or believe every match, got "
+                f"{self.wake_min_target_confidence}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +791,18 @@ _TOML_SECTIONS: dict[str, dict[str, tuple[str, Callable[..., Any]]]] = {
         "fit_frames": ("perception_fit_frames", _as_int),
         "adapt_rate": ("perception_adapt_rate", _as_float),
     },
+    "wake": {
+        "salience_grid": ("wake_salience_grid", _as_int),
+        "view_grid": ("wake_view_grid", _as_int),
+        "scan_counts": ("wake_scan_counts", _as_int),
+        "max_scan_moves": ("wake_max_scan_moves", _as_int),
+        "max_target_candidates": ("wake_max_target_candidates", _as_int),
+        "max_center_moves": ("wake_max_center_moves", _as_int),
+        "max_moves": ("wake_max_moves", _as_int),
+        "max_seconds": ("wake_max_seconds", _as_float),
+        "dead_zone_px": ("wake_dead_zone_px", _as_float),
+        "min_target_confidence": ("wake_min_target_confidence", _as_float),
+    },
 }
 
 _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
@@ -646,6 +837,16 @@ _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
     "PERCEPTION_FLOOR": ("perception_floor", _as_float),
     "PERCEPTION_FIT_FRAMES": ("perception_fit_frames", _as_int),
     "PERCEPTION_ADAPT_RATE": ("perception_adapt_rate", _as_float),
+    "WAKE_SALIENCE_GRID": ("wake_salience_grid", _as_int),
+    "WAKE_VIEW_GRID": ("wake_view_grid", _as_int),
+    "WAKE_SCAN_COUNTS": ("wake_scan_counts", _as_int),
+    "WAKE_MAX_SCAN_MOVES": ("wake_max_scan_moves", _as_int),
+    "WAKE_MAX_TARGET_CANDIDATES": ("wake_max_target_candidates", _as_int),
+    "WAKE_MAX_CENTER_MOVES": ("wake_max_center_moves", _as_int),
+    "WAKE_MAX_MOVES": ("wake_max_moves", _as_int),
+    "WAKE_MAX_SECONDS": ("wake_max_seconds", _as_float),
+    "WAKE_DEAD_ZONE_PX": ("wake_dead_zone_px", _as_float),
+    "WAKE_MIN_TARGET_CONFIDENCE": ("wake_min_target_confidence", _as_float),
 }
 
 

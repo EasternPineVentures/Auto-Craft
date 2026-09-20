@@ -49,6 +49,7 @@ __all__ = [
     "ObserverSnapshot",
     "RunMetrics",
     "SafetyStatus",
+    "WakeReport",
     "frame_freshness",
     "input_permitted",
     "with_events",
@@ -86,6 +87,37 @@ def _finite(value: Any, *, name: str) -> float:
 def _unit(value: Any, *, name: str) -> float:
     """Coerce to a normalised ``0.0``-``1.0`` value, clamping out-of-range input."""
     return min(1.0, max(0.0, _finite(value, name=name)))
+
+
+def _optional_pair(value: Any) -> tuple[float, float] | None:
+    """Coerce a two-number position to floats, or ``None`` when there is none."""
+    if value is None:
+        return None
+    left, right = _expect_length(value, 2, name="position")
+    return (float(left), float(right))
+
+
+def _optional_box(value: Any) -> tuple[int, int, int, int] | None:
+    """Coerce a four-number bounding box to ints, or ``None`` when there is none."""
+    if value is None:
+        return None
+    x0, y0, x1, y1 = _expect_length(value, 4, name="bounding box")
+    return (int(x0), int(y0), int(x1), int(y1))
+
+
+def _expect_length(value: Any, length: int, *, name: str) -> tuple[Any, ...]:
+    """Unpack a fixed-length sequence, reporting a bad shape as an observer error.
+
+    A malformed report is a caller bug, and the failure has to say which field
+    and how many numbers it wanted rather than surfacing as a bare unpack error.
+    """
+    try:
+        parts = tuple(value)
+    except TypeError as exc:
+        raise ObserverError(f"{name} must be a sequence, got {value!r}") from exc
+    if len(parts) != length:
+        raise ObserverError(f"{name} must have {length} numbers, got {len(parts)}")
+    return parts
 
 
 @dataclass(frozen=True)
@@ -529,6 +561,168 @@ class LookReport:
 
 
 @dataclass(frozen=True)
+class WakeReport:
+    """The most recent WAKE-001 attempt, as the behaviour layer reported it.
+
+    WAKE-001 wakes up, looks around, picks a region that stands out, turns toward
+    it and stops. The page shows what the behaviour said about itself while it was
+    doing that, and no verdict about it: the milestone defines no pass mark, so a
+    run that spent its whole budget without centring anything is reported as the
+    truthful outcome it is, not as a grade.
+
+    The same honesty rules apply as for :class:`LookReport`. Every measured field
+    defaults to ``None`` and ``available`` defaults to ``False``, so the empty
+    state is "no WAKE run has happened" and never a row of zeroes that reads like
+    a real result. ``pixels_per_delta_*`` is the mapping the *behaviour measured
+    for itself*, not the one LOOK-001 never established: when ``mapping_source``
+    is ``"unmeasured"`` the corrections were sized by a fixed band count and the
+    agent genuinely did not know how far a count would move the view. The panel
+    has to say that rather than print a number it cannot support.
+
+    ``progress`` is the sequence of measured distances from the frame centre, in
+    pixels, oldest first. It is the whole point of the panel: a run that is
+    working shows a falling sequence, and one that is stuck shows a flat one.
+    """
+
+    available: bool = False
+    status: str = "not-run"
+    state: str = "STARTING"
+    experiment: str = "WAKE-001"
+    run_id: str = ""
+    window_width: int = 0
+    window_height: int = 0
+    max_moves: int = 0
+    moves_sent: int = 0
+    scan_moves: int = 0
+    centering_moves: int = 0
+    unique_views: int = 0
+    revisited_views: int = 0
+    candidate_count: int = 0
+    target_changes: int = 0
+    overshoots: int = 0
+    failed_strategies: int = 0
+    stuck_patterns_detected: int = 0
+    stuck_patterns_broken: int = 0
+    dead_repetition_ratio: float | None = None
+    productive_repetition_ratio: float | None = None
+    target_centre: tuple[float, float] | None = None
+    target_bbox: tuple[int, int, int, int] | None = None
+    target_salience: float | None = None
+    target_seen: int = 0
+    target_offset: tuple[float, float] | None = None
+    target_distance: float | None = None
+    confidence: float | None = None
+    progress: tuple[float, ...] = ()
+    strategy: str = ""
+    repeat_guard_stuck: bool = False
+    repeat_guard_repeats: int = 0
+    cooldowns_active: int = 0
+    mapping_source: str = "unmeasured"
+    mapping_quality: float | None = None
+    pixels_per_delta_x: float | None = None
+    pixels_per_delta_y: float | None = None
+    recent_event: str = ""
+    stop_reason: str = ""
+    measured_at: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "available", bool(self.available))
+        object.__setattr__(self, "repeat_guard_stuck", bool(self.repeat_guard_stuck))
+        for name in (
+            "status",
+            "state",
+            "experiment",
+            "run_id",
+            "strategy",
+            "mapping_source",
+            "recent_event",
+            "stop_reason",
+        ):
+            object.__setattr__(self, name, str(getattr(self, name)))
+        for name in (
+            "window_width",
+            "window_height",
+            "max_moves",
+            "moves_sent",
+            "scan_moves",
+            "centering_moves",
+            "unique_views",
+            "revisited_views",
+            "candidate_count",
+            "target_changes",
+            "overshoots",
+            "failed_strategies",
+            "stuck_patterns_detected",
+            "stuck_patterns_broken",
+            "target_seen",
+            "repeat_guard_repeats",
+            "cooldowns_active",
+        ):
+            object.__setattr__(self, name, int(getattr(self, name)))
+        object.__setattr__(self, "progress", tuple(float(value) for value in self.progress))
+        object.__setattr__(self, "target_centre", _optional_pair(self.target_centre))
+        object.__setattr__(self, "target_offset", _optional_pair(self.target_offset))
+        object.__setattr__(self, "target_bbox", _optional_box(self.target_bbox))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable view. Contains no pixel data."""
+
+        def number(value: float | None, digits: int) -> float | None:
+            return None if value is None else round(float(value), digits)
+
+        def pair(value: tuple[float, float] | None, digits: int) -> list[float] | None:
+            return None if value is None else [round(float(v), digits) for v in value]
+
+        return {
+            "available": self.available,
+            "status": self.status,
+            "state": self.state,
+            "experiment": self.experiment,
+            "run_id": self.run_id,
+            "window": {"width": self.window_width, "height": self.window_height},
+            "max_moves": self.max_moves,
+            "moves_sent": self.moves_sent,
+            "scan_moves": self.scan_moves,
+            "centering_moves": self.centering_moves,
+            "unique_views": self.unique_views,
+            "revisited_views": self.revisited_views,
+            "candidate_count": self.candidate_count,
+            "target_changes": self.target_changes,
+            "overshoots": self.overshoots,
+            "failed_strategies": self.failed_strategies,
+            "stuck_patterns_detected": self.stuck_patterns_detected,
+            "stuck_patterns_broken": self.stuck_patterns_broken,
+            "dead_repetition_ratio": number(self.dead_repetition_ratio, 4),
+            "productive_repetition_ratio": number(self.productive_repetition_ratio, 4),
+            "target": {
+                "centre": pair(self.target_centre, 1),
+                "bbox": list(self.target_bbox) if self.target_bbox is not None else None,
+                "salience": number(self.target_salience, 4),
+                "seen": self.target_seen,
+            },
+            "target_offset": pair(self.target_offset, 1),
+            "target_distance": number(self.target_distance, 2),
+            "confidence": number(self.confidence, 4),
+            "progress": [round(float(value), 1) for value in self.progress],
+            "strategy": self.strategy,
+            "repeat_guard": {
+                "stuck": self.repeat_guard_stuck,
+                "repeats": self.repeat_guard_repeats,
+                "cooldowns_active": self.cooldowns_active,
+            },
+            "mapping": {
+                "source": self.mapping_source,
+                "quality": number(self.mapping_quality, 4),
+                "pixels_per_delta_x": number(self.pixels_per_delta_x, 5),
+                "pixels_per_delta_y": number(self.pixels_per_delta_y, 5),
+            },
+            "recent_event": self.recent_event,
+            "stop_reason": self.stop_reason,
+            "measured_at": self.measured_at,
+        }
+
+
+@dataclass(frozen=True)
 class FrameInfo:
     """Metadata about the frame the page is currently showing.
 
@@ -620,6 +814,7 @@ class ObserverSnapshot:
     safety: SafetyStatus = field(default_factory=SafetyStatus)
     frame: FrameInfo = field(default_factory=FrameInfo)
     look: LookReport = field(default_factory=LookReport)
+    wake: WakeReport = field(default_factory=WakeReport)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", str(self.run_id))
@@ -666,6 +861,7 @@ class ObserverSnapshot:
             "safety": self.safety.to_dict(),
             "frame": self.frame.to_dict(),
             "look": self.look.to_dict(),
+            "wake": self.wake.to_dict(),
         }
 
 

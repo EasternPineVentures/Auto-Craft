@@ -333,6 +333,7 @@ Touching the game is always explicit.
 | `input-test` | **yes** | Explicit smoke test. Prints the bounded action, requires `--yes`, gives you 10 seconds (`--focus-delay`) to focus the game, re-verifies that exact window is foreground, sends one tiny bounded action and then releases everything. |
 | `look-test` | **yes** | LOOK-001. Injects one known relative mouse movement, captures the picture before it, after it, and after the exact reverse, and reports the measured pixel displacement and its reversibility. Requires `--yes`; every plan is bounded. |
 | `perceive-test` | no | VISION-001. Observes for a bounded time, learns what each cell of the scene normally does from the run's own frames, then reports per-cell change as it goes. Never sends input and has no `--yes` flag. |
+| `wake-test` | **yes** | WAKE-001. Looks around with bounded mouse movements, picks the most visually salient region it can find, centres it in the view, and stops. Requires `--yes`; every plan is bounded and the run always terminates. |
 | `keys` | no | Lists every supported key name. |
 | `config` | no | Prints the effective configuration and where it came from. |
 | `observer` | no | Serves the local read-only observer page. Never enables control. |
@@ -344,6 +345,7 @@ python -m autocraft observe --seconds 5 --steps 60
 python -m autocraft observe --seconds 30 --steps 300 --observer
 python -m autocraft loop --steps 5 --seconds 10
 python -m autocraft perceive-test --seconds 30
+python -m autocraft wake-test --yes
 python -m autocraft observer --demo
 python -m autocraft keys
 ```
@@ -351,10 +353,10 @@ python -m autocraft keys
 The loop refuses to start unless you give it `--steps` or `--seconds`. There
 is no "run forever" option, by design.
 
-`--observer` is available on `observe`, `loop` and `look-test` and does exactly
-one thing: it starts the page and publishes that run's state to it. It does not
-change what the command does, and it never enables input. If the port is
-already busy, the run continues and the page is simply unavailable.
+`--observer` is available on `observe`, `loop`, `look-test` and `wake-test` and
+does exactly one thing: it starts the page and publishes that run's state to it.
+It does not change what the command does, and it never enables input. If the
+port is already busy, the run continues and the page is simply unavailable.
 
 ### The first input smoke test
 
@@ -730,6 +732,165 @@ refuses to serialise rather than writing an empty file.
 
 ---
 
+### The WAKE-001 first behaviour
+
+```powershell
+python -m autocraft wake-test --yes
+```
+
+VISION-001 can tell *that* the scene changed. WAKE-001 is the first behaviour
+built on top of that: **wake up, look around, notice a visually interesting
+region, turn toward it, centre it in the view, and stop.**
+
+It is deliberately not TREE-001. There is no object detector, no semantic
+class, and no privileged game state anywhere in this path. The thing it finds is
+a *visually salient region*, and that is the only thing the code or the output
+will ever call it. Nothing here knows what a tree is.
+
+#### What it actually does
+
+1. **Looks.** A fixed ring of bounded relative mouse movements, each followed by
+   a fresh capture. Every view is fingerprinted and stored in a small bounded
+   memory, so the agent can notice it is looking at somewhere it has already
+   been.
+2. **Scores.** Each frame is divided into a grid of cells and each cell is scored
+   with deterministic, local evidence: texture, edge density, colour spread,
+   local contrast, and how much it differs from its neighbours. Cells are merged
+   into a small candidate set, at most `wake_max_target_candidates` of them.
+3. **Chooses.** Candidates are ranked by
+   `salience + novelty + persistence - recently_seen_penalty - excessive_distance_penalty`.
+   The weights are a named, documented constant
+   (`SelectionWeights`), not numbers buried in the ranking code.
+4. **Centres.** A closed loop: measure the offset from the crosshair, move a
+   bounded number of counts, re-capture, re-locate, adjust. Coarse band first,
+   then medium, then fine. Every correction is sized from the *latest* frame.
+5. **Stops.** On being centred inside the dead zone, or on confidence falling
+   below the floor, or on a budget running out, or on a safety abort. All four
+   paths terminate the run and are recorded with the reason that ended it.
+
+#### The mapping is measured, not assumed
+
+The centring controller never assumes `1 mouse count = 1 pixel`. It starts with
+a fixed band count and **self-measures**: every movement is followed by a fresh
+capture, and the observed shift divided by the counts sent becomes a sample in a
+`MotionCalibration`. Once an axis has three samples the controller switches to
+`source: self-measured` and sizes its corrections from the ratio it actually
+observed. Until then it says `source: unmeasured` and every record, every
+console summary and every panel says so too.
+
+The LOOK-001 calibration can be adopted as a starting point, but it is not
+required and it is never invented: `mapping_quality` is reported as `null` when
+there was no measurement, not as a confident number.
+
+#### Anti-repetition, because repetition is the failure mode
+
+The spec is explicit that the third identical failed strategy must not be tried
+blindly. Two mechanisms enforce that:
+
+- **A progress model.** Distance from the crosshair is assessed on every
+  centring step and classified as improved or not against an epsilon. It tracks
+  `dead_repetition_ratio` and `productive_repetition_ratio` separately, so
+  164 → 97 → 43 → 11 px reads as *productive* while 114 → 114 → 114 reads as
+  *dead*.
+- **A repetition guard.** A signature is built from the view, the strategy and
+  the movement, and the guard counts how many times in a row it has been seen
+  *without progress*. On the third, it raises `STUCK_PATTERN_DETECTED` and the
+  policy **changes strategy** — it forces a smaller movement band — rather than
+  adding random jitter. A strategy that keeps failing goes on a cooldown and
+  becomes unavailable; it can come back if the visual situation changes.
+
+Randomness exists in exactly one place, the candidate tie-break in
+`select_candidate`, it is seeded in tests, and it can never override a safety
+rule or a progress decision.
+
+#### Bounded, always
+
+The behaviour can never run away. Each of these is a configured ceiling, and
+hitting one ends the run rather than extending it:
+
+| Bound | Default | What it stops |
+|---|---|---|
+| `wake_max_scan_moves` | 12 | looking around forever |
+| `wake_max_target_candidates` | 3 | one run chasing every region in the frame |
+| `wake_max_center_moves` | 8 | grinding on a target that will not centre |
+| `wake_max_moves` | 45 | the whole run's movement budget |
+| `wake_max_seconds` | 120 | wall clock |
+
+`max_moves` must be at least `max_scan_moves + max_center_moves`; a configuration
+that would let one phase starve the other is rejected at load time.
+
+#### Configuration
+
+```toml
+[wake]
+salience_grid = 8            # cells per side for the salience map
+view_grid = 8                # cells per side for the view fingerprint
+scan_counts = 60             # mouse counts per scan step
+max_scan_moves = 12
+max_target_candidates = 3
+max_center_moves = 8
+max_moves = 45
+max_seconds = 120.0
+dead_zone_px = 12.0          # "centred enough" radius
+min_target_confidence = 0.35 # below this, do not pretend to know where it is
+```
+
+Every field has a matching `AUTOCRAFT_WAKE_*` environment override, and all of
+them appear in every run's `wake_result.json`.
+
+#### Files
+
+```
+data/runs/<run-id>/wake_result.json   what was measured, and what it is not
+```
+
+`wake_result.json` carries the metrics, the event stream in order, the
+per-target detail, and the mapping provenance. It never contains raw pixels, and
+it never contains a pass/fail verdict — the numbers are there to be read, not
+scored. Four standing limitation notes travel with every record, so the file
+cannot be read out of context.
+
+The record is rewritten after **every** step rather than only at the end. A run
+that is killed mid-way leaves behind what it had measured, and it cannot be
+mistaken for a finished run because its status is still `running`.
+
+The window size in the record is taken from the first frame that actually
+arrived, not from the plan: what the agent looked at is a measurement.
+
+#### Known weaknesses
+
+- **The mouse mapping is unmeasured until a run measures it.** LOOK-001
+  established that relative mouse input moves the camera, but the pixels-per-count
+  ratio is only weakly constrained: a 200-count probe moved the view so far that
+  no shared features survived to fit a transform to. A run therefore begins by
+  not knowing how far a count will move the view, and the first centring
+  corrections are sized by a fixed band count. Self-measurement fixes this within
+  a few movements — but only if the target stays findable.
+- **The floor on the measured ratio is a real limit.** `_MIN_PIXELS_PER_COUNT`
+  is 0.05. If the true ratio were smaller than that, the 200-count hardware
+  ceiling would mean no bounded number of corrections could ever close a
+  large offset. That is deliberate — it fails honestly instead of sending
+  thousands of counts — but it is a genuine inability, and it is recorded rather
+  than hidden.
+- **Salience is not semantics.** The chosen region is whatever has the most
+  local structure, novelty and persistence. On a busy scene it will sometimes
+  pick something a human would not.
+- **Re-acquisition is shallow.** If a target is lost mid-centring, the agent
+  gets `wake_max_center_moves` attempts to find it again by searching outward.
+  If it stays lost, the target is abandoned and the run ends rather than
+  wandering.
+
+#### What it does not do
+
+No semantic object recognition, no tree recognition, no LLM in the motor path,
+no vision-language API, no reinforcement learning, no pathfinding, no walking,
+jumping, mining, crafting, or survival, no long-term memory, no multi-agent
+logic. `ThoughtEvent` is display-only: the thought hook is called *after* a
+decision is made, its return value is discarded, and its failure is caught. A
+thought can never move the mouse.
+
+---
+
 ## The observer page
 
 ```powershell
@@ -740,13 +901,24 @@ python -m autocraft observer --demo     # same page, synthetic data
 A local, read-only page that shows what AutoCraft is doing internally: the
 latest captured frame, the current mode, goal and intention, the last action
 and its result, confidence, recent events, the current simulated affect, the
-safety state, and — during `look-test` — the **Visual motion** panel.
+safety state, and — during `look-test` — the **Visual motion** panel, and —
+during `wake-test` — the **Wake behaviour** panel.
+
+The Wake behaviour panel shows what the behaviour layer is doing right now: the
+state, the current strategy, the target's centre, offset and distance from the
+crosshair, its salience, the match confidence, the progress series, the repeat
+guard, the unique and revisited view counts, the active cooldowns, and the most
+recent event. Every number on it comes from the same flat report the policy
+publishes, so the panel cannot disagree with the record on disk; the one field
+the page adds is `measured_at`, which is a fact about the display rather than
+about the run.
 
 The Visual motion panel shows the measured primitives of the LOOK-001 run: the
 difference statistics, the per-block difference map, the estimated shift, the
-pixels-per-delta ratio, and the reversibility figure. It reads
-`status: not-run` until a trial has actually been measured, and it never fills
-itself in from the plan.
+pixels-per-delta ratio, and the reversibility figure.
+
+Both panels read `status: not-run` until something has actually been measured,
+and neither fills itself in from the plan.
 
 It exists so a run can be watched and streamed without reading a log.
 
@@ -1006,8 +1178,41 @@ covered:
   persisted with `complete: false`
 - the `perceive-test` persist-before-print ordering: the printing is made to fail
   on purpose, and the result file still holds the full measurement
+- the WAKE-001 view memory: that an identical view is recognised as a revisit, a
+  novel view is not, and the memory stays inside its limit
+- the WAKE-001 salience: that a region of structure is found and a uniform scene
+  offers nothing, that the returned candidates are real `CandidateTarget`s, that
+  a candidate marked failed is not offered again, and that the scoring weights
+  are explicit and documented
+- the WAKE-001 centring: that the movement band follows the distance, that a
+  sign flip is recorded as an overshoot with the reversed axis named, that a
+  panning scene converges inside the dead zone, that the controller self-measures
+  its mapping and switches source once it has samples, and that a mapping limited
+  by the hardware ceiling does not converge — recorded as the honest failure it
+  is rather than asserted away
+- the WAKE-001 anti-repetition: that a productive streak is not stuck, that a
+  move which stops helping becomes stuck, that an unmeasured attempt counts as
+  no improvement, and that a repeatedly failing strategy goes on cooldown
+- the WAKE-001 bounds: that every ceiling is enforced and that a configuration
+  letting one phase starve another is rejected
+- the WAKE-001 record: strict-JSON round-trip, no raw pixels, the standing
+  limitation notes, and that the measured target is not overwritten by the run
+  plan
+- the WAKE-001 runner, end to end on a synthetic panning scene: a complete run
+  that centres its target and reports `completed`, and a run the loop has to cut
+  short that reports `aborted` with the reason that ended it
+- the WAKE-001 live publisher: that the CLI's status callback actually reaches
+  the observer panel, driven with the real report shape, because the display path
+  swallows its own failures and a bad keyword there would leave the panel empty
+  for a whole run without raising anywhere
+- the WAKE-001 structural prohibitions, checked as **imports** and as the
+  package's declared public surface: no `wake` module can reach the control
+  layer, none imports a trained model or a model API, none opens a network
+  connection or a subprocess, and none exposes a pass/fail verdict
+- the `wake-test` safety gate: refusal before any input object exists, the plan
+  printed without claiming a result, and a dry run that sends nothing
 
-The suite is 725 tests and runs in about 23 seconds. Everything that talks to
+The suite is 796 tests and runs in about 23 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -1082,21 +1287,54 @@ why the default countdown is now 10 seconds and `--focus-delay` exists.
 wiring, nothing more. Still unverified: sustained autonomous movement, repeated
 closed-loop control, camera calibration, the relationship between `dx`/`dy` and
 how far the view actually rotates, navigation, model-backed decisions, and
-long-running autonomous play. A `mouse-move` of `(10, 0)` was accepted by the
-game, but the LOOK-001 trial measured no picture movement from it, so even that
-much is now in doubt. The VISION-001 scene model narrows that gap — it can now
-say whether a frame changed — but it has never been run against a *moving*
-camera, so it does not close it.
+long-running autonomous play.
 
-**The LOOK-001 trial has been run once, and it did not measure the mapping.** The
+**The `--dx 200` probe has now been run, and it moved the camera — but it did not
+produce a mapping.** This is the correction to an earlier reading, so it is worth
+stating precisely. The completed run
+(`data/runs/20260920T051311Z-1145fdca`) reports a shift of `0.006 px` and a
+`pixels_per_delta.x` of `3e-05`, which reads as "nothing moved". **That reading is
+wrong.** On the raw frames, no rigid transform reproduces frame B from frame A:
+translation is best at exactly `(0, 0)` with a 0.00% gain, a large-shift search
+reaches only 3.7–12.96% at mutually inconsistent offsets, vertical shift is
+0.00%, the best rotation is `0°` with a monotone decline either way, the best
+zoom is scale exactly `1.00`, ECC reaches `cc 0.594–0.628` against `0.9998` for
+the control, ORB finds only 8/31 inliers, and the best achievable correlation of B
+against *any* shifted A is 0.6249 versus 0.5364 for identity. Meanwhile the
+reverse `-200` delta restored the view essentially exactly: `cc 0.9998`,
+1824/1825 ORB inliers, an identity homography to 0.02 px, and every matched patch
+at `NCC 1.0000`. The `0.006 px` figure is a phase-correlation artifact — the two
+views share so little that the estimator has nothing to lock onto.
+
+So: **relative mouse input demonstrably causes large in-game camera motion, and it
+is exactly reversible.** That settles the engagement question in the affirmative.
+It does **not** give a pixels-per-count ratio, because a 200-count delta moves the
+view far enough that no shared features survive to fit a transform to. The ratio
+has to come from a middle value (roughly 25–50 counts), which is what the
+calibration series is for. An earlier analysis of these same frames concluded the
+opposite; that analysis applied `cv2.equalizeHist` to a near-black scene, which
+amplifies quantization noise into apparent structure. The re-derivation on raw
+luminance is what is reported here.
+
+**The mapping is therefore still unmeasured, and WAKE-001 runs without it.**
+`wake-test` begins by not knowing how far a count moves the view and sizes its
+first corrections from a fixed band count; it self-measures as it goes and reports
+`source: unmeasured` until it has three samples on an axis. This is honest, but it
+means the first behaviour runs with a weaker prior than the design intends.
+
+**The LOOK-001 trial has been run twice, and neither measured the mapping.** The
 tool exists — `look-test`, documented above — and one live trial at `(+10, +0)` is
-now on record. It established that the mechanism works (two movements sent, three
+on record. It established that the mechanism works (two movements sent, three
 frames captured, nothing left held) and that reversibility is excellent (0.007).
 It did **not** establish a pixels-per-delta ratio: the picture did not move by a
 measurable amount at 10 counts, so the ratio that run reported came from an
-estimate indistinguishable from zero. There is still no live mapping number, no
-evidence about repeatability, and no answer to whether the camera look was engaged
-at all. See [The first live trial](#the-first-live-trial).
+estimate indistinguishable from zero.
+
+The follow-up probe at `(+200, +0)` did move the camera, decisively, and it too
+reported no usable ratio — see
+[the correction above](#known-limitations) for the evidence and for why a
+200-count delta is too large to fit a transform to. There is still no live mapping
+number and still no evidence about repeatability.
 
 **A measured ratio is a ratio for one configuration.** Even once the trial has
 run, a pixels-per-delta figure is specific to that window size, that field of
@@ -1126,43 +1364,52 @@ There is also **no verdict anywhere** in the layer, deliberately. It reports
 changed cells, excess, and where the change accumulated; deciding whether any of
 that means "the camera moved" is a separate, unbuilt thing.
 
-**The camera-engagement question is still open, and the scene model is why it can
-now be settled.** The first LOOK-001 trial at `(+10, +0)` measured no picture
-movement, and the two live `perceive-test` runs show why that was hard to read:
-this scene has a genuine animated band and drifts in brightness on its own, so
-"nothing changed" and "something changed by an unmeasurable amount" were not
-distinguishable by a fixed cutoff. The next probe is still
-`look-test --dx 200 --dy 0 --steps 1 --yes`, now with a scene model available to
-tell the band's animation apart from the camera. If a 200-count delta also moves
-the picture by nothing measurable, the cause is engagement rather than
-sensitivity.
+**The camera-engagement question is now answered, and the mapping question is
+not.** The first LOOK-001 trial at `(+10, +0)` measured no picture movement. The
+`(+200, +0)` probe answered why the question was hard to read and settled the
+engagement half of it: on the raw frames no rigid transform reproduces B from A,
+while the reverse delta restores the view essentially exactly. Relative mouse
+input does turn the camera. What is still missing is the *scale* of that turn,
+because 200 counts moves the view past the point where any shared features
+survive. That is a middle-value calibration problem, not an engagement problem.
+
+The follow-up probe to run is therefore a smaller one:
+
+```powershell
+python -m autocraft look-test --dx 40 --dy 0 --steps 1 --yes
+```
+
+and then the full series:
+
+```powershell
+python -m autocraft look-test --calibrate-horizontal --yes
+```
 
 ---
 
 ## Where this goes next
 
-**The perception layer is now real, and the next milestone is still LOOK-001's
-open question.** `perceive-test` (VISION-001) observes for a bounded time, learns
-what each cell of the scene normally does from the run's own frames, and reports
-per-cell change as it goes — read-only, no verdict, no input. It has been run
-live twice and both runs are documented above, including the two ways it is
-currently weak.
+**The first behaviour is now built, and the mapping is still the open question.**
+`wake-test` (WAKE-001) looks around, picks the most visually salient region it can
+find, centres it, and stops — bounded at every phase, with the mouse mapping
+self-measured as it goes. It has not been run live yet.
 
-What it has **not** done is change the fact that there is no live mapping number.
-The immediate next step is unchanged, and it is a single command:
+**The mapping is what it is still missing.** LOOK-001's `(+200, +0)` probe
+settled that relative mouse input turns the camera; it did not produce a
+pixels-per-count ratio, because 200 counts moves the view far enough that no
+shared features survive to fit a transform to. The next step is a smaller delta:
 
 ```powershell
-python -m autocraft look-test --dx 200 --dy 0 --steps 1 --yes
+python -m autocraft look-test --dx 40 --dy 0 --steps 1 --yes
 ```
 
-Click inside the game window during the countdown before running it. If a
-200-count delta still moves the picture by nothing measurable, the cause is that
-the camera look is not engaged rather than that sensitivity is low, and that is a
-different problem to solve. The full series is the follow-up:
+and then the series:
 
 ```powershell
 python -m autocraft look-test --calibrate-horizontal --yes
 ```
+
+Click inside the game window during the countdown before running either.
 
 (If either reports `invalid choice: 'look-test'`, you are running from a different
 worktree than the branch — see
@@ -1170,15 +1417,24 @@ worktree than the branch — see
 
 **After that**, the ordering that follows from what has actually been measured:
 
-1. **Settle the warm-up and adaptation weaknesses.** A median-of-medians fit and
+1. **Run WAKE-001 live once, and read what it records.** The behaviour is built
+   and tested against synthetic frames, but it has never faced a real scene. The
+   first live run is the only way to find out whether the salience it computes on
+   a real Luanti frame picks anything sensible, and whether its self-measured
+   mapping settles.
+2. **Feed the measured mapping back in.** Once `look-test` produces a ratio,
+   `wake-test` can adopt it as a starting calibration instead of beginning from a
+   fixed band count, which is the difference between a first correction that is
+   roughly right and one that is sized by a guess.
+3. **Settle the warm-up and adaptation weaknesses.** A median-of-medians fit and
    a transient warning, both driven by the two live runs above.
-2. **Capture a focused series with deliberate movement.** Every capture so far
+4. **Capture a focused series with deliberate movement.** Every capture so far
    was either unfocused or had no camera movement, so there is still no data
    about what a moving camera does to these per-cell statistics. That is the
    first thing TREE-001 would need.
-3. **Only then** a movement-sensitive decision policy. `PerceptionDecisionPolicy`
+5. **Only then** a movement-sensitive decision policy. `PerceptionDecisionPolicy`
    exists and is tested, but it is unvalidated against real motion, and
-   validating it needs step 2.
+   validating it needs step 4.
 
 A perception layer that cannot yet tell a camera pan from an animated river is
 not a foundation for tree recognition, and pretending otherwise would undo the

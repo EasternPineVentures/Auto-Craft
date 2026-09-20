@@ -51,6 +51,7 @@ from .snapshot import (
     FrameFreshness,
     FrameInfo,
     LookReport,
+    WakeReport,
     ObserverError,
     ObserverSnapshot,
     RunMetrics,
@@ -273,6 +274,7 @@ class ObserverState:
         self._thoughts: deque[ThoughtEvent] = deque(maxlen=max(1, int(config.thought_history_max)))
 
         self._look = LookReport()
+        self._wake = WakeReport()
 
         self._demo_records: tuple[_DemoRecord, ...] = tuple(demo_script)
         self._demo_index = 0
@@ -321,6 +323,7 @@ class ObserverState:
                 safety=self._safety_locked(),
                 frame=self._frame_info_locked(moment),
                 look=self._look,
+                wake=self._wake,
             )
             snapshot = with_events(snapshot, events, short_term_limit=SHORT_TERM_LIMIT)
             return with_thoughts(snapshot, tuple(self._thoughts))
@@ -352,6 +355,12 @@ class ObserverState:
         with self._lock:
             return self._look
 
+    @property
+    def wake(self) -> WakeReport:
+        """The most recent WAKE-001 attempt, or an empty report."""
+        with self._lock:
+            return self._wake
+
     # -- write side -------------------------------------------------------
 
     def begin_run(self, run_id: str, *, now: float | None = None, goal: str = "") -> None:
@@ -378,6 +387,7 @@ class ObserverState:
             self._frame_times.clear()
             self._step_times.clear()
             self._look = LookReport()
+            self._wake = WakeReport()
         self.publish_event("Run started.", kind=EventKind.INFO, now=moment)
 
     def publish_mode(self, mode: AgentMode | str, *, note: str = "", now: float | None = None) -> None:
@@ -452,6 +462,33 @@ class ObserverState:
             if merged.measured_at is None:
                 merged = replace(merged, measured_at=moment)
             self._look = merged
+            return merged
+
+    def publish_wake(
+        self,
+        report: WakeReport | None = None,
+        *,
+        now: float | None = None,
+        **fields: Any,
+    ) -> WakeReport:
+        """Record a WAKE-001 attempt for the wake panel.
+
+        Accepts either a finished :class:`WakeReport` or keyword overrides merged
+        onto the current one, so the CLI can refresh the panel after every step
+        without rebuilding the whole report. Display-only: nothing reads this
+        back, and publishing it cannot inject input or change a run. In
+        particular it cannot influence which region the agent picks or how far it
+        turns, which is what keeps the page a window rather than a control.
+        """
+        moment = float(now) if now is not None else float(self._clock())
+        with self._lock:
+            if report is not None:
+                merged = report
+            else:
+                merged = replace(self._wake, **fields)
+            if merged.measured_at is None:
+                merged = replace(merged, measured_at=moment)
+            self._wake = merged
             return merged
 
     def publish_frame(
