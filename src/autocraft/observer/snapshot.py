@@ -420,6 +420,115 @@ class SafetyStatus:
 
 
 @dataclass(frozen=True)
+class LookReport:
+    """The most recent LOOK-001 measurement, exactly as it was measured.
+
+    LOOK-001 injects a known mouse delta and measures the picture's response. The
+    page shows those measurements and no verdict about them, because the
+    milestone defines no pass mark: ``reversibility_ratio`` is reported as a
+    number, not as a grade.
+
+    Two honesty rules are structural rather than stylistic. First, every measured
+    field defaults to ``None`` and ``available`` defaults to ``False``, so the
+    empty state is "no LOOK measurement has been taken" and never a row of
+    zeroes that reads like a real result. Second, ``pixels_per_delta_x`` and
+    ``pixels_per_delta_y`` are image pixels per unit of injected mouse delta as
+    *measured*; they are not a conversion AutoCraft is entitled to assume, and
+    the panel says so.
+    """
+
+    available: bool = False
+    status: str = "not-run"
+    experiment: str = "LOOK-001"
+    trial_index: int | None = None
+    trial_count: int = 0
+    dx: int | None = None
+    dy: int | None = None
+    settle_seconds: float | None = None
+    window_width: int = 0
+    window_height: int = 0
+    movements_sent: int = 0
+    mean_absolute_difference: float | None = None
+    rmse: float | None = None
+    changed_fraction: float | None = None
+    block_grid: int = 0
+    block_map: tuple[tuple[float, ...], ...] = ()
+    shift_x: float | None = None
+    shift_y: float | None = None
+    shift_quality: float | None = None
+    shift_available: bool = False
+    pixels_per_delta_x: float | None = None
+    pixels_per_delta_y: float | None = None
+    reversibility_ratio: float | None = None
+    reversibility_note: str = ""
+    capture_seconds: float | None = None
+    stop_reason: str = ""
+    measured_at: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "available", bool(self.available))
+        object.__setattr__(self, "shift_available", bool(self.shift_available))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "experiment", str(self.experiment))
+        object.__setattr__(self, "trial_count", int(self.trial_count))
+        object.__setattr__(self, "window_width", int(self.window_width))
+        object.__setattr__(self, "window_height", int(self.window_height))
+        object.__setattr__(self, "movements_sent", int(self.movements_sent))
+        object.__setattr__(self, "block_grid", int(self.block_grid))
+        object.__setattr__(
+            self,
+            "block_map",
+            tuple(tuple(float(value) for value in row) for row in self.block_map),
+        )
+        if self.trial_index is not None:
+            object.__setattr__(self, "trial_index", int(self.trial_index))
+        if self.dx is not None:
+            object.__setattr__(self, "dx", int(self.dx))
+        if self.dy is not None:
+            object.__setattr__(self, "dy", int(self.dy))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable view. Contains no pixel data."""
+
+        def number(value: float | None, digits: int) -> float | None:
+            return None if value is None else round(float(value), digits)
+
+        return {
+            "available": self.available,
+            "status": self.status,
+            "experiment": self.experiment,
+            "trial_index": self.trial_index,
+            "trial_count": self.trial_count,
+            "dx": self.dx,
+            "dy": self.dy,
+            "settle_seconds": number(self.settle_seconds, 4),
+            "window": {"width": self.window_width, "height": self.window_height},
+            "movements_sent": self.movements_sent,
+            "mean_absolute_difference": number(self.mean_absolute_difference, 4),
+            "rmse": number(self.rmse, 4),
+            "changed_fraction": number(self.changed_fraction, 6),
+            "block_grid": self.block_grid,
+            "block_map": [[round(value, 2) for value in row] for row in self.block_map],
+            "shift": {
+                "available": self.shift_available,
+                "x": number(self.shift_x, 3),
+                "y": number(self.shift_y, 3),
+                "quality": number(self.shift_quality, 4),
+                "method": "phase-correlation",
+            },
+            "pixels_per_delta": {
+                "x": number(self.pixels_per_delta_x, 5),
+                "y": number(self.pixels_per_delta_y, 5),
+            },
+            "reversibility_ratio": number(self.reversibility_ratio, 5),
+            "reversibility_note": self.reversibility_note,
+            "capture_seconds": number(self.capture_seconds, 4),
+            "stop_reason": self.stop_reason,
+            "measured_at": self.measured_at,
+        }
+
+
+@dataclass(frozen=True)
 class FrameInfo:
     """Metadata about the frame the page is currently showing.
 
@@ -482,6 +591,10 @@ class ObserverSnapshot:
     ``latest_thought`` and ``thought_history`` carry the expression layer. They
     are display-only: the page renders them, and nothing reads them back to
     decide anything.
+
+    ``look`` carries the most recent LOOK-001 measurement. Like the thought
+    fields it is display-only, and like ``beliefs`` it starts out honestly empty:
+    a run that never measured anything shows nothing rather than zeroes.
     """
 
     run_id: str = "-"
@@ -506,6 +619,7 @@ class ObserverSnapshot:
     metrics: RunMetrics = field(default_factory=RunMetrics)
     safety: SafetyStatus = field(default_factory=SafetyStatus)
     frame: FrameInfo = field(default_factory=FrameInfo)
+    look: LookReport = field(default_factory=LookReport)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", str(self.run_id))
@@ -551,6 +665,7 @@ class ObserverSnapshot:
             "metrics": self.metrics.to_dict(),
             "safety": self.safety.to_dict(),
             "frame": self.frame.to_dict(),
+            "look": self.look.to_dict(),
         }
 
 

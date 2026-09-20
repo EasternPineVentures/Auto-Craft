@@ -57,6 +57,51 @@
       </dl>
     </section>
 
+    <!-- visual motion (LOOK-001) --------------------------------------- -->
+    <section class="panel panel-look" aria-labelledby="h-look">
+      <div class="panel-head">
+        <h2 id="h-look">Visual motion</h2>
+        <div class="panel-head-right">
+          <span id="look-status" class="badge badge-muted">not run</span>
+          <span id="look-trial" class="mono muted">-</span>
+        </div>
+      </div>
+      <p class="empty-body" id="look-empty">
+        No LOOK-001 measurement has been taken. Run
+        <code>python -m autocraft look-test</code> to inject one known mouse
+        movement and measure how far the picture moved.
+      </p>
+      <div id="look-body" hidden>
+        <dl class="kv kv-grid">
+          <div><dt>injected delta</dt><dd class="mono" id="look-delta">-</dd></div>
+          <div><dt>movements sent</dt><dd class="mono" id="look-moves">-</dd></div>
+          <div><dt>window</dt><dd class="mono" id="look-window">-</dd></div>
+          <div><dt>settle</dt><dd class="mono" id="look-settle">-</dd></div>
+          <div><dt>capture</dt><dd class="mono" id="look-capture">-</dd></div>
+          <div><dt>mean abs diff</dt><dd class="mono" id="look-mad">-</dd></div>
+          <div><dt>rmse</dt><dd class="mono" id="look-rmse">-</dd></div>
+          <div><dt>changed pixels</dt><dd class="mono" id="look-changed">-</dd></div>
+          <div><dt>shift x</dt><dd class="mono" id="look-shift-x">-</dd></div>
+          <div><dt>shift y</dt><dd class="mono" id="look-shift-y">-</dd></div>
+          <div><dt>shift quality</dt><dd class="mono" id="look-quality">-</dd></div>
+          <div><dt>reversibility</dt><dd class="mono" id="look-reversibility">-</dd></div>
+        </dl>
+        <div class="look-grid-wrap">
+          <div class="look-grid-label">
+            <span>difference grid</span>
+            <span class="mono muted" id="look-grid-size">-</span>
+          </div>
+          <div class="look-grid" id="look-grid" role="img"
+               aria-label="Coarse grid of per-block mean absolute difference"></div>
+        </div>
+        <p class="footnote" id="look-note">
+          Pixels per unit of injected mouse delta, as measured on this machine.
+          A measurement of the game's own camera convention, not an assumed
+          conversion.
+        </p>
+      </div>
+    </section>
+
     <!-- safety --------------------------------------------------------- -->
     <section class="panel panel-safety" aria-labelledby="h-safety">
       <div class="panel-head">

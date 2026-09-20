@@ -39,6 +39,26 @@
     frameLuma: document.getElementById("frame-luma"),
     frameSignature: document.getElementById("frame-signature"),
 
+    lookStatus: document.getElementById("look-status"),
+    lookTrial: document.getElementById("look-trial"),
+    lookEmpty: document.getElementById("look-empty"),
+    lookBody: document.getElementById("look-body"),
+    lookDelta: document.getElementById("look-delta"),
+    lookMoves: document.getElementById("look-moves"),
+    lookWindow: document.getElementById("look-window"),
+    lookSettle: document.getElementById("look-settle"),
+    lookCapture: document.getElementById("look-capture"),
+    lookMad: document.getElementById("look-mad"),
+    lookRmse: document.getElementById("look-rmse"),
+    lookChanged: document.getElementById("look-changed"),
+    lookShiftX: document.getElementById("look-shift-x"),
+    lookShiftY: document.getElementById("look-shift-y"),
+    lookQuality: document.getElementById("look-quality"),
+    lookReversibility: document.getElementById("look-reversibility"),
+    lookGridSize: document.getElementById("look-grid-size"),
+    lookGrid: document.getElementById("look-grid"),
+    lookNote: document.getElementById("look-note"),
+
     safetyPanel: document.querySelector(".panel-safety"),
     safetyVerdict: document.getElementById("safety-verdict"),
     sWindow: document.getElementById("s-window"),
@@ -208,6 +228,105 @@
     setText(nodes.frameLuma, frame.mean_luma === null || frame.mean_luma === undefined ? "-" : frame.mean_luma);
     setText(nodes.frameSignature, frame.signature);
     renderFrameAge();
+  }
+
+  // -- visual motion (LOOK-001) -------------------------------------------
+
+  function renderLookGrid(report) {
+    const grid = report.block_map || [];
+    const size = report.block_grid || 0;
+    nodes.lookGrid.replaceChildren();
+    if (!grid.length) {
+      setText(nodes.lookGridSize, "-");
+      nodes.lookGrid.style.setProperty("--cols", "1");
+      return;
+    }
+    setText(nodes.lookGridSize, size + " x " + grid.length);
+    nodes.lookGrid.style.setProperty("--cols", String(grid[0].length));
+    // One cell per block, filled by that block's mean absolute difference on a
+    // fixed 0-255 scale. This is a readout of the stored measurement, not a
+    // recomputation, so the grid can never disagree with the numbers beside it.
+    grid.forEach(function (row) {
+      row.forEach(function (value) {
+        const cell = document.createElement("span");
+        const level = Math.max(0, Math.min(1, Number(value) / 255));
+        cell.className = "look-cell";
+        cell.style.setProperty("--v", level.toFixed(4));
+        cell.title = Number(value).toFixed(1);
+        nodes.lookGrid.append(cell);
+      });
+    });
+  }
+
+  function renderLook(snapshot) {
+    const look = snapshot.look || {};
+    const available = Boolean(look.available);
+    nodes.lookEmpty.hidden = available;
+    nodes.lookBody.hidden = !available;
+
+    setText(nodes.lookStatus, look.status || "not run");
+    setClass(
+      nodes.lookStatus,
+      available
+        ? look.status === "completed"
+          ? "badge badge-ok"
+          : "badge badge-warn"
+        : "badge badge-muted"
+    );
+
+    if (!available) {
+      setText(nodes.lookTrial, "-");
+      nodes.lookGrid.replaceChildren();
+      return;
+    }
+
+    setText(
+      nodes.lookTrial,
+      "trial " + (look.trial_index === null || look.trial_index === undefined ? "?" : look.trial_index + 1) +
+        " of " + (look.trial_count || 0)
+    );
+    const dx = look.dx === null || look.dx === undefined ? "-" : look.dx;
+    const dy = look.dy === null || look.dy === undefined ? "-" : look.dy;
+    setText(nodes.lookDelta, "(" + dx + ", " + dy + ")");
+    setText(nodes.lookMoves, look.movements_sent);
+    const window = look.window || {};
+    setText(nodes.lookWindow, window.width && window.height ? window.width + " x " + window.height : "-");
+    setText(nodes.lookSettle, look.settle_seconds === null || look.settle_seconds === undefined ? "-" : look.settle_seconds + " s");
+    setText(nodes.lookCapture, look.capture_seconds === null || look.capture_seconds === undefined ? "-" : look.capture_seconds + " s");
+    setText(nodes.lookMad, look.mean_absolute_difference);
+    setText(nodes.lookRmse, look.rmse);
+    setText(
+      nodes.lookChanged,
+      look.changed_fraction === null || look.changed_fraction === undefined
+        ? "-"
+        : (Number(look.changed_fraction) * 100).toFixed(2) + "%"
+    );
+
+    const shift = look.shift || {};
+    setText(nodes.lookShiftX, shift.available ? shift.x + " px" : "not estimated");
+    setText(nodes.lookShiftY, shift.available ? shift.y + " px" : "not estimated");
+    setText(nodes.lookQuality, shift.available ? shift.quality : "-");
+
+    const ratio = look.reversibility_ratio;
+    setText(
+      nodes.lookReversibility,
+      ratio === null || ratio === undefined
+        ? "not measurable"
+        : Number(ratio).toFixed(3)
+    );
+
+    const perDelta = look.pixels_per_delta || {};
+    if (perDelta.x === null || perDelta.x === undefined) {
+      setText(nodes.lookNote, look.reversibility_note || "-");
+    } else {
+      setText(
+        nodes.lookNote,
+        Number(perDelta.x).toFixed(4) + " px per unit of injected delta. " +
+          (look.reversibility_note || "")
+      );
+    }
+
+    renderLookGrid(look);
   }
 
   // -- safety -------------------------------------------------------------
@@ -472,6 +591,7 @@
     nodes.demoBadge.hidden = !snapshot.demo;
     nodes.demoNotice.hidden = !snapshot.demo;
     renderFrame(snapshot);
+    renderLook(snapshot);
     renderSafety(snapshot);
     renderState(snapshot);
     renderAffect(snapshot);

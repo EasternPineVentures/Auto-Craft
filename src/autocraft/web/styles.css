@@ -121,6 +121,7 @@ html, body {
     "frame   safety"
     "frame   state"
     "frame   affect"
+    "frame   look"
     "thought metrics"
     "events  memory";
   align-items: start;
@@ -132,6 +133,7 @@ html, body {
 .panel-safety  { grid-area: safety; }
 .panel-state   { grid-area: state; }
 .panel-affect  { grid-area: affect; }
+.panel-look    { grid-area: look; }
 .panel-thought { grid-area: thought; }
 .panel-metrics { grid-area: metrics; }
 .panel-events  { grid-area: events; }
@@ -145,6 +147,7 @@ html, body {
       "safety"
       "state"
       "affect"
+      "look"
       "thought"
       "metrics"
       "events"
@@ -373,6 +376,42 @@ html, body {
   align-items: baseline;
   justify-content: space-between;
   margin-bottom: 5px;
+}
+
+/* ---------------------------------------------------- visual motion (LOOK) */
+
+.panel-look { border-color: var(--line-strong); }
+
+.look-grid-wrap { margin: 11px 0 0; }
+
+.look-grid-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 5px;
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* The coarse difference grid. Each cell carries a 0-1 intensity in --v and is
+   filled by mixing the panel background toward the accent, so the grid reads as
+   a magnitude map rather than a heat legend that needs decoding. */
+.look-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 8), minmax(0, 1fr));
+  gap: 2px;
+  padding: 3px;
+  background: #08090a;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.look-cell {
+  aspect-ratio: 1 / 1;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--accent) calc(var(--v, 0) * 100%), #12161a);
 }
 
 /* --------------------------------------------------------------- thought */

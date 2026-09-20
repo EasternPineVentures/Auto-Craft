@@ -50,6 +50,7 @@ from .snapshot import (
     EventKind,
     FrameFreshness,
     FrameInfo,
+    LookReport,
     ObserverError,
     ObserverSnapshot,
     RunMetrics,
@@ -271,6 +272,8 @@ class ObserverState:
         self._thought_engine = thought_engine
         self._thoughts: deque[ThoughtEvent] = deque(maxlen=max(1, int(config.thought_history_max)))
 
+        self._look = LookReport()
+
         self._demo_records: tuple[_DemoRecord, ...] = tuple(demo_script)
         self._demo_index = 0
         self._demo_ticks = 0
@@ -317,6 +320,7 @@ class ObserverState:
                 metrics=self._metrics_locked(moment),
                 safety=self._safety_locked(),
                 frame=self._frame_info_locked(moment),
+                look=self._look,
             )
             snapshot = with_events(snapshot, events, short_term_limit=SHORT_TERM_LIMIT)
             return with_thoughts(snapshot, tuple(self._thoughts))
@@ -341,6 +345,12 @@ class ObserverState:
         """Thoughts expressed so far, oldest first."""
         with self._lock:
             return tuple(self._thoughts)
+
+    @property
+    def look(self) -> LookReport:
+        """The most recent LOOK-001 measurement, or an empty report."""
+        with self._lock:
+            return self._look
 
     # -- write side -------------------------------------------------------
 
@@ -367,6 +377,7 @@ class ObserverState:
             self._errors = 0
             self._frame_times.clear()
             self._step_times.clear()
+            self._look = LookReport()
         self.publish_event("Run started.", kind=EventKind.INFO, now=moment)
 
     def publish_mode(self, mode: AgentMode | str, *, note: str = "", now: float | None = None) -> None:
@@ -417,6 +428,31 @@ class ObserverState:
         """Record an expressed thought. Display-only: nothing reads it back."""
         with self._lock:
             self._thoughts.append(thought)
+
+    def publish_look(
+        self,
+        report: LookReport | None = None,
+        *,
+        now: float | None = None,
+        **fields: Any,
+    ) -> LookReport:
+        """Record a LOOK-001 measurement for the visual-motion panel.
+
+        Accepts either a finished :class:`LookReport` or keyword overrides merged
+        onto the current one, so the CLI can update the panel per trial without
+        rebuilding the whole report. Display-only: nothing reads this back, and
+        publishing it cannot inject input or change a run.
+        """
+        moment = float(now) if now is not None else float(self._clock())
+        with self._lock:
+            if report is not None:
+                merged = report
+            else:
+                merged = replace(self._look, **fields)
+            if merged.measured_at is None:
+                merged = replace(merged, measured_at=moment)
+            self._look = merged
+            return merged
 
     def publish_frame(
         self,

@@ -2,9 +2,9 @@
 
 Design rule for every command here: **looking is always safe, touching is always
 explicit.** ``status``, ``capture`` and ``observe`` read pixels and print facts -
-they never inject input, so they can be run freely. ``input-test`` is the only
-command that can move the mouse or press a key, it says so before it does
-anything, and it refuses to run without ``--yes``.
+they never inject input, so they can be run freely. ``input-test`` and
+``look-test`` are the only commands that can move the mouse or press a key, they
+say so before they do anything, and they refuse to run without ``--yes``.
 
 Nothing here starts autonomous play. The only shipped decision policy is the
 no-op policy, and the loop refuses to run without an explicit bound.
@@ -27,10 +27,25 @@ from .agent.decision import NoOpDecisionPolicy
 from .agent.loop import AgentLoop
 from .agent.observation import Observer
 from .config import Config, ConfigError, DEFAULT_CONFIG_FILENAME, load_config
+from .control.errors import ControlError, InputBlocked
 from .control.keyboard import Keyboard
 from .control.keymap import known_key_names
 from .control.mouse import Mouse
 from .control.safety import SafetyGuard
+from .look import (
+    EVENT_ERROR,
+    EVENT_INFO,
+    EVENT_OBSERVE,
+    EVENT_SAFETY,
+    EXPERIMENT_NAME,
+    TRIAL_COMPLETED,
+    FocusCheck,
+    LookRecorder,
+    LookRunner,
+    LookTrialResult,
+    MoveOutcome,
+    TrialSpec,
+)
 from .observer import (
     LoopPublisher,
     ObserverError,
@@ -365,6 +380,7 @@ def _start_observer(
     intention: str | None = None,
     safety: Any = None,
     express_thoughts: bool = True,
+    state: ObserverState | None = None,
 ) -> tuple[ObserverServer | None, LoopPublisher | None]:
     """Start the read-only observer page for a run.
 
@@ -376,8 +392,14 @@ def _start_observer(
     A page that cannot bind its port is reported and skipped, and the pair
     ``(None, None)`` is returned. The run is the important thing and the page is
     an accessory, so a port already in use must not end an observation.
+
+    ``state`` lets a caller that needs to publish beyond the two loop callbacks -
+    ``look-test`` publishing a measurement, for instance - keep the
+    :class:`ObserverState` it will write through. The page is still built and
+    owned entirely here.
     """
-    state = ObserverState(config)
+    if state is None:
+        state = ObserverState(config)
     try:
         server = ObserverServer(
             state, host=config.observer_host, port=config.observer_port
@@ -798,6 +820,472 @@ def _smoke_action(args: argparse.Namespace) -> Action | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# LOOK-001
+# ---------------------------------------------------------------------------
+
+#: Client-area size above which LOOK-001 warns that the window is large.
+#: The specification's recommendation is roughly 1280x650 to 1280x720. This is a
+#: warning only: nothing here resizes, moves or reconfigures the game window,
+#: because a command that reconfigures the thing it is measuring would change the
+#: measurement.
+LOOK_RECOMMENDED_MAX_WIDTH = 1280
+LOOK_RECOMMENDED_MAX_HEIGHT = 720
+
+
+def _look_plan(args: argparse.Namespace, config: Config) -> tuple[tuple[TrialSpec, ...], str]:
+    """Build the bounded trial plan, or raise ``ValueError`` with the reason.
+
+    Every plan is finite. There is no unbounded mode, no "keep going until it
+    works", and no calibration that runs as long as it likes: the series length
+    comes from ``look_calibration_deltas`` and is capped by ``look_max_steps``.
+    """
+    settle = config.look_settle_seconds if args.settle is None else args.settle
+    if not math.isfinite(settle) or settle < 0:
+        raise ValueError(f"invalid --settle {args.settle!r}: expected a non-negative number of seconds")
+    if settle > 10:
+        raise ValueError(f"invalid --settle {settle:g}: a settle above 10s is not a bounded wait")
+
+    steps = int(args.steps)
+    if steps < 1:
+        raise ValueError(f"invalid --steps {args.steps}: at least one trial is required")
+    if steps > config.look_max_steps:
+        raise ValueError(
+            f"invalid --steps {args.steps}: the configured bound is "
+            f"look_max_steps={config.look_max_steps}"
+        )
+
+    if args.calibrate_horizontal or args.calibrate_vertical:
+        deltas = tuple(int(value) for value in config.look_calibration_deltas)
+        if len(deltas) > config.look_max_steps:
+            raise ValueError(
+                f"look_calibration_deltas has {len(deltas)} entries, above the "
+                f"look_max_steps bound of {config.look_max_steps}"
+            )
+        if args.calibrate_horizontal:
+            specs = tuple(
+                TrialSpec(index=index, dx=delta, dy=0, settle_seconds=settle)
+                for index, delta in enumerate(deltas)
+            )
+            return specs, f"horizontal calibration series at x deltas {list(deltas)}"
+        specs = tuple(
+            TrialSpec(index=index, dx=0, dy=delta, settle_seconds=settle)
+            for index, delta in enumerate(deltas)
+        )
+        return specs, f"vertical calibration series at y deltas {list(deltas)}"
+
+    limit = int(config.max_mouse_delta)
+    if abs(int(args.dx)) > limit or abs(int(args.dy)) > limit:
+        raise ValueError(
+            f"delta ({args.dx}, {args.dy}) exceeds max_mouse_delta={limit} per axis; "
+            "AutoCraft refuses an oversized movement rather than clamping it"
+        )
+    if args.dx == 0 and args.dy == 0:
+        raise ValueError("delta (0, 0) would not move anything, so nothing could be measured")
+    specs = tuple(
+        TrialSpec(index=index, dx=int(args.dx), dy=int(args.dy), settle_seconds=settle)
+        for index in range(steps)
+    )
+    return specs, f"{steps} x ({args.dx:+d}, {args.dy:+d}) then the exact reverse"
+
+
+def _look_rerun_hint(args: argparse.Namespace) -> str:
+    """The exact ``look-test`` invocation that repeats this run for real.
+
+    Echoing the operator's own flags back means the suggested command is
+    copy-pasteable and cannot drift from what they actually asked for.
+    """
+    parts = ["autocraft", "look-test"]
+    if args.calibrate_horizontal:
+        parts.append("--calibrate-horizontal")
+    elif args.calibrate_vertical:
+        parts.append("--calibrate-vertical")
+    else:
+        parts += ["--dx", str(args.dx), "--dy", str(args.dy), "--steps", str(args.steps)]
+    if args.settle is not None:
+        parts += ["--settle", f"{args.settle:g}"]
+    if args.focus_delay is not None:
+        parts += ["--focus-delay", f"{args.focus_delay:g}"]
+    if args.output:
+        parts += ["--output", args.output]
+    parts.append("--yes")
+    return " ".join(parts)
+
+
+def _look_window_warning(width: int, height: int, config: Config) -> str | None:
+    """Explain an oversized client area, without doing anything about it.
+
+    A big window is not an error - the operator may want one - but the
+    specification recommends roughly 1280x650 to 1280x720, because a phase
+    correlation over a very large frame is slower and its estimate is no more
+    meaningful for the extra pixels. This reports that and stops.
+    """
+    pixels = int(width) * int(height)
+    if pixels <= config.look_large_window_pixels:
+        return None
+    return (
+        f"WARNING: the client area is {width}x{height} ({pixels} pixels), above the\n"
+        f"  configured look_large_window_pixels={config.look_large_window_pixels}.\n"
+        f"  LOOK-001 is recommended at about "
+        f"{LOOK_RECOMMENDED_MAX_WIDTH}x{LOOK_RECOMMENDED_MAX_HEIGHT} or smaller.\n"
+        "  AutoCraft will not resize your window - that would change the thing being\n"
+        "  measured. Resize it yourself, or raise look_large_window_pixels if you mean it."
+    )
+
+
+def _look_move(mouse: Mouse, direction: str) -> Any:
+    """Wrap :meth:`Mouse.move_relative` as a :class:`MoveOutcome` factory.
+
+    This is the only place LOOK-001 reaches the actuator, and it reaches it
+    through the existing V0 :class:`~autocraft.control.mouse.Mouse`, so the guard,
+    the rate limit, the per-axis bound and the release bookkeeping are all exactly
+    the ones the rest of AutoCraft uses. There is no second input path.
+    """
+
+    def move(dx: int, dy: int) -> MoveOutcome:
+        try:
+            mouse.move_relative(dx, dy)
+        except InputBlocked as exc:
+            return MoveOutcome(sent=False, detail=f"{direction} ({dx}, {dy}): {exc}", refused=True)
+        except (ControlError, ValueError) as exc:
+            return MoveOutcome(sent=False, detail=f"{direction} ({dx}, {dy}): {exc}")
+        except Exception as exc:  # noqa: BLE001 - a broken backend must not escape
+            return MoveOutcome(sent=False, detail=f"{direction} ({dx}, {dy}): {type(exc).__name__}: {exc}")
+        return MoveOutcome(sent=True, detail=f"{direction} ({dx}, {dy})")
+
+    return move
+
+
+def _look_event_printer(state: Any, quiet: bool):
+    """Timeline printer for the LOOK sequence, and optional observer mirror."""
+
+    def emit(message: str, kind: str) -> None:
+        if state is not None:
+            try:
+                state.publish_event(message, kind=kind)
+            except Exception:  # noqa: BLE001 - display must never break the experiment
+                pass
+        if quiet:
+            return
+        marker = {EVENT_ERROR: "!", EVENT_SAFETY: "~", EVENT_OBSERVE: ".", EVENT_INFO: "-"}.get(kind, "-")
+        print(f"  {marker} {message}", flush=True)
+
+    return emit
+
+
+def cmd_look_test(args: argparse.Namespace) -> int:
+    """LOOK-001: measure the picture's response to one known mouse movement.
+
+    The same ordering rule as ``input-test`` applies. ``look-test`` is normally
+    launched from a shell, so at the first check the *shell* is the foreground
+    window, and refusing on that would make the documented trial impossible to
+    run. So: locate and vet the target, validate the whole bounded plan, print
+    exactly what will be sent, demand ``--yes`` before any injection machinery
+    exists, and only then give the operator a window to focus the game. Focus is
+    re-checked before every single movement, and the guard re-checks it again
+    inside the actuator call.
+
+    What this command does not do: it does not resize the window, it does not
+    decide whether the result is good, and it does not claim to have learned
+    anything. It injects a known delta, measures the frames, and writes the
+    numbers down.
+    """
+    handoff = FOCUS_HANDOFF_SECONDS if args.focus_delay is None else args.focus_delay
+    if not math.isfinite(handoff) or handoff < 0:
+        print(
+            f"invalid --focus-delay {args.focus_delay!r}: expected a non-negative number of seconds",
+            file=sys.stderr,
+        )
+        return 2
+
+    config, source = _load(args)
+    config.ensure_directories()
+
+    try:
+        plan, plan_note = _look_plan(args, config)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    movements_planned = 2 * len(plan)
+
+    runtime = _build_runtime(config, config_source=source)
+    try:
+        status = runtime.locator.status(force=True)
+        if not status.found or status.window is None:
+            print(
+                f"no target window matched {config.target_title_patterns!r}; nothing sent",
+                file=sys.stderr,
+            )
+            return 1
+        if status.window.minimized:
+            print("the target window is minimized; nothing sent", file=sys.stderr)
+            return 1
+
+        target_title = status.window.title
+        target_handle = status.window.handle
+        region = status.window.region
+        window_width, window_height = region.width, region.height
+        look_dir = Path(args.output) if args.output else Path(runtime.config.runs_dir) / "look"
+
+        print("LOOK-001: MEASURED SENSORIMOTOR MAPPING")
+        print()
+        print("  LIVE INPUT WILL OCCUR: this command moves the mouse pointer")
+        print(f"  press {config.emergency_stop_key.upper()} at any time to abort and release everything")
+        print()
+        _print_table(
+            [
+                (
+                    "mode",
+                    f"LIVE - {movements_planned} mouse movement(s) will be sent"
+                    if args.yes
+                    else f"DRY RUN - {movements_planned} movement(s) planned, nothing will be sent",
+                ),
+                ("target", repr(target_title)),
+                ("handle", f"0x{target_handle:X}"),
+                ("client area", f"{window_width}x{window_height}"),
+                ("sequence", plan_note),
+                ("per trial", plan[0].describe()),
+                ("trials", f"{len(plan)} (bounded; there is no unbounded mode)"),
+                ("settle", f"{plan[0].settle_seconds:g}s between movement and capture"),
+                ("calibration", "no" if not (args.calibrate_horizontal or args.calibrate_vertical) else "yes"),
+                ("output", str(look_dir)),
+                ("observer", "shown at the end" if args.observer else "off (pass --observer to watch live)"),
+                ("config", source),
+            ]
+        )
+
+        warning = _look_window_warning(window_width, window_height, config)
+        if warning is not None:
+            print()
+            print(warning)
+
+        if not args.yes:
+            print()
+            print("refusing to send input without --yes; nothing was sent")
+            print("to run the measurement for real, re-run with --yes:")
+            print()
+            print(f"    {_look_rerun_hint(args)}")
+            return 3
+
+        guard = _build_guard(config, runtime.locator)
+        guard.install_atexit()
+        mouse = Mouse(guard, guard.backend, config)
+        recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+
+        state = ObserverState(config)
+        observer_server = None
+        publisher = None
+        if args.observer:
+            observer_server, publisher = _start_observer(
+                config,
+                run_id=recorder.run_id,
+                goal="Measure how the picture responds to one known mouse movement.",
+                intention="Inject a known delta, capture A/B/C, and record what changed.",
+                safety=lambda: publish_safety_from(guard),
+                express_thoughts=False,
+                state=state,
+            )
+        look_state = state if publisher is not None else None
+
+        emit = _look_event_printer(look_state, args.quiet)
+        look_recorder = LookRecorder(
+            look_dir,
+            run_id=recorder.run_id,
+            plan=plan,
+            target={
+                "title": target_title,
+                "handle": target_handle,
+                "width": window_width,
+                "height": window_height,
+            },
+            settings={
+                "block_grid": config.look_block_grid,
+                "max_steps": config.look_max_steps,
+                "large_window_pixels": config.look_large_window_pixels,
+                "calibration_deltas": list(config.look_calibration_deltas),
+                "max_mouse_delta": config.max_mouse_delta,
+            },
+            clock=time.time,
+        )
+
+        def verify() -> FocusCheck:
+            ready, reason = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
+            return FocusCheck(ready=ready, reason=reason)
+
+        def on_frame(frame: Any) -> None:
+            if look_state is None:
+                return
+            try:
+                look_state.publish_frame(frame, source="look-test")
+            except Exception:  # noqa: BLE001 - display must never break the experiment
+                pass
+
+        def on_trial(trial: LookTrialResult) -> None:
+            if look_state is None:
+                return
+            try:
+                look_state.publish_look(
+                    available=True,
+                    status=trial.status,
+                    experiment=EXPERIMENT_NAME,
+                    trial_count=len(plan),
+                    **trial.report_fields(),
+                )
+            except Exception:  # noqa: BLE001 - display must never break the experiment
+                pass
+
+        runner = LookRunner(
+            recorder=look_recorder,
+            capture=lambda: runtime.capturer.capture_window(status.window),
+            move=_look_move(mouse, "look-test"),
+            verify=verify,
+            stop_requested=lambda: bool(guard.stop_requested),
+            release=guard.release_all,
+            window_size=(window_width, window_height),
+            block_grid=config.look_block_grid,
+            clock=time.time,
+            sleeper=time.sleep,
+            on_event=emit,
+            on_frame=on_frame,
+            on_trial=on_trial,
+        )
+
+        result = None
+        interrupted = False
+        try:
+            guard.release_all("look-test start")
+
+            print()
+            _print_table([("run id", recorder.run_id), ("experiment", EXPERIMENT_NAME)])
+            print()
+            print("  Focus the game window now.")
+            print("  It is checked again before every movement, not just once.")
+            _focus_countdown(handoff, stream=sys.stdout)
+
+            ready, refusal = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
+            if not ready:
+                print()
+                sys.stdout.flush()
+                print(f"  refused: {refusal}", file=sys.stderr)
+                print("  nothing was sent", file=sys.stderr)
+                print(f"  hint: click into {target_title!r} during the countdown,", file=sys.stderr)
+                print("        or allow more time with --focus-delay 20", file=sys.stderr)
+                result = look_recorder.finish(status="interrupted", stop_reason=refusal)
+                exit_code = 1
+            else:
+                result = runner.run(plan)
+                exit_code = 0 if result.status == TRIAL_COMPLETED else 1
+        except KeyboardInterrupt:
+            interrupted = True
+            result = look_recorder.finish(status="interrupted", stop_reason="Ctrl+C")
+            print("\ninterrupted by Ctrl+C; releasing everything")
+            exit_code = 130
+        finally:
+            released = guard.release_all("look-test end")
+            guard.shutdown("look-test finished")
+            if result is None:
+                result = look_recorder.finish(status="interrupted", stop_reason="stopped before the sequence began")
+            recorder.record_step(
+                {
+                    "index": 0,
+                    "observation": {"window": status.to_dict()},
+                    "action": {"kind": "look-test", "plan": [spec.to_dict() for spec in plan]},
+                    "result": result.to_dict(),
+                }
+            )
+            recorder.record_safety_events(guard.events)
+            run_record = recorder.finish(
+                status="look-test",
+                stop_reason=result.stop_reason or "look-test finished",
+            )
+            if publisher is not None:
+                publisher.finish(run_record)
+            if observer_server is not None:
+                observer_server.stop()
+
+            _print_look_summary(result, released=released, telemetry=run_record.directory)
+            if interrupted:
+                print()
+                print("Nothing else will be sent. AutoCraft is idle.")
+        return exit_code
+    finally:
+        runtime.close()
+
+
+def _print_look_summary(result: Any, *, released: Sequence[str], telemetry: str) -> None:
+    """Print the measured numbers, and only the measured numbers."""
+    print()
+    print("LOOK-001 summary")
+    trials = tuple(result.trials)
+    rows: list[tuple[str, Any]] = [
+        ("experiment", result.experiment),
+        ("status", result.status),
+        ("stop reason", result.stop_reason),
+        ("trials recorded", f"{len(trials)} of {len(result.plan)}"),
+        ("movements sent", result.movements_sent),
+    ]
+    if result.duration is not None:
+        rows.append(("duration", f"{result.duration:.2f}s"))
+    rows.append(("result file", str(Path(result.directory) / "look_result.json")))
+    rows.append(("released inputs", ", ".join(released) or "none"))
+    rows.append(("telemetry", telemetry))
+    _print_table(rows)
+
+    for trial in trials:
+        print()
+        print(f"  trial {trial.spec.index + 1}: {trial.spec.describe()}")
+        _print_table(_look_trial_rows(trial))
+    print()
+    print("No pass/fail threshold was applied. Read the numbers above, and see")
+    print("look_result.json for the per-block difference map.")
+    print("Nothing else will be sent. AutoCraft is idle.")
+
+
+def _look_trial_rows(trial: Any) -> list[tuple[str, Any]]:
+    """One trial's measured primitives, formatted for the terminal."""
+    rows: list[tuple[str, Any]] = [("status", trial.status)]
+    if trial.stop_reason:
+        rows.append(("stopped because", trial.stop_reason))
+    if trial.frame_a is not None:
+        rows.append(("frame size", f"{trial.window_width}x{trial.window_height}"))
+    rows.append(("movements sent", trial.movements_sent))
+    rows.append(("capture time", f"{trial.capture_seconds * 1000:.0f} ms"))
+    if trial.a_to_b is not None:
+        rows += [
+            ("A to B mean abs diff", f"{trial.a_to_b.mean_absolute_difference:.3f} luma levels"),
+            ("A to B rmse", f"{trial.a_to_b.rmse:.3f}"),
+            ("A to B changed pixels", f"{trial.a_to_b.changed_fraction * 100:.2f}%"),
+            ("difference grid", f"{trial.a_to_b.block_grid} x {trial.a_to_b.block_grid} blocks"),
+        ]
+    if trial.a_to_c is not None:
+        rows.append(("A to C mean abs diff", f"{trial.a_to_c.mean_absolute_difference:.3f} luma levels"))
+    if trial.shift is not None:
+        if trial.shift.available:
+            rows.append(
+                ("estimated shift", f"({trial.shift.x:+.2f}, {trial.shift.y:+.2f}) px, quality {trial.shift.quality:.3f}")
+            )
+        else:
+            rows.append(("estimated shift", f"not available ({trial.shift.reason})"))
+    if trial.pixels_per_delta_x is not None:
+        rows.append(("pixels per delta x", f"{trial.pixels_per_delta_x:.4f}"))
+    if trial.pixels_per_delta_y is not None:
+        rows.append(("pixels per delta y", f"{trial.pixels_per_delta_y:.4f}"))
+    rows.append(
+        (
+            "reversibility",
+            "not defined (A and B were indistinguishable)"
+            if trial.reversibility_ratio is None
+            else f"{trial.reversibility_ratio:.3f}",
+        )
+    )
+    if trial.reversibility_note:
+        rows.append(("note", trial.reversibility_note))
+    for name, path in trial.artifacts.items():
+        rows.append((f"file {name}", path))
+    return rows
+
+
 def cmd_loop(args: argparse.Namespace) -> int:
     """Run the bounded agent loop. V0's only policy is no-op."""
     config, source = _load(args)
@@ -934,7 +1422,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="autocraft",
         description=(
             "AutoCraft V0: a pixel-in, human-controls-out foundation for an embodied agent. "
-            "Observation commands never send input; only 'input-test' can, and only with --yes."
+            "Observation commands never send input; only 'input-test' and 'look-test' can, "
+            "and only with --yes."
         ),
     )
     parser.add_argument("--version", action="version", version=f"autocraft {__version__}")
@@ -1016,6 +1505,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_input.add_argument("--yes", action="store_true", help="required confirmation; without it nothing is sent")
     p_input.set_defaults(func=cmd_input_test)
+
+    p_look = sub.add_parser(
+        "look-test",
+        help="LOOK-001: inject one known mouse movement and measure how far the picture moved",
+    )
+    p_look.add_argument("--dx", type=int, default=10, help="x delta to inject per trial (default: 10)")
+    p_look.add_argument("--dy", type=int, default=0, help="y delta to inject per trial (default: 0)")
+    p_look.add_argument(
+        "--steps",
+        type=int,
+        default=1,
+        help="how many identical trials to run (default: 1; capped by config look_max_steps)",
+    )
+    p_look.add_argument(
+        "--settle",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="seconds to let the picture settle between a movement and its capture (default: config look_settle_seconds)",
+    )
+    p_look.add_argument(
+        "--focus-delay",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "seconds to wait for you to focus the game before the final foreground "
+            f"check (default: {FOCUS_HANDOFF_SECONDS:g})"
+        ),
+    )
+    p_look.add_argument(
+        "--output",
+        metavar="PATH",
+        help="directory for the frames and look_result.json (default: <runs dir>/look)",
+    )
+    look_calibration = p_look.add_mutually_exclusive_group()
+    look_calibration.add_argument(
+        "--calibrate-horizontal",
+        action="store_true",
+        help="run the bounded x calibration series instead of a single delta",
+    )
+    look_calibration.add_argument(
+        "--calibrate-vertical",
+        action="store_true",
+        help="run the bounded y calibration series instead of a single delta",
+    )
+    p_look.add_argument("--observer", action="store_true", help="also serve the read-only observer page for this run")
+    p_look.add_argument("--quiet", action="store_true", help="do not print per-step progress")
+    p_look.add_argument("--yes", action="store_true", help="required confirmation; without it nothing is sent")
+    p_look.set_defaults(func=cmd_look_test)
 
     p_keys = sub.add_parser("keys", help="list supported key names")
     p_keys.add_argument("--json", action="store_true", help="emit JSON")

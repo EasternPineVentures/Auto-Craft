@@ -62,3 +62,24 @@ min_interval_seconds = 25.0
 max_per_minute = 3.0
 # How many thoughts the history keeps.
 history_max = 20
+
+[look]
+# Settings for `autocraft look-test`, the LOOK-001 sensorimotor measurement.
+# That command injects real mouse movement; every bound on it is here.
+#
+# Seconds to wait after a movement before capturing the next frame. Too short
+# and the capture lands mid-motion; too long and unrelated animation changes
+# the scene instead.
+settle_seconds = 0.15
+# Coarse partition for the difference map written into the record and drawn on
+# the observer page.
+block_grid = 8
+# Hard ceiling on planned trials in one look-test run. LOOK-001 has no
+# unbounded mode.
+max_steps = 10
+# Window area above which look-test warns that the target is bigger than the
+# recommended 1280x720. It warns; it never resizes your game window.
+large_window_pixels = 921600
+# Injected mouse deltas, in counts, tried in both directions by
+# --calibrate-horizontal and --calibrate-vertical.
+calibration_deltas = [2, 5, 10, 20]

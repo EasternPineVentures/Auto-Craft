@@ -108,6 +108,9 @@ near future:
 - no vector databases, Docker, Electron, React, or databases
 - no cloud services, multiplayer, or chat integrations
 - no game mods, and no modification of the game installation
+- no world map, no long-term memory expansion, no story engine
+- no multi-agent system, no simulated society, no economy
+- no pass/fail verdict on a measurement, and no "the camera moved" claim
 
 The local observer page is a deliberate, narrow exception to "no web
 dashboard", and it is drawn tightly: it is read-only, it is loopback-only, it
@@ -204,7 +207,7 @@ python -m pip install -e ".[dev]"
 | Package | Why |
 |---|---|
 | `mss` | Fast, dependency-light screen capture. No GUI toolkit dragged in. |
-| `opencv-python` | Only used to write PNGs and resize. Kept to a single image library. |
+| `opencv-python` | Writes and resizes PNGs, and provides the phase correlation LOOK-001 measures with. Kept to a single image library. |
 | `numpy` | Frames are arrays. All the frame maths is vectorised. |
 | `pytest` (dev) | The test suite. |
 
@@ -234,6 +237,7 @@ Touching the game is always explicit.
 | `observe` | no | Observes for a bounded time. Reports frames captured, achieved FPS, dropped/failed frames, and focus state. |
 | `loop` | no | Runs the bounded agent loop with the no-op policy. |
 | `input-test` | **yes** | Explicit smoke test. Prints the bounded action, requires `--yes`, gives you 10 seconds (`--focus-delay`) to focus the game, re-verifies that exact window is foreground, sends one tiny bounded action and then releases everything. |
+| `look-test` | **yes** | LOOK-001. Injects one known relative mouse movement, captures the picture before it, after it, and after the exact reverse, and reports the measured pixel displacement and its reversibility. Requires `--yes`; every plan is bounded. |
 | `keys` | no | Lists every supported key name. |
 | `config` | no | Prints the effective configuration and where it came from. |
 | `observer` | no | Serves the local read-only observer page. Never enables control. |
@@ -251,10 +255,10 @@ python -m autocraft keys
 The loop refuses to start unless you give it `--steps` or `--seconds`. There
 is no "run forever" option, by design.
 
-`--observer` is available on `observe` and `loop` and does exactly one thing:
-it starts the page and publishes that run's state to it. It does not change
-what the command does, and it never enables input. If the port is already
-busy, the run continues and the page is simply unavailable.
+`--observer` is available on `observe`, `loop` and `look-test` and does exactly
+one thing: it starts the page and publishes that run's state to it. It does not
+change what the command does, and it never enables input. If the port is
+already busy, the run continues and the page is simply unavailable.
 
 ### The first input smoke test
 
@@ -306,6 +310,114 @@ coordinates, so display scaling and DPI awareness cannot distort them. Deltas
 above `max_mouse_delta` (200 by default) are refused rather than clamped, so a
 typo fails loudly instead of yanking the view around.
 
+### The LOOK-001 measurement
+
+`input-test` proves the actuator reaches the game. `look-test` asks the next
+question: **when the pointer moves by a known number of counts, how far does the
+picture move, and does moving back put it back?** That is a measurement, not a
+capability — it is the number TREE-001 would need before anything can be aimed.
+
+```powershell
+python -m autocraft look-test --dx 10 --dy 0 --steps 1 --yes
+```
+
+One trial is a fixed nine-step sequence, and nothing about it is adaptive:
+
+1. Verify the target window is foreground.
+2. Capture frame **A**.
+3. Send the outbound movement (`--dx`, `--dy`).
+4. Wait `--settle` seconds (config `look_settle_seconds`, 0.15 by default).
+5. Capture frame **B**.
+6. Send the exact reverse movement (`-dx`, `-dy`).
+7. Wait `--settle` seconds again.
+8. Capture frame **C**.
+9. Measure and record. Nothing is decided.
+
+`--steps N` repeats that sequence N times in N separate directories, which is
+how you see whether the measurement is repeatable. Focus is re-verified before
+*every* movement, and the guard re-checks it again inside the actuator call.
+
+#### What it reports
+
+- **A→B and A→C mean absolute luma difference, RMSE, and changed-pixel
+  fraction**, plus a `block_grid` × `block_grid` map (config `look_block_grid`,
+  8 by default) so you can see *where* the frame changed rather than only that
+  it did.
+- **Estimated pixel shift**, from OpenCV phase correlation, in pixels, with the
+  response value that came with it.
+- **Pixels per delta**, the mapping ratio on each axis. `null` on an axis you
+  did not move, rather than `0` or `inf`.
+- **Reversibility ratio**: the outbound A→B displacement divided by the A→C
+  displacement that should undo it. `1.0` means the reverse returned the picture
+  to where it started. It is `null` when A and B were indistinguishable, because
+  the ratio would be a division by nothing.
+
+The quality number that comes back from phase correlation is deliberately **not**
+normalised to `0..1`. It is a relative response: read it as an ordering (this
+match is stronger than that one), never as a score with a meaning of its own.
+
+#### Calibration
+
+The mapping is not assumed to be linear, so `look-test` will run a bounded
+series instead of a single delta:
+
+```powershell
+python -m autocraft look-test --calibrate-horizontal --yes
+python -m autocraft look-test --calibrate-vertical --yes
+```
+
+The series is config `look_calibration_deltas` (`[2, 5, 10, 20]` by default),
+one trial per delta, and it is capped by config `look_max_steps` (10 by
+default). A series longer than that bound is refused outright, so editing the
+config cannot produce an unbounded run.
+
+#### Bounds and refusals
+
+Every plan is finite; there is no unbounded mode. These are all usage errors
+(exit `2`), refused before the window layer is consulted:
+
+| Input | Why it is refused |
+|---|---|
+| `--dx 0 --dy 0` | Nothing moved means nothing could be measured. That is not a measurement of zero. |
+| `--dx`/`--dy` above `max_mouse_delta` | Refused, not clamped — the same rule as `input-test`. |
+| `--steps 0` or above `look_max_steps` | The trial count is capped by config. |
+| `--settle` negative, `nan`, `inf`, or above 10s | A settle is a bounded wait, not a delay you can make arbitrary. |
+| `--focus-delay` negative, `nan` or `inf` | Rejected before anything else happens. |
+
+Leaving off `--yes` is a dry run: it prints the whole plan, the window geometry,
+the exact command to repeat it for real, and exits `3` without constructing any
+injection machinery or creating the output directory.
+
+#### What it does not do
+
+- It does **not** resize, move, or reconfigure the game window. A command that
+  reconfigures the thing it is measuring would change the measurement. If the
+  client area is large it says so and stops; resize it yourself.
+- It does **not** apply a pass/fail threshold. There is no `is_good()`, no
+  score, no verdict. It prints numbers and writes them down.
+- It does **not** claim anything understands the camera. The mapping is
+  measured from the mouse delta, never assumed from it.
+
+#### Files
+
+Everything lands in `data/runs/look/` (or `--output PATH`):
+
+```
+look_result.json    the numbers, the plan, the settings, and the limitation notes
+frame_a.png         before the movement
+frame_b.png         after the outbound movement
+frame_c.png         after the exact reverse
+difference_ab.png   |A - B|, the same map the block grid is computed from
+difference_ac.png   |A - C|
+trial-00/ …         one directory per trial when --steps is above 1
+```
+
+Raw pixels are never serialised into the JSON; the record references frames by
+filename. A trial whose frames cannot be compared — the window was resized
+mid-trial, so A and B have different shapes — is recorded as `failed` with the
+reason, and it keeps its raw frames rather than inventing a difference image for
+a comparison that could not be made.
+
 ---
 
 ## The observer page
@@ -317,9 +429,16 @@ python -m autocraft observer --demo     # same page, synthetic data
 
 A local, read-only page that shows what AutoCraft is doing internally: the
 latest captured frame, the current mode, goal and intention, the last action
-and its result, confidence, recent events, the current simulated affect, and
-the safety state. It exists so a run can be watched and streamed without
-reading a log.
+and its result, confidence, recent events, the current simulated affect, the
+safety state, and — during `look-test` — the **Visual motion** panel.
+
+The Visual motion panel shows the measured primitives of the LOOK-001 run: the
+difference statistics, the per-block difference map, the estimated shift, the
+pixels-per-delta ratio, and the reversibility figure. It reads
+`status: not-run` until a trial has actually been measured, and it never fills
+itself in from the plan.
+
+It exists so a run can be watched and streamed without reading a log.
 
 It is **loopback-only by default**. Binding to a non-loopback address requires
 an explicit `--allow-remote`, and requests carrying a non-loopback `Host`
@@ -440,16 +559,26 @@ never consumes the "too many consecutive failures" budget; it waits instead of
 refusing, so pacing cannot masquerade as a safety stop.
 
 **No autonomy by default.** `status`, `capture`, `observe`, `loop`, `keys`,
-`config`, and `observer` never inject input. Only `input-test` can, and it
-requires an explicit `--yes`, states clearly what it is about to do, sends
-exactly one small action, releases it, and exits. It checks foreground in the
-only order that works from a shell: locate and vet the target, print the bounded
-action, demand `--yes` *before* any injection machinery is constructed, and only
-then start a countdown for you to focus the game. After the countdown it
-re-queries the window and refuses unless that exact window is foreground; the
-guard then re-checks foreground again inside the actuator call itself, so focus
-moving in between is still caught. Every refusal path injects nothing and every
-exit path releases everything.
+`config`, and `observer` never inject input. Only `input-test` and `look-test`
+can, and each requires an explicit `--yes`. `input-test` states clearly what it
+is about to do, sends exactly one small action, releases it, and exits. Both
+commands check foreground in the only order that works from a shell: locate and
+vet the target, print the bounded plan, demand `--yes` *before* any injection
+machinery is constructed, and only then start a countdown for you to focus the
+game. After the countdown they re-query the window and refuse unless that exact
+window is foreground; the guard then re-checks foreground again inside the
+actuator call itself, so focus moving in between is still caught. `look-test`
+does that check before *every* movement in the sequence, not once. Every
+refusal path injects nothing and every exit path releases everything.
+
+**LOOK-001 injects through the same actuator as everything else.** `look-test`
+has no input path of its own: it calls `Mouse.move_relative` through the
+existing V0 guard, so the foreground lock, the rate limit, the per-axis bound
+and the release bookkeeping are exactly the ones described above. Its movements
+are bounded twice over — a plan of at most `look_max_steps` trials, and a
+per-axis delta capped by `max_mouse_delta` — and the calibration series is
+capped by the same `look_max_steps` bound, so editing the config cannot produce
+an unbounded run.
 
 **The observer cannot reach the actuators.** The observer page and the thought
 system are downstream of the agent, not upstream of it. Starting the page
@@ -510,8 +639,30 @@ covered:
   and a real 300-step run asserting zero backend events and zero held inputs
 - the memory-honesty property: no thought may reference a memory that is not
   in its context
+- the LOOK-001 frame maths: identical and different frames, the block map's
+  shape, synthetic shifts in both directions on both axes, the divide-by-zero
+  cases returning `null` rather than a number, and reversibility
+- the LOOK-001 runner sequence: a complete trial writes all five artifacts, and
+  focus loss before the first movement, focus loss between `+dx` and `-dx`, a
+  capture failure, a vanished target, and an emergency stop all abort with a
+  reason and no further movement
+- the LOOK-001 record: strict-JSON round-trip, no raw pixels in the JSON, the
+  difference images present only for comparisons that were actually measured,
+  and the limitation notes travelling with every record
+- the LOOK-001 structural prohibitions, checked as **imports** and as the
+  package's declared public surface: no `look` module can reach the control
+  layer, none imports a trained model, and none exposes a pass/fail verdict
+- the `look-test` safety gate: refusal before any input object exists, no output
+  directory created on a refused run, and a dry run that reports the plan
+  without claiming a result
+- the `look-test` ordering: a shell being foreground at launch is fine, and
+  losing focus during the countdown stops the run with the record marked
+  `interrupted` and zero movements sent
+- the `look-test` bounds: a zero delta, an oversized delta, an out-of-range step
+  count, a non-positive or unbounded settle, and a calibration series longer
+  than `look_max_steps` are each refused with the configured bound named
 
-The suite is 528 tests and runs in about 20 seconds. Everything that talks to
+The suite is 643 tests and runs in about 21 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -529,6 +680,10 @@ data/runs/<run-id>/
 
 `<run-id>` is a UTC timestamp plus a short random suffix, so runs sort
 chronologically and two runs in the same second cannot collide.
+
+`look-test` writes its own experiment record alongside the standard run
+directory, in `data/runs/look/` by default. See
+[the LOOK-001 measurement](#the-look-001-measurement) for the layout.
 
 Raw pixels are never serialised into the JSON. A step references a saved
 frame by path instead, which keeps the records small enough to read.
@@ -583,8 +738,21 @@ wiring, nothing more. Still unverified: sustained autonomous movement, repeated
 closed-loop control, camera calibration, the relationship between `dx`/`dy` and
 how far the view actually rotates, perception, navigation, model-backed
 decisions, and long-running autonomous play. A `mouse-move` of `(10, 0)` turned
-the camera *some* amount; it says nothing about the pixels-per-count ratio,
-which would need a calibration pass that does not exist in V0.
+the camera *some* amount; it says nothing about the pixels-per-count ratio.
+
+**The LOOK-001 trial has not been run against the live game.** The tool for it
+exists — `look-test`, documented above — and the machinery behind it is covered
+by the suite, but every one of those tests uses synthetic frames and a fake
+mouse. So at this commit there is **no live measurement**: no pixels-per-delta
+ratio, no reversibility figure, and no evidence about how repeatable either is.
+Those numbers are what the next manual run produces, and until it happens they
+should be treated as unknown rather than as approximately known.
+
+**A measured ratio is a ratio for one configuration.** Even once the trial has
+run, a pixels-per-delta figure is specific to that window size, that field of
+view, that in-game sensitivity, and that mouse setting. It is not a property of
+AutoCraft, and it does not transfer to a different setup without being measured
+again.
 
 ---
 
@@ -596,5 +764,16 @@ and measure what actually changes on screen. Before any of TREE-001 can be
 attempted, the project needs to know what "looking around" does to pixels, and
 how much of a frame is stable while the camera moves.
 
-That work is not started. V0 stops at a foundation that is boring, inspectable,
-and trustworthy.
+The bounded version of that is implemented: `look-test` injects a known relative
+mouse movement, captures A/B/C, and reports the measured displacement and its
+reversibility, with a calibration series for the mapping ratio. What it has not
+done is run against the live game. That is the next step, and it is a manual
+one:
+
+```powershell
+python -m autocraft look-test --dx 10 --dy 0 --steps 1
+```
+
+Everything beyond that — a continuous look stream, stability maps, a
+perception layer — is still not started. V0 stops at a foundation that is
+boring, inspectable, and trustworthy.

@@ -28,6 +28,11 @@ __all__ = [
     "DEFAULT_CAPTURE_FPS",
     "DEFAULT_CONFIG_FILENAME",
     "DEFAULT_EMERGENCY_STOP_KEY",
+    "DEFAULT_LOOK_BLOCK_GRID",
+    "DEFAULT_LOOK_CALIBRATION_DELTAS",
+    "DEFAULT_LOOK_LARGE_WINDOW_PIXELS",
+    "DEFAULT_LOOK_MAX_STEPS",
+    "DEFAULT_LOOK_SETTLE_SECONDS",
     "DEFAULT_MAX_CONSECUTIVE_BLOCKS",
     "DEFAULT_MAX_KEY_HOLD_SECONDS",
     "DEFAULT_MAX_MOUSE_DELTA",
@@ -86,6 +91,32 @@ DEFAULT_OBSERVER_PORT: int = 8765
 #: by accident.
 LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
 
+#: LOOK-001 settings. The milestone injects a known mouse movement and measures
+#: the picture's response, so every bound on that experiment lives here too.
+
+#: Seconds to wait after a movement before capturing the next frame, giving the
+#: game time to finish its own camera interpolation. Too short and the capture
+#: lands mid-motion; too long and unrelated animation has time to change the
+#: scene instead.
+DEFAULT_LOOK_SETTLE_SECONDS: float = 0.15
+
+#: Coarse partition for the difference map. 8x8 keeps the whole map to 64
+#: numbers, small enough to ride along in the observer's JSON payload.
+DEFAULT_LOOK_BLOCK_GRID: int = 8
+
+#: Hard ceiling on planned trials in one ``look-test`` invocation. LOOK-001 has
+#: no unbounded mode, and this is the number that enforces that.
+DEFAULT_LOOK_MAX_STEPS: int = 10
+
+#: Window area above which ``look-test`` warns. 1280x720 is the size the
+#: milestone recommends; a larger window is not refused, only flagged, because
+#: AutoCraft must never resize the game window to suit itself.
+DEFAULT_LOOK_LARGE_WINDOW_PIXELS: int = 1280 * 720
+
+#: The calibration series: injected deltas, in mouse counts, each tried in both
+#: directions. Small on purpose - calibration is a bounded probe, not a sweep.
+DEFAULT_LOOK_CALIBRATION_DELTAS: tuple[int, ...] = (2, 5, 10, 20)
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are missing, malformed or unsafe."""
@@ -126,6 +157,16 @@ class Config:
         thought_min_interval_seconds: Hard cooldown between expressed thoughts.
         thought_max_per_minute: Ceiling on thoughts in any trailing minute.
         thought_history_max: How many recent thoughts the observer retains.
+        look_settle_seconds: Seconds to wait after a LOOK-001 movement before
+            capturing the next frame.
+        look_block_grid: Coarse partition size for the LOOK-001 difference map.
+        look_max_steps: Ceiling on planned trials in one ``look-test`` run. There
+            is no unbounded mode.
+        look_large_window_pixels: Window area above which ``look-test`` warns that
+            the target is larger than the recommended 1280x720.
+        look_calibration_deltas: Injected mouse deltas, in counts, tried in both
+            directions by ``--calibrate-horizontal`` and
+            ``--calibrate-vertical``.
     """
 
     target_title_patterns: tuple[str, ...] = DEFAULT_TARGET_TITLE_PATTERNS
@@ -149,6 +190,11 @@ class Config:
     thought_min_interval_seconds: float = 25.0
     thought_max_per_minute: float = 3.0
     thought_history_max: int = 20
+    look_settle_seconds: float = DEFAULT_LOOK_SETTLE_SECONDS
+    look_block_grid: int = DEFAULT_LOOK_BLOCK_GRID
+    look_max_steps: int = DEFAULT_LOOK_MAX_STEPS
+    look_large_window_pixels: int = DEFAULT_LOOK_LARGE_WINDOW_PIXELS
+    look_calibration_deltas: tuple[int, ...] = DEFAULT_LOOK_CALIBRATION_DELTAS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_title_patterns", tuple(str(p) for p in self.target_title_patterns))
@@ -172,6 +218,15 @@ class Config:
         object.__setattr__(self, "thought_min_interval_seconds", float(self.thought_min_interval_seconds))
         object.__setattr__(self, "thought_max_per_minute", float(self.thought_max_per_minute))
         object.__setattr__(self, "thought_history_max", int(self.thought_history_max))
+        object.__setattr__(self, "look_settle_seconds", float(self.look_settle_seconds))
+        object.__setattr__(self, "look_block_grid", int(self.look_block_grid))
+        object.__setattr__(self, "look_max_steps", int(self.look_max_steps))
+        object.__setattr__(self, "look_large_window_pixels", int(self.look_large_window_pixels))
+        object.__setattr__(
+            self,
+            "look_calibration_deltas",
+            tuple(int(delta) for delta in self.look_calibration_deltas),
+        )
         self._validate()
 
     # -- derived paths ----------------------------------------------------
@@ -225,6 +280,11 @@ class Config:
             "thought_min_interval_seconds": self.thought_min_interval_seconds,
             "thought_max_per_minute": self.thought_max_per_minute,
             "thought_history_max": self.thought_history_max,
+            "look_settle_seconds": self.look_settle_seconds,
+            "look_block_grid": self.look_block_grid,
+            "look_max_steps": self.look_max_steps,
+            "look_large_window_pixels": self.look_large_window_pixels,
+            "look_calibration_deltas": list(self.look_calibration_deltas),
         }
 
     # -- validation -------------------------------------------------------
@@ -299,6 +359,30 @@ class Config:
             raise ConfigError(
                 f"thought_history_max must be at least 1, got {self.thought_history_max}"
             )
+        if self.look_settle_seconds <= 0:
+            raise ConfigError(
+                f"look_settle_seconds must be greater than 0, got {self.look_settle_seconds}"
+            )
+        if self.look_settle_seconds > 10:
+            raise ConfigError(
+                "look_settle_seconds must be at most 10; a longer settle lets the scene "
+                f"change for reasons other than the injected movement, got {self.look_settle_seconds}"
+            )
+        if self.look_block_grid < 1:
+            raise ConfigError(f"look_block_grid must be at least 1, got {self.look_block_grid}")
+        if self.look_max_steps < 1:
+            raise ConfigError(f"look_max_steps must be at least 1, got {self.look_max_steps}")
+        if self.look_large_window_pixels < 1:
+            raise ConfigError(
+                f"look_large_window_pixels must be at least 1, got {self.look_large_window_pixels}"
+            )
+        if not self.look_calibration_deltas:
+            raise ConfigError("look_calibration_deltas must contain at least one delta")
+        if any(delta < 1 for delta in self.look_calibration_deltas):
+            raise ConfigError(
+                "look_calibration_deltas must all be at least 1, "
+                f"got {list(self.look_calibration_deltas)}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +431,25 @@ def _as_str_list(value: Any, *, source: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _as_int_list(value: Any, *, source: str) -> tuple[int, ...]:
+    """Parse a list of positive integers from a comma-separated string or list."""
+    if isinstance(value, str):
+        items: list[Any] = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ConfigError(f"{source}: expected an integer or list of integers, got {value!r}")
+    if not items:
+        raise ConfigError(f"{source}: at least one value is required")
+    parsed: list[int] = []
+    for item in items:
+        try:
+            parsed.append(int(item))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{source}: expected an integer, got {item!r}") from exc
+    return tuple(parsed)
+
+
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
@@ -385,6 +488,13 @@ _TOML_SECTIONS: dict[str, dict[str, tuple[str, Callable[..., Any]]]] = {
         "max_per_minute": ("thought_max_per_minute", _as_float),
         "history_max": ("thought_history_max", _as_int),
     },
+    "look": {
+        "settle_seconds": ("look_settle_seconds", _as_float),
+        "block_grid": ("look_block_grid", _as_int),
+        "max_steps": ("look_max_steps", _as_int),
+        "large_window_pixels": ("look_large_window_pixels", _as_int),
+        "calibration_deltas": ("look_calibration_deltas", _as_int_list),
+    },
 }
 
 _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
@@ -409,6 +519,11 @@ _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
     "THOUGHT_MIN_INTERVAL_SECONDS": ("thought_min_interval_seconds", _as_float),
     "THOUGHT_MAX_PER_MINUTE": ("thought_max_per_minute", _as_float),
     "THOUGHT_HISTORY_MAX": ("thought_history_max", _as_int),
+    "LOOK_SETTLE_SECONDS": ("look_settle_seconds", _as_float),
+    "LOOK_BLOCK_GRID": ("look_block_grid", _as_int),
+    "LOOK_MAX_STEPS": ("look_max_steps", _as_int),
+    "LOOK_LARGE_WINDOW_PIXELS": ("look_large_window_pixels", _as_int),
+    "LOOK_CALIBRATION_DELTAS": ("look_calibration_deltas", _as_int_list),
 }
 
 

@@ -13,6 +13,7 @@ with sentinels that fail loudly if anything reaches for them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -60,11 +61,23 @@ class FakeLocator:
         return True
 
 
+class ForbiddenCapturer:
+    """A capturer that fails the test if anything tries to read the screen."""
+
+    def capture_window(self, window: object) -> object:
+        raise AssertionError("the screen was captured during a command that must not capture")
+
+
 @dataclass
 class FakeRuntime:
     """The subset of ``Runtime`` that the CLI commands actually use."""
 
     locator: FakeLocator
+    config: Config
+    #: A hard failure rather than ``None``: a command that reaches for the
+    #: screen when it should not gets a loud error instead of an
+    #: ``AttributeError`` that a later refactor might accidentally swallow.
+    capturer: object = field(default_factory=ForbiddenCapturer)
 
     def close(self) -> None:
         """``cmd_input_test`` closes the runtime on every exit path."""
@@ -72,7 +85,7 @@ class FakeRuntime:
 
 def _fake_runtime_factory(locator: FakeLocator):
     def factory(config: Config, *, config_source: str) -> FakeRuntime:
-        return FakeRuntime(locator=locator)
+        return FakeRuntime(locator=locator, config=config)
 
     return factory
 
@@ -701,12 +714,307 @@ class TestRerunHint:
         )
 
 
+@dataclass
+class LookHarness:
+    """Everything a test needs to observe one ``look-test`` run."""
+
+    config: Config
+    locator: SequenceLocator
+    guard: FakeGuard
+
+    @property
+    def look_dir(self) -> Path:
+        """Where ``look-test`` writes its frames and its result file."""
+        return Path(self.config.runs_dir) / "look"
+
+    def result_payload(self) -> dict:
+        """The parsed ``look_result.json`` from this run."""
+        import json
+
+        path = self.look_dir / "look_result.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _install_look_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    statuses: list[TargetStatus],
+    *,
+    guard_allows: bool = True,
+) -> LookHarness:
+    """Wire ``look-test`` to fakes all the way down to the actuator boundary.
+
+    No real window, no real sleep, and - the point of the exercise - no real
+    mouse: ``Keyboard`` and ``Mouse`` become plain objects, so a test that
+    reaches the actuator reaches something with no ``move_relative`` at all
+    rather than moving the operator's pointer. The runtime's capturer is a hard
+    failure for the same reason. ``FOCUS_HANDOFF_SECONDS`` is zeroed so the
+    ordering is exercised without waiting.
+    """
+    config = Config(data_dir=tmp_path / "data")
+    locator = SequenceLocator(statuses=list(statuses))
+    guard = FakeGuard(allow=guard_allows)
+    monkeypatch.setattr(cli, "_load", lambda args: (config, "test"))
+    monkeypatch.setattr(cli, "_build_runtime", _fake_runtime_factory(locator))
+    monkeypatch.setattr(cli, "_build_guard", lambda config, locator: guard)
+    monkeypatch.setattr(cli, "Keyboard", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "Mouse", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "FOCUS_HANDOFF_SECONDS", 0.0)
+    return LookHarness(config=config, locator=locator, guard=guard)
+
+
+def _run_look_test(*argv: str) -> int:
+    args = cli.build_parser().parse_args(["look-test", *argv])
+    return cli.cmd_look_test(args)
+
+
+class TestLookTestSafetyGate:
+    """``look-test`` may only inject with ``--yes``, and never before vetting."""
+
+    def test_defaults_to_not_sending(self) -> None:
+        assert cli.build_parser().parse_args(["look-test"]).yes is False
+
+    def test_refuses_without_yes(self, fake_cli_env, no_real_input, capsys) -> None:
+        assert _run_look_test() == 3
+
+        output = capsys.readouterr().out
+        assert "refusing to send input without --yes" in output
+        assert "nothing was sent" in output
+
+    def test_refusal_happens_before_any_input_object_exists(
+        self, fake_cli_env, no_real_input
+    ) -> None:
+        # ``no_real_input`` turns every input class into a hard failure, so
+        # reaching this assertion proves the gate ran before the guard, the
+        # mouse and the actuator existed.
+        assert _run_look_test() == 3
+
+    def test_the_refusal_does_not_create_the_result_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # A refused run must leave nothing behind that could later be mistaken
+        # for the output of a measurement.
+        harness = _install_look_harness(monkeypatch, tmp_path, [_focused_status()])
+
+        assert _run_look_test() == 3
+        assert not harness.look_dir.exists()
+
+    def test_the_refusal_prints_the_exact_rerun_command(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--dx", "12", "--dy", "-4", "--steps", "3") == 3
+
+        assert "\n    autocraft look-test --dx 12 --dy -4 --steps 3 --yes\n" in capsys.readouterr().out
+
+    def test_the_refusal_warns_about_an_oversized_window(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        # The fake target is 3840x1950, far above the recommended ~1280x720.
+        assert _run_look_test() == 3
+
+        output = capsys.readouterr().out
+        assert "WARNING: the client area is 3840x1950" in output
+        # The warning explains itself and stops; it does not act on the window.
+        assert "will not resize your window" in output
+        assert "Resize it yourself" in output
+
+    def test_the_dry_run_reports_the_plan_without_claiming_a_result(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--dx", "10", "--dy", "0", "--steps", "1") == 3
+
+        output = capsys.readouterr().out
+        assert "LOOK-001: MEASURED SENSORIMOTOR MAPPING" in output
+        assert "DRY RUN - 2 movement(s) planned, nothing will be sent" in output
+        # The standing warning that this command can move the pointer stays,
+        # even on a dry run: the operator has to know what --yes would do.
+        assert "LIVE INPUT WILL OCCUR" in output
+
+
+class TestLookTestTargetVetting:
+    """A missing or minimized target is refused before the ``--yes`` gate."""
+
+    def test_refuses_when_no_window_matches(
+        self, monkeypatch: pytest.MonkeyPatch, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        monkeypatch.setattr(fake_cli_env, "status", _missing_status)
+
+        assert _run_look_test("--yes") == 1
+        assert "no target window matched" in capsys.readouterr().err
+
+    def test_refuses_a_minimized_window(
+        self, monkeypatch: pytest.MonkeyPatch, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        monkeypatch.setattr(fake_cli_env, "status", _minimized_status)
+
+        assert _run_look_test("--yes") == 1
+        assert "is minimized" in capsys.readouterr().err
+
+
+class TestLookTestBoundedPlan:
+    """Every plan is finite, and an impossible one is refused with a reason."""
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ("--steps", "0"),
+            ("--steps", "11"),
+            ("--dx", "0", "--dy", "0"),
+            ("--dx", "99999"),
+            ("--dy", "-99999"),
+            ("--settle", "-1"),
+            ("--settle", "60"),
+            ("--focus-delay", "-1"),
+        ],
+    )
+    def test_an_impossible_plan_is_refused(
+        self, fake_cli_env, no_real_input, argv: tuple[str, ...]
+    ) -> None:
+        assert _run_look_test(*argv) == 2
+
+    def test_the_refusal_names_the_configured_bound(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--steps", "11") == 2
+        assert "look_max_steps=10" in capsys.readouterr().err
+
+    def test_an_oversized_delta_is_refused_rather_than_clamped(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--dx", "99999") == 2
+        assert "rather than clamping it" in capsys.readouterr().err
+
+    def test_a_zero_delta_is_refused(self, fake_cli_env, no_real_input, capsys) -> None:
+        # Nothing moved means nothing could be measured, so the run is not a
+        # measurement of zero - it is not a measurement at all.
+        assert _run_look_test("--dx", "0", "--dy", "0") == 2
+        assert "nothing could be measured" in capsys.readouterr().err
+
+    def test_a_negative_settle_is_refused(self, fake_cli_env, no_real_input, capsys) -> None:
+        assert _run_look_test("--settle", "-1") == 2
+        assert "non-negative number of seconds" in capsys.readouterr().err
+
+    def test_an_unbounded_settle_is_refused(self, fake_cli_env, no_real_input, capsys) -> None:
+        assert _run_look_test("--settle", "60") == 2
+        assert "not a bounded wait" in capsys.readouterr().err
+
+
+class TestLookTestCalibration:
+    """The calibration series comes from config and is bounded by look_max_steps."""
+
+    def test_the_horizontal_series_is_the_configured_one(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--calibrate-horizontal") == 3
+
+        output = capsys.readouterr().out
+        assert "horizontal calibration series at x deltas [2, 5, 10, 20]" in output
+        assert "4 (bounded; there is no unbounded mode)" in output
+        # Four trials, each moving out and back.
+        assert "8 movement(s) planned" in output
+
+    def test_the_vertical_series_runs_on_the_other_axis(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--calibrate-vertical") == 3
+
+        output = capsys.readouterr().out
+        assert "vertical calibration series at y deltas [2, 5, 10, 20]" in output
+        assert "  calibration : yes" in output
+
+    def test_the_rerun_hint_keeps_the_calibration_flag(
+        self, fake_cli_env, no_real_input, capsys
+    ) -> None:
+        assert _run_look_test("--calibrate-vertical") == 3
+
+        assert "\n    autocraft look-test --calibrate-vertical --yes\n" in capsys.readouterr().out
+
+    def test_the_calibration_flags_are_mutually_exclusive(self) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            cli.build_parser().parse_args(
+                ["look-test", "--calibrate-horizontal", "--calibrate-vertical"]
+            )
+        assert excinfo.value.code == 2
+
+    def test_a_series_longer_than_the_bound_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # A config edit must not be able to produce an unbounded series: the
+        # length comes from look_calibration_deltas, so that list is what has to
+        # be capped by look_max_steps.
+        config = Config(
+            data_dir=tmp_path / "data",
+            look_calibration_deltas=tuple(range(1, 12)),
+        )
+        monkeypatch.setattr(cli, "_load", lambda args: (config, "test"))
+
+        assert _run_look_test("--calibrate-horizontal") == 2
+
+        stderr = capsys.readouterr().err
+        assert "11 entries, above the look_max_steps bound of 10" in stderr
+
+
+class TestLookTestFocusOrdering:
+    """The foreground handoff must be usable when launched from a shell.
+
+    ``look-test`` is normally typed into PowerShell, so at the discovery query
+    the *shell* is foreground. Refusing there would make the documented trial
+    impossible to run, so the foreground check belongs after the countdown -
+    and it must still stop the run dead when it fails.
+    """
+
+    def test_a_shell_being_foreground_at_launch_is_not_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        _install_look_harness(monkeypatch, tmp_path, [_unfocused_status()])
+
+        assert _run_look_test("--yes") == 1
+
+        captured = capsys.readouterr()
+        assert "not the foreground window" in captured.err
+        assert "nothing was sent" in captured.err
+
+    def test_losing_focus_during_the_countdown_stops_the_run(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # Focused at discovery, unfocused by the time the countdown ends.
+        harness = _install_look_harness(
+            monkeypatch, tmp_path, [_focused_status(), _unfocused_status()]
+        )
+
+        assert _run_look_test("--yes") == 1
+
+        captured = capsys.readouterr()
+        assert "refused: the target window is not the foreground window" in captured.err
+        # No measurement was taken, and the record says so rather than
+        # presenting an empty run as a completed one.
+        payload = harness.result_payload()
+        assert payload["status"] == "interrupted"
+        assert payload["trials"] == []
+        assert payload["movements_sent"] == 0
+        assert "foreground" in payload["stop_reason"]
+
+    def test_the_run_never_reaches_the_actuator_without_focus(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        harness = _install_look_harness(
+            monkeypatch, tmp_path, [_focused_status(), _unfocused_status()]
+        )
+
+        assert _run_look_test("--yes") == 1
+
+        # ``Mouse`` is a bare ``object()`` here, so an injected movement would
+        # raise rather than move the pointer; the guard records the decisions it
+        # was asked for, and there must be none.
+        assert harness.guard.authorize_calls == []
+
+
 class TestParserSurface:
     """The command surface is part of the contract; pin it down."""
 
     def test_all_documented_commands_exist(self) -> None:
         parser = cli.build_parser()
-        for command in ("status", "capture", "observe", "input-test", "keys", "config"):
+        for command in ("status", "capture", "observe", "input-test", "look-test", "keys", "config"):
             args = parser.parse_args([command])
             assert callable(args.func)
 
