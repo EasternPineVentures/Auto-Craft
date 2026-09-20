@@ -85,3 +85,32 @@ large_window_pixels = 921600
 # answer, and no entry may exceed max_mouse_delta, or the whole series is
 # refused before anything is sent.
 calibration_deltas = [5, 10, 25, 50, 100, 200]
+
+[perception]
+# Settings for `autocraft perceive-test` (VISION-001) and for the perception
+# decision policy. Nothing here causes any input to be sent: perceive-test has
+# no --yes flag and never moves the mouse. These values bound how the layer
+# *learns* what the scene normally does, which is what lets it tell a real
+# change from the scene's own animation.
+#
+# Partition the frame is read through. 16x16 gives 256 cells: coarse enough that
+# a cell holds real texture rather than one noisy pixel, fine enough that a
+# small on-screen change still lands in its own cell.
+grid = 16
+# Robust standard deviations above a cell's own typical frame-to-frame movement
+# before that cell counts as changed. The spread itself is learned per cell from
+# this run's frames; this is only the multiplier.
+sigma = 4.0
+# Luma levels. No learned bound may fall below this. Without a floor, a cell
+# that sat perfectly still during learning would get a bound of zero and then
+# flag every later frame as changed.
+floor = 2.0
+# Frames the layer learns "normal" from before it reports anything. A run
+# shorter than this never leaves the learning phase, and says so rather than
+# reporting numbers it cannot support.
+fit_frames = 20
+# Per frame, how far an *unchanged* cell's learned baseline drifts toward what
+# it currently sees. This is what lets the model follow slow lighting change
+# instead of treating it as a change forever. Cells that are currently flagged
+# as changed keep their baseline, so real motion cannot desensitise the model.
+adapt_rate = 0.05

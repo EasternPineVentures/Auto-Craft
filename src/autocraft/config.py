@@ -39,6 +39,11 @@ __all__ = [
     "DEFAULT_MIN_ACTION_INTERVAL",
     "DEFAULT_OBSERVER_HOST",
     "DEFAULT_OBSERVER_PORT",
+    "DEFAULT_PERCEPTION_ADAPT_RATE",
+    "DEFAULT_PERCEPTION_FIT_FRAMES",
+    "DEFAULT_PERCEPTION_FLOOR",
+    "DEFAULT_PERCEPTION_GRID",
+    "DEFAULT_PERCEPTION_SIGMA",
     "DEFAULT_TARGET_TITLE_PATTERNS",
     "ENV_PREFIX",
     "SUPPORTED_IMAGE_FORMATS",
@@ -124,6 +129,43 @@ DEFAULT_LOOK_LARGE_WINDOW_PIXELS: int = 1280 * 720
 #: resolution of the instrument and report near-zero estimates for all of them.
 DEFAULT_LOOK_CALIBRATION_DELTAS: tuple[int, ...] = (5, 10, 25, 50, 100, 200)
 
+#: VISION-001 settings. The perception layer learns what each part of the scene
+#: normally does, so these bound that learning rather than any game input. The
+#: whole ``autocraft.perception`` package is read-only: it can look at the game
+#: and has no code path that reaches :mod:`autocraft.control`.
+
+#: Partition the frame is read through. 16x16 gives 256 cells, coarse enough that
+#: a cell holds real texture rather than a single noisy pixel, and fine enough
+#: that a small on-screen change still lands in its own cell.
+DEFAULT_PERCEPTION_GRID: int = 16
+
+#: How many robust standard deviations above a cell's typical frame-to-frame
+#: movement count as "this cell changed". The bound itself is learned per cell
+#: from real frames; this is only the multiplier applied to the learned spread.
+DEFAULT_PERCEPTION_SIGMA: float = 4.0
+
+#: Luma levels. No learned bound is allowed below this. Without a floor, a cell
+#: that happened to sit perfectly still while the model was fitted would get a
+#: bound of zero and then flag every subsequent frame as changed.
+DEFAULT_PERCEPTION_FLOOR: float = 2.0
+
+#: Frames the perception layer learns "normal" from before it starts reporting.
+#: A run shorter than this never gets past the learning phase, and says so rather
+#: than reporting numbers it cannot support.
+DEFAULT_PERCEPTION_FIT_FRAMES: int = 20
+
+#: Per frame, how far an *unchanged* cell's learned baseline drifts toward the
+#: current frame, in ``0.0 .. 1.0``. Zero disables adaptation entirely.
+#:
+#: Adaptation exists because of a measured failure. In the first real run, the
+#: scene's ambient lighting shifted at about frame 28 and stayed shifted. A model
+#: fitted on frames 0-19 and then frozen reported that shift as a change on every
+#: remaining frame forever - precisely the failure this layer exists to prevent.
+#: Letting quiet cells drift absorbs a persistent scene change; cells currently
+#: flagged as changed are held back, so a transient change still stands out until
+#: it either goes away or proves it is the new normal.
+DEFAULT_PERCEPTION_ADAPT_RATE: float = 0.05
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are missing, malformed or unsafe."""
@@ -174,6 +216,17 @@ class Config:
         look_calibration_deltas: Injected mouse deltas, in counts, tried in both
             directions by ``--calibrate-horizontal`` and
             ``--calibrate-vertical``.
+        perception_grid: Coarse partition the perception layer reads a frame
+            through.
+        perception_sigma: Robust standard deviations above a cell's learned
+            typical frame-to-frame movement that count as a change.
+        perception_floor: Lower bound, in luma levels, on any learned change
+            bound.
+        perception_fit_frames: Frames the perception layer learns "normal" from
+            before it reports anything.
+        perception_adapt_rate: Per frame, how far an unchanged cell's learned
+            baseline drifts toward the current frame. Zero freezes the model at
+            the end of its learning phase.
     """
 
     target_title_patterns: tuple[str, ...] = DEFAULT_TARGET_TITLE_PATTERNS
@@ -202,6 +255,11 @@ class Config:
     look_max_steps: int = DEFAULT_LOOK_MAX_STEPS
     look_large_window_pixels: int = DEFAULT_LOOK_LARGE_WINDOW_PIXELS
     look_calibration_deltas: tuple[int, ...] = DEFAULT_LOOK_CALIBRATION_DELTAS
+    perception_grid: int = DEFAULT_PERCEPTION_GRID
+    perception_sigma: float = DEFAULT_PERCEPTION_SIGMA
+    perception_floor: float = DEFAULT_PERCEPTION_FLOOR
+    perception_fit_frames: int = DEFAULT_PERCEPTION_FIT_FRAMES
+    perception_adapt_rate: float = DEFAULT_PERCEPTION_ADAPT_RATE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_title_patterns", tuple(str(p) for p in self.target_title_patterns))
@@ -234,6 +292,11 @@ class Config:
             "look_calibration_deltas",
             tuple(int(delta) for delta in self.look_calibration_deltas),
         )
+        object.__setattr__(self, "perception_grid", int(self.perception_grid))
+        object.__setattr__(self, "perception_sigma", float(self.perception_sigma))
+        object.__setattr__(self, "perception_floor", float(self.perception_floor))
+        object.__setattr__(self, "perception_fit_frames", int(self.perception_fit_frames))
+        object.__setattr__(self, "perception_adapt_rate", float(self.perception_adapt_rate))
         self._validate()
 
     # -- derived paths ----------------------------------------------------
@@ -247,6 +310,15 @@ class Config:
     def runs_dir(self) -> Path:
         """Where per-run telemetry directories are written."""
         return self.data_dir / "runs"
+
+    @property
+    def models_dir(self) -> Path:
+        """Where fitted perception models are written.
+
+        Models are artifacts of a run, not of a checkout, so they live under
+        ``data/`` alongside captures and runs and are never committed.
+        """
+        return self.data_dir / "models"
 
     @property
     def step_interval(self) -> float:
@@ -292,6 +364,11 @@ class Config:
             "look_max_steps": self.look_max_steps,
             "look_large_window_pixels": self.look_large_window_pixels,
             "look_calibration_deltas": list(self.look_calibration_deltas),
+            "perception_grid": self.perception_grid,
+            "perception_sigma": self.perception_sigma,
+            "perception_floor": self.perception_floor,
+            "perception_fit_frames": self.perception_fit_frames,
+            "perception_adapt_rate": self.perception_adapt_rate,
         }
 
     # -- validation -------------------------------------------------------
@@ -389,6 +466,32 @@ class Config:
             raise ConfigError(
                 "look_calibration_deltas must all be at least 1, "
                 f"got {list(self.look_calibration_deltas)}"
+            )
+        if self.perception_grid < 1:
+            raise ConfigError(f"perception_grid must be at least 1, got {self.perception_grid}")
+        if self.perception_grid > 128:
+            raise ConfigError(
+                "perception_grid must be at most 128; a finer grid gives cells too small "
+                f"to hold any texture, got {self.perception_grid}"
+            )
+        if self.perception_sigma <= 0:
+            raise ConfigError(
+                f"perception_sigma must be greater than 0, got {self.perception_sigma}"
+            )
+        if self.perception_floor < 0:
+            raise ConfigError(
+                f"perception_floor must not be negative, got {self.perception_floor}"
+            )
+        if self.perception_fit_frames < 2:
+            raise ConfigError(
+                "perception_fit_frames must be at least 2; a spread needs at least one "
+                f"frame-to-frame difference, got {self.perception_fit_frames}"
+            )
+        if not 0.0 <= self.perception_adapt_rate <= 1.0:
+            raise ConfigError(
+                "perception_adapt_rate must be between 0 and 1; it is the fraction "
+                "of the gap a quiet cell closes each frame, so a value above 1 would "
+                f"overshoot the current frame, got {self.perception_adapt_rate}"
             )
 
 
@@ -502,6 +605,13 @@ _TOML_SECTIONS: dict[str, dict[str, tuple[str, Callable[..., Any]]]] = {
         "large_window_pixels": ("look_large_window_pixels", _as_int),
         "calibration_deltas": ("look_calibration_deltas", _as_int_list),
     },
+    "perception": {
+        "grid": ("perception_grid", _as_int),
+        "sigma": ("perception_sigma", _as_float),
+        "floor": ("perception_floor", _as_float),
+        "fit_frames": ("perception_fit_frames", _as_int),
+        "adapt_rate": ("perception_adapt_rate", _as_float),
+    },
 }
 
 _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
@@ -531,6 +641,11 @@ _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
     "LOOK_MAX_STEPS": ("look_max_steps", _as_int),
     "LOOK_LARGE_WINDOW_PIXELS": ("look_large_window_pixels", _as_int),
     "LOOK_CALIBRATION_DELTAS": ("look_calibration_deltas", _as_int_list),
+    "PERCEPTION_GRID": ("perception_grid", _as_int),
+    "PERCEPTION_SIGMA": ("perception_sigma", _as_float),
+    "PERCEPTION_FLOOR": ("perception_floor", _as_float),
+    "PERCEPTION_FIT_FRAMES": ("perception_fit_frames", _as_int),
+    "PERCEPTION_ADAPT_RATE": ("perception_adapt_rate", _as_float),
 }
 
 

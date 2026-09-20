@@ -4,9 +4,15 @@ An experimental project to build an agent that learns to play a Minecraft-like
 voxel survival game by **looking at the screen** and **using the keyboard and
 mouse** — the same way a person does.
 
-AutoCraft V0 is deliberately small. It contains no learning, no perception
-model, and no game knowledge. It is the nervous system: find the game window,
-see the pixels, and move the hands — safely.
+AutoCraft V0 is deliberately small. It contains no game knowledge and no
+learning of its own: the `loop` command's decision policy always chooses to do
+nothing. It is the nervous system: find the game window, see the pixels, and
+move the hands — safely. The one thing added on top of that foundation is a
+scene model that learns what each part of the picture normally does, so that
+"the picture did not move" can be told apart from "the picture moved by less
+than I can see". It is read-only, it is not wired into the loop, and it is
+documented in full under
+[The one exception: the scene model in `perception/`](#the-one-exception-the-scene-model-in-perception).
 
 ---
 
@@ -61,9 +67,16 @@ specification:
 | I | Basic experiment telemetry (one directory per run) |
 | J | Safety controls: focus lock, emergency stop, guaranteed key release |
 
-The decision layer is a **`NoOpDecisionPolicy`**. It always chooses to do
-nothing. There is no AI in V0, on purpose: the loop skeleton had to be
-trustworthy before anything is allowed to plug into it.
+The decision layer the `loop` command uses is a **`NoOpDecisionPolicy`**. It
+always chooses to do nothing. There is no AI in the loop, on purpose: the loop
+skeleton had to be trustworthy before anything is allowed to plug into it.
+
+Since then the owner lifted the LLM/model-API prohibition for one narrow purpose,
+and `perception/` now exists: a scene model fitted online from the run's own
+frames, plus a `PerceptionDecisionPolicy` that implements the same
+`DecisionPolicy` protocol. It is read-only, it is not wired into `loop`, and the
+distinction is set out in full below — see
+[The one exception: the scene model in `perception/`](#the-one-exception-the-scene-model-in-perception).
 
 ---
 
@@ -117,6 +130,38 @@ dashboard", and it is drawn tightly: it is read-only, it is loopback-only, it
 has no build step, no framework, and no dependency the agent does not already
 need. See [The observer page](#the-observer-page).
 
+### The one exception: the scene model in `perception/`
+
+The project owner lifted the **LLM / model-API** prohibition so that the
+perception layer could be built. It is worth being precise about what was
+lifted, because the list above is otherwise still in force.
+
+**What `perception/` is.** It fits a small statistical model of the scene from
+the run's *own* frames. For each cell of a 16x16 partition it learns a robust
+centre, a robust spread, and a ridge regression from seven cheap appearance
+features to the cell's observed frame-to-frame movement. All of it is
+computed at run time by the process itself, in numpy, on frames it just
+captured. Nothing is downloaded, nothing is pre-trained, and no network call is
+made.
+
+**What it is not.** It is not a trained vision model: there are no weights
+shipped, nothing was trained offline on a corpus, and the "model" is a handful
+of per-cell means and a 8x256 coefficient matrix that is thrown away at the end
+of a run unless you ask for it to be saved. It contains no object detector, no
+classifier, and no notion of what anything on screen *is*. It answers one
+question — "does this cell look like the cell I learned?" — and nothing else.
+
+**Why it is measurement rather than capability.** The distinction the list is
+protecting is between *measuring the instrument* and *giving the agent new
+powers*. This layer is the former: it is the thing that makes the question "did
+the camera actually move?" answerable at all, which is exactly what the
+LOOK-001 trial could not settle. It is read-only, it is in the same
+`AGENT != EVALUATOR` position as `vision/`, and it has no code path that
+reaches `control/` — pinned by an import-structure test, not by convention.
+
+Everything else on the list, including "no reinforcement learning" and "no
+object detector, no trained vision model", is unchanged and unplanned.
+
 ---
 
 ## Architecture
@@ -128,6 +173,8 @@ can be replaced without touching the others.
 GAME          Luanti / VoxelLibre  (never modified, never inspected internally)
   |
 SENSORS       vision/     screen capture -> Frame (a numpy BGRA array)
+  |
+PERCEPTION    perception/ Frame -> per-cell scene model -> SceneScore
   |
 AGENT         agent/      Observation -> Decision -> Action
   |
@@ -147,15 +194,26 @@ EXPRESSION    thoughts/   ThoughtEvent (generated, never acted on)
 The last two boxes are deliberately **below** the arrow, not beside it.
 `observer/` and `thoughts/` read published facts; nothing in them can reach
 `control/`. That is enforced by import structure and pinned by tests.
+`perception/` sits in the same position: it is a sensor, not an actuator, and
+the same test forbids it from importing the control layer.
 
 ```
 src/autocraft/
   config.py              frozen Config: window patterns, limits, directories
-  cli.py                 the eight commands
+  cli.py                 the nine commands
   vision/
     window.py            Win32 window discovery + client-area geometry
     capture.py           mss-backed client-area capture
     frame.py             ScreenRegion + Frame (block means, difference, save)
+  perception/
+    features.py          per-cell appearance: seven features + the cell partition
+    stability.py         StabilityModel: the learned scene model + SceneScore
+    session.py           PerceptionSession: a frame source through the model
+    policy.py            PerceptionDecisionPolicy: a DecisionPolicy over the model
+  look/
+    metrics.py           frame maths: difference, shift, reversibility
+    record.py            the LOOK-001 result schema
+    runner.py            the fixed nine-step trial sequence
   control/
     keymap.py            key names <-> virtual key codes
     win32_input.py       SendInput via ctypes (scan codes)
@@ -274,6 +332,7 @@ Touching the game is always explicit.
 | `loop` | no | Runs the bounded agent loop with the no-op policy. |
 | `input-test` | **yes** | Explicit smoke test. Prints the bounded action, requires `--yes`, gives you 10 seconds (`--focus-delay`) to focus the game, re-verifies that exact window is foreground, sends one tiny bounded action and then releases everything. |
 | `look-test` | **yes** | LOOK-001. Injects one known relative mouse movement, captures the picture before it, after it, and after the exact reverse, and reports the measured pixel displacement and its reversibility. Requires `--yes`; every plan is bounded. |
+| `perceive-test` | no | VISION-001. Observes for a bounded time, learns what each cell of the scene normally does from the run's own frames, then reports per-cell change as it goes. Never sends input and has no `--yes` flag. |
 | `keys` | no | Lists every supported key name. |
 | `config` | no | Prints the effective configuration and where it came from. |
 | `observer` | no | Serves the local read-only observer page. Never enables control. |
@@ -284,6 +343,7 @@ python -m autocraft capture
 python -m autocraft observe --seconds 5 --steps 60
 python -m autocraft observe --seconds 30 --steps 300 --observer
 python -m autocraft loop --steps 5 --seconds 10
+python -m autocraft perceive-test --seconds 30
 python -m autocraft observer --demo
 python -m autocraft keys
 ```
@@ -501,6 +561,163 @@ a comparison that could not be made.
 
 ---
 
+### The VISION-001 scene model
+
+`look-test` measures the actuator against the picture. `perceive-test` asks the
+question underneath it: **what does this scene normally do, and did anything
+actually change?** Without an answer, "the picture did not move" and "the picture
+moved by less than I can see" are the same observation — which is exactly the
+hole the first LOOK-001 trial fell into.
+
+```powershell
+python -m autocraft perceive-test --seconds 30
+```
+
+It never sends input, it has no `--yes` flag, and it has no dry-run mode because
+there is nothing to authorise. The test suite goes further than the flag: it
+replaces `Keyboard`, `Mouse`, `ActionExecutor`, `SafetyGuard` **and** the guard
+factory with hard failures, so a `perceive-test` run that reaches exit `0` has
+proved that no input machinery was even constructed.
+
+#### Why a fixed threshold cannot do this
+
+The obvious implementation is "a pixel changed if it differs by more than *N*".
+That was measured against 60 real frames of the live game first, and it does not
+work:
+
+- The scene is **almost entirely static**. Only 3.12% of pixels ever differ by
+  more than 8 luma levels, and they sit in one wide horizontal band
+  (`y 1521..1693`, `x 619..2692`).
+- That band is **animated texture cycling**, not noise. Some consecutive frames
+  are *pixel-identical*; others differ by a maximum of *exactly* 77.0 in 0.0029%
+  of pixels. A fixed cutoff either ignores the animation or calls it a change,
+  depending on which frames it happens to compare.
+- The scene's overall brightness **drifts** — mean luma went 15.927 → 16.290 over
+  50 frames in the quiet recorded set, and 41.05 → 73.44 over 40 seconds in one
+  live run. Any global threshold is chasing that drift.
+
+On the recorded set, a flat `8.0` cutoff reported a mean of **0.70** changed
+cells (range 0–1) — it **misses the animated band entirely**. The learned model,
+on the same frames, reported a mean of **16.50** (range 1–21) and localized the
+band to rows 12–13, columns 3–13 of a 16x16 grid, with **zero** false positives
+across the other 87% of the grid. That comparison is the entire justification for
+this layer.
+
+#### What it learns
+
+For every cell of the 16x16 partition (config `perception_grid`), from a warm-up
+window of frames (config `perception_fit_frames`, 20 by default):
+
+- a robust **centre** — the mean luma the cell normally shows;
+- a robust **spread** — the 90th percentile of the cell's observed frame-to-frame
+  movement, divided by 1.6449 so it reads as a standard deviation;
+- a per-cell **ridge regression** from seven cheap appearance features
+  (`mean_r`, `mean_g`, `mean_b`, `mean_luma`, `std_luma`, `edge_energy`,
+  `colour_spread`) to the movement that cell is observed to make.
+
+A cell counts as changed when it exceeds
+`max(floor, sigma * spread, predicted_movement)` — config `perception_floor`
+(2.0 luma levels) stops a cell that happened to be perfectly still during
+learning from getting a bound of zero, and `perception_sigma` (4.0) is the
+multiplier on the learned spread.
+
+Once fitted, the model **adapts**: on each frame an *unchanged* cell's centre
+drifts toward what it currently sees, at config `perception_adapt_rate` (0.05 per
+frame). That is what lets it follow slow lighting change instead of calling it a
+change forever. A cell that is currently **flagged** keeps its centre — so real
+motion cannot desensitise the model — but its *spread* still learns from every
+frame, because a cell that is repeatedly surprising should get a wider idea of
+normal, while one surprise should not.
+
+#### What it reports
+
+- **Warm-up versus steady.** A run shorter than `perception_fit_frames` never
+  leaves the learning phase. It says so, reports `complete: false`, and still
+  writes its measurement — "the warm-up never finished" is a result.
+- **Per-frame change**: how many of the 256 cells changed, what fraction of the
+  grid that is, and the total and maximum excess above each cell's own allowance.
+- **An accumulated excess map** — where change kept happening across the whole
+  run, rendered as ASCII on the terminal and as a 16x16 grid in the JSON. This is
+  the part that answers "did anything move", and it is why the animated band is
+  visible as a band rather than as a count.
+- **The model's own fit numbers**, including `floor_share`: the fraction of cells
+  whose bound came from the floor rather than from anything learned. A high
+  `floor_share` means the model learned almost nothing and is running on the
+  floor.
+- **No verdict.** There is no pass/fail threshold, no `is_good()`, and no claim
+  that anything was recognized. It prints numbers and writes them down.
+
+#### The two live runs, and why they disagree
+
+`perceive-test` has been run twice against Luanti 5.17.0, both with the game
+focused and neither sending input. **The two runs disagree sharply, and that
+disagreement is the finding.** Quoting them both is more useful than quoting
+either.
+
+| | Recorded set (unfocused, 60 frames) | Live run 2 (`…90360bf0`, 40 s) | Live run 1 (`…34371370`, 45 s) |
+|---|---|---|---|
+| warm-up | 20 frames | 20 frames | 20 frames |
+| scored frames | 39 | 36 | 45 |
+| `floor_share` | 0.996 | 0.000 | — |
+| fitted `movement_mean` | 0.0023 | 21.30 | — |
+| fitted `spread_mean` | 0.0035 | 33.33 | — |
+| changed cells per frame (mean) | 16.50 | 0.22 | 5.29 |
+| changed cells (range) | 1–21 | 0–4 | 0–55 |
+| total excess (mean / max) | — | 1.78 / 43.12 | 70.77 / 833.02 |
+
+Three things are visible in that table and none of them is a bug to hide:
+
+**The model learns whatever the warm-up window contains.** In the quiet recorded
+set the warm-up saw almost no movement, so `floor_share` was 0.996 — 99.6% of
+cells were running on the floor bound rather than on anything learned, and the
+model then reported 16.5 changed cells per frame against a scene that was
+essentially static. That is an honest over-report: with nothing learned, the
+floor is doing all the work.
+
+**The live run's warm-up captured a transient.** Live run 2 fitted
+`movement_mean` 21.30 and `spread_mean` 33.33, which produced a mean allowance of
+**70.0** luma levels — far above the 13.2 mean deviation it was actually seeing.
+With an allowance that wide, the same scene scores 0.22 changed cells per frame.
+The model is not wrong; it was calibrated against 20 frames that happened to
+contain a lot of motion.
+
+**And the scene itself genuinely changed mid-run.** This is the more important
+half. Over live run 2, mean luma rose **41.05 → 73.44**, `std_luma` 13.29 →
+19.74, and `colour_spread` 15.58 → 33.97. That is a large, systematic change in
+what the camera was looking at, *after* the model had already been fitted. A
+longer warm-up would not fix this: the model's answer to it is the `adapt_rate`
+centre drift, and 0.05 per frame at the capture rate this machine achieves
+(about 2.4 fps at 3222x1928) is far too slow to track a change that size.
+
+So the model's weakest points are named and measured: **the warm-up window can
+catch a transient, and the adaptation rate cannot follow a scene that changes
+this much.** Both are configuration, both are recorded in every run's JSON, and
+the accumulated excess map is what makes either visible. The next design step is
+to fit against a median-of-medians warm-up and to warn when the fitted
+`movement_mean` looks like a transient; neither is implemented yet.
+
+#### Files
+
+Everything lands in `data/runs/<run-id>/`:
+
+```
+perceive_result.json   summary, timeline, model fit, and the accumulated map
+steps.ndjson           one JSON object per frame, streamed as the run goes
+```
+
+The result file is written **before** any of the pretty-printing, and it is
+written for incomplete runs too. A live run once lost 45 seconds of measurement
+to a formatting error in the reporting path; that ordering is now pinned by a
+test that makes the printing fail on purpose and asserts the numbers still
+reached disk.
+
+A fitted model can also be saved and reloaded (`StabilityModel.save` /
+`load`), which is what `data/models/` is for. Nothing writes there
+automatically, the directory is gitignored, and a model that has not been fitted
+refuses to serialise rather than writing an empty file.
+
+---
+
 ## The observer page
 
 ```powershell
@@ -538,10 +755,12 @@ pinned by a test:
    which would make the log a record of the dashboard's polling rather than of
    the agent's behaviour.
 
-**Truthful empty states.** V0 has no perception: no object detector, no tree
-recognition, no privileged state. Beliefs and detected entities are therefore
-displayed as empty, and say so. The page never invents perception to look
-busier than the agent is.
+**Truthful empty states.** V0 has no object detector, no tree recognition, and
+no privileged state. Beliefs and detected entities are therefore displayed as
+empty, and say so. The page never invents perception to look busier than the
+agent is. The VISION-001 scene model is not published to the page either:
+`perceive-test` writes its result to `data/runs/<run-id>/perceive_result.json`,
+and nothing on the page pretends otherwise.
 
 **One-directional by construction.** `LoopPublisher` receives safety as a
 provider function and confidence as a callback, so the bridge never holds a
@@ -742,8 +961,41 @@ covered:
 - the `look-test` bounds: a zero delta, an oversized delta, an out-of-range step
   count, a non-positive or unbounded settle, and a calibration series longer
   than `look_max_steps` are each refused with the configured bound named
+- the VISION-001 cell partition: `cell_luma` against `Frame.block_means` on an
+  even split, the deliberate divergence between the two layers on an uneven
+  frame, and that the perception partition covers every pixel exactly once
+- the VISION-001 feature vector: every cell feature, the ragged-frame refusal,
+  and the declared feature-name order matching what the extractor returns
+- the VISION-001 model: fitting, that a still scene is reported as still, that a
+  post-warm-up change is localized to the cells it happened in, that adaptation
+  drifts a quiet cell's centre and leaves a flagged one's alone, that one large
+  surprise cannot desensitise a cell, that the spread still learns from a
+  flagged cell, strict-JSON round-trip through `save`/`load`, and that an
+  unfitted model refuses to serialise
+- the VISION-001 session: the stop reasons for a step limit, a time limit and a
+  replayed frame set, capture failures counted rather than raised, and an
+  incomplete warm-up reported as incomplete
+- the VISION-001 policy: that it is a real `DecisionPolicy`, that it never
+  exceeds `max_mouse_delta`, and that it nudges one axis toward the worst cell
+  rather than stalling
+- the VISION-001 structural prohibitions, checked as **imports** and as the
+  package's declared public surface — including a test that pins the
+  relative-import resolver itself, because a resolver that silently returns
+  nothing would make every other structural check pass forever without checking
+  anything
+- the `perceive-test` safety gate: no input machinery is constructed, frames
+  arrive only through the observer, the record contains no verdict, and the
+  command says so
+- the `perceive-test` target vetting: a missing window and a minimised window are
+  each refused with no result file written, and an oversized window warns but
+  still measures
+- the `perceive-test` bounds: `--steps` bounds the run and the observer is called
+  exactly that many times, and an incomplete warm-up is both reported and
+  persisted with `complete: false`
+- the `perceive-test` persist-before-print ordering: the printing is made to fail
+  on purpose, and the result file still holds the full measurement
 
-The suite is 644 tests and runs in about 21 seconds. Everything that talks to
+The suite is 725 tests and runs in about 23 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -817,10 +1069,12 @@ why the default countdown is now 10 seconds and `--focus-delay` exists.
 **What two bounded smoke tests do not establish.** They prove the actuator
 wiring, nothing more. Still unverified: sustained autonomous movement, repeated
 closed-loop control, camera calibration, the relationship between `dx`/`dy` and
-how far the view actually rotates, perception, navigation, model-backed
-decisions, and long-running autonomous play. A `mouse-move` of `(10, 0)` was
-accepted by the game, but the LOOK-001 trial measured no picture movement from it,
-so even that much is now in doubt.
+how far the view actually rotates, navigation, model-backed decisions, and
+long-running autonomous play. A `mouse-move` of `(10, 0)` was accepted by the
+game, but the LOOK-001 trial measured no picture movement from it, so even that
+much is now in doubt. The VISION-001 scene model narrows that gap — it can now
+say whether a frame changed — but it has never been run against a *moving*
+camera, so it does not close it.
 
 **The LOOK-001 trial has been run once, and it did not measure the mapping.** The
 tool exists — `look-test`, documented above — and one live trial at `(+10, +0)` is
@@ -838,44 +1092,83 @@ view, that in-game sensitivity, and that mouse setting. It is not a property of
 AutoCraft, and it does not transfer to a different setup without being measured
 again.
 
+**The VISION-001 scene model has two measured weak points.** Both are visible in
+the two live `perceive-test` runs and neither is fixed:
+
+- **The warm-up window can catch a transient.** Live run 2 fitted a mean
+  frame-to-frame movement of 21.30 and a mean spread of 33.33, giving a mean
+  allowance of 70.0 luma levels against a mean observed deviation of 13.2. The
+  model then reported 0.22 changed cells per frame — an honest reading of a model
+  calibrated against 20 unusually busy frames. On the quiet recorded set the same
+  code reported `floor_share` 0.996, meaning 99.6% of cells were running on the
+  configured floor rather than on anything learned. A median-of-medians fit and a
+  warning when the fitted movement looks like a transient are the obvious next
+  steps; neither is implemented.
+- **The adaptation rate cannot follow a scene that changes a lot.** In live run 2
+  the mean luma rose 41.05 → 73.44 and `colour_spread` 15.58 → 33.97 over 40
+  seconds, *after* the model was fitted. The only mechanism for that is the
+  `adapt_rate` centre drift, and 0.05 per frame at this machine's ~2.4 fps
+  capture rate is far too slow. A longer warm-up does not help this case.
+
+There is also **no verdict anywhere** in the layer, deliberately. It reports
+changed cells, excess, and where the change accumulated; deciding whether any of
+that means "the camera moved" is a separate, unbuilt thing.
+
+**The camera-engagement question is still open, and the scene model is why it can
+now be settled.** The first LOOK-001 trial at `(+10, +0)` measured no picture
+movement, and the two live `perceive-test` runs show why that was hard to read:
+this scene has a genuine animated band and drifts in brightness on its own, so
+"nothing changed" and "something changed by an unmeasurable amount" were not
+distinguishable by a fixed cutoff. The next probe is still
+`look-test --dx 200 --dy 0 --steps 1 --yes`, now with a scene model available to
+tell the band's animation apart from the camera. If a 200-count delta also moves
+the picture by nothing measurable, the cause is engagement rather than
+sensitivity.
+
 ---
 
 ## Where this goes next
 
-**VISION-001 / LOOK-001** is the recommended next milestone: capture a
-continuous stream of gameplay frames while deliberately rotating the camera,
-and measure what actually changes on screen. Before any of TREE-001 can be
-attempted, the project needs to know what "looking around" does to pixels, and
-how much of a frame is stable while the camera moves.
+**The perception layer is now real, and the next milestone is still LOOK-001's
+open question.** `perceive-test` (VISION-001) observes for a bounded time, learns
+what each cell of the scene normally does from the run's own frames, and reports
+per-cell change as it goes — read-only, no verdict, no input. It has been run
+live twice and both runs are documented above, including the two ways it is
+currently weak.
 
-The bounded version of that is implemented: `look-test` injects a known relative
-mouse movement, captures A/B/C, and reports the measured displacement and its
-reversibility, with a calibration series for the mapping ratio. It has now been
-run against the live game once, at `(+10, +0)`, and that run did not measure the
-mapping — 10 counts moved the picture by less than the method can resolve. So the
-next step is the same measurement with a delta large enough to produce one:
-
-```powershell
-python -m autocraft look-test --calibrate-horizontal --yes
-```
-
-The series ascends to `max_mouse_delta` (200), so it brackets the answer instead
-of starting below the resolution of the instrument. A single large delta is the
-cheaper first probe:
+What it has **not** done is change the fact that there is no live mapping number.
+The immediate next step is unchanged, and it is a single command:
 
 ```powershell
 python -m autocraft look-test --dx 200 --dy 0 --steps 1 --yes
 ```
 
-Click inside the game window during the countdown before either of these. If a
+Click inside the game window during the countdown before running it. If a
 200-count delta still moves the picture by nothing measurable, the cause is that
 the camera look is not engaged rather than that sensitivity is low, and that is a
-different problem to solve.
+different problem to solve. The full series is the follow-up:
+
+```powershell
+python -m autocraft look-test --calibrate-horizontal --yes
+```
 
 (If either reports `invalid choice: 'look-test'`, you are running from a different
 worktree than the branch — see
 [Working from a git worktree](#working-from-a-git-worktree).)
 
-Everything beyond that — a continuous look stream, stability maps, a
-perception layer — is still not started. V0 stops at a foundation that is
-boring, inspectable, and trustworthy.
+**After that**, the ordering that follows from what has actually been measured:
+
+1. **Settle the warm-up and adaptation weaknesses.** A median-of-medians fit and
+   a transient warning, both driven by the two live runs above.
+2. **Capture a focused series with deliberate movement.** Every capture so far
+   was either unfocused or had no camera movement, so there is still no data
+   about what a moving camera does to these per-cell statistics. That is the
+   first thing TREE-001 would need.
+3. **Only then** a movement-sensitive decision policy. `PerceptionDecisionPolicy`
+   exists and is tested, but it is unvalidated against real motion, and
+   validating it needs step 2.
+
+A perception layer that cannot yet tell a camera pan from an animated river is
+not a foundation for tree recognition, and pretending otherwise would undo the
+point of measuring. V0 still stops at a foundation that is boring, inspectable,
+and trustworthy.

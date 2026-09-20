@@ -1,4 +1,4 @@
-"""AutoCraft's command line interface.
+﻿"""AutoCraft's command line interface.
 
 Design rule for every command here: **looking is always safe, touching is always
 explicit.** ``status``, ``capture`` and ``observe`` read pixels and print facts -
@@ -13,6 +13,7 @@ no-op policy, and the loop refuses to run without an explicit bound.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import sys
@@ -56,6 +57,7 @@ from .observer import (
     resolve_bind_host,
 )
 from .observer.snapshot import AgentMode
+from .perception import PerceptionReport, PerceptionSession, StabilityModel
 from .telemetry.recorder import RunRecorder
 from .vision.capture import CaptureError, MssCaptureBackend, ScreenCapturer
 from .vision.window import (
@@ -609,6 +611,268 @@ def cmd_observe(args: argparse.Namespace) -> int:
         runtime.close()
 
 
+def cmd_perceive_test(args: argparse.Namespace) -> int:
+    """VISION-001: learn the scene, then report every frame that surprises it.
+
+    Observation only. This command has no mouse, no keyboard, and no executor: it
+    cannot send input even if it wanted to, because nothing that injects is
+    constructed here.
+
+    The model it uses is fitted online from the run's own warm-up frames. Nothing
+    is downloaded, nothing is pretrained, and no model API is called - the whole
+    layer is a per-cell statistic computed with numpy. That is a deliberate
+    reading of the project's rules, and it is stated here so the owner can
+    disagree with it.
+    """
+    config, source = _load(args)
+    config.ensure_directories()
+    runtime = _build_runtime(config, config_source=source)
+    recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+    try:
+        status = runtime.locator.status(force=True)
+        if not status.found or status.window is None:
+            print(
+                f"no target window matched {config.target_title_patterns!r}; nothing observed",
+                file=sys.stderr,
+            )
+            return 1
+        if status.window.minimized:
+            print("the target window is minimized; nothing observed", file=sys.stderr)
+            return 1
+
+        region = status.window.region
+        warning = _large_window_warning(region.width, region.height, config)
+        if warning is not None:
+            print(warning)
+            print()
+
+        model = StabilityModel(
+            grid=config.perception_grid,
+            fit_frames=config.perception_fit_frames,
+            sigma=config.perception_sigma,
+            floor=config.perception_floor,
+            adapt_rate=config.perception_adapt_rate,
+        )
+        counter = itertools.count()
+
+        def next_frame():
+            observation = runtime.observer.observe(next(counter))
+            return observation.frame
+
+        session = PerceptionSession(model, next_frame)
+
+        print("VISION-001: LEARNED SCENE MODEL")
+        print()
+        print("  OBSERVATION ONLY: no mouse movement, no key press, no click")
+        print("  the model is fitted from this run's own frames; nothing is pretrained")
+        print()
+        bound = f"{args.seconds:g}s" if args.seconds is not None else ""
+        if args.steps is not None:
+            bound = f"{bound} or {args.steps} frame(s)" if bound else f"{args.steps} frame(s)"
+        _print_table(
+            [
+                ("target", repr(status.window.title)),
+                ("handle", f"0x{status.window.handle:X}"),
+                ("client area", f"{region.width}x{region.height}"),
+                ("grid", f"{config.perception_grid} x {config.perception_grid} cells"),
+                ("warm-up", f"{config.perception_fit_frames} frames"),
+                ("sigma", f"{config.perception_sigma:g}"),
+                ("floor", f"{config.perception_floor:g} luma levels"),
+                ("adapt rate", f"{config.perception_adapt_rate:g}"),
+                ("bound", bound),
+            ]
+        )
+        print()
+        print("Watching. Nothing will be sent at any point.")
+        print()
+
+        report = session.run(seconds=args.seconds, steps=args.steps)
+        _report_perceive(
+            report,
+            model,
+            recorder,
+            config,
+            target_title=status.window.title,
+            width=region.width,
+            height=region.height,
+        )
+        return 0
+    except KeyboardInterrupt:
+        recorder.record_error("KeyboardInterrupt", context="perceive-test")
+        recorder.finish(status="interrupted", stop_reason="Ctrl+C")
+        print("\ninterrupted by Ctrl+C; no input was sent")
+        return 130
+    finally:
+        runtime.close()
+
+
+def _report_perceive(
+    report: PerceptionReport,
+    model: StabilityModel,
+    recorder: RunRecorder,
+    config: Config,
+    *,
+    target_title: str,
+    width: int,
+    height: int,
+) -> None:
+    """Print and persist what the scene model measured."""
+    summary = report.summary()
+    print("Perception summary")
+    rows: list[tuple[str, Any]] = [
+        ("run id", recorder.run_id),
+        ("stop reason", report.stop_reason),
+        ("duration", f"{report.duration_seconds:.2f}s"),
+        ("frames", f"{len(report.rows)} ({report.warmup_frames} warm-up, "
+                   f"{report.steady_frames} scored)"),
+        ("capture failures", report.capture_failures),
+        ("grid", f"{report.grid} x {report.grid} = {report.grid * report.grid} cells"),
+    ]
+    if not report.is_complete:
+        rows.append(("result", "warm-up never completed, so no frame was scored"))
+    else:
+        rows.extend(
+            [
+                ("changed cells, mean", f"{summary['changed_cells_mean']:.2f}"),
+                ("changed cells, range", f"{summary['changed_cells_min']}"
+                                          f"..{summary['changed_cells_max']}"),
+                ("changed fraction, mean", f"{summary['changed_fraction_mean']:.4%}"),
+                ("total excess, mean", f"{summary['total_excess_mean']:.4f}"),
+                ("total excess, max", f"{summary['total_excess_max']:.4f}"),
+            ]
+        )
+    rows.append(("telemetry", recorder.directory))
+    _print_table(rows)
+
+    # Persist the measurement before printing anything else. The capture is the
+    # expensive, unrepeatable part of this command, and a formatting error in the
+    # reporting path below has already cost one live run its result file: the
+    # numbers must reach disk even if a later print statement raises. An
+    # incomplete run is persisted too - "the warm-up never finished" is itself a
+    # measurement, and `summary.complete` records which case this was.
+    payload = report.to_dict()
+    payload["run_id"] = recorder.run_id
+    payload["target"] = {"title": target_title, "client_area": [width, height]}
+    payload["config"] = {
+        "grid": config.perception_grid,
+        "sigma": config.perception_sigma,
+        "floor": config.perception_floor,
+        "fit_frames": config.perception_fit_frames,
+        "adapt_rate": config.perception_adapt_rate,
+    }
+    result_path = Path(recorder.directory) / "perceive_result.json"
+    result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    for row in report.rows:
+        recorder.record_step(
+            {
+                "index": row.index,
+                "phase": row.phase,
+                "seconds": round(row.seconds, 4),
+                "score": None if row.score is None else row.score.to_dict(),
+            }
+        )
+
+    if not report.is_complete:
+        print()
+        print("The run ended before the model had a warm-up window, so nothing was")
+        print("scored. Raise --seconds or lower perception_fit_frames and try again.")
+        print("No input was sent.")
+        recorder.finish(status="observed", stop_reason=report.stop_reason)
+        return
+
+    print()
+    print("Where the scene moved (accumulated overshoot, one character per cell)")
+    accumulated = report.accumulated_excess()
+    for line in _render_map(accumulated):
+        print(f"  {line}")
+    print("  '.' is nothing unexpected; heavier characters are more overshoot.")
+
+    print()
+    print("Last scored frame")
+    last = report.scores[-1]
+    _print_table(
+        [
+            ("changed cells", f"{last.changed_cells} of {last.cell_count}"),
+            ("total excess", f"{last.total_excess:.4f}"),
+            ("largest overshoot", f"{last.max_excess:.4f} luma levels"),
+            ("mean deviation", f"{last.mean_deviation:.4f} luma levels"),
+            ("mean allowance", f"{last.mean_allowance:.4f} luma levels"),
+        ]
+    )
+    for line in last.excess_ascii():
+        print(f"  {line}")
+
+    print()
+    print("What the model learned")
+    _print_table(_perceive_model_rows(model))
+
+    share = model.floor_share()
+    print()
+    print(f"  {share:.1%} of the learned allowance came from the floor rather than")
+    print("  from the measured wobble of the scene. On a scene that is genuinely")
+    print("  still this is expected and correct: the floor is what stops a perfectly")
+    print("  static picture from being reported as noisy. It is printed because it")
+    print("  is also the number that would reveal a model that had learned nothing.")
+
+    record = recorder.finish(status="observed", stop_reason=report.stop_reason)
+
+    print()
+    print("No threshold was applied and no verdict was reached: read the numbers")
+    print("above and decide what they mean.")
+    print(f"Per-frame detail: {result_path}")
+    print(f"Run status: {record.status}")
+    print("No input was sent. AutoCraft is idle.")
+
+
+def _perceive_model_rows(model: StabilityModel) -> list[tuple[str, Any]]:
+    """The learned parameters, as printable rows."""
+    summary = model.summary()
+    rows: list[tuple[str, Any]] = [
+        ("grid", summary["grid"]),
+        ("fit frames", summary["fit_frames"]),
+        ("frames seen", summary["frames_seen"]),
+        ("sigma", f"{summary['sigma']:g}"),
+        ("floor", f"{summary['floor']:g} luma levels"),
+        ("adapt rate", f"{summary['adapt_rate']:g}"),
+    ]
+    fit = summary.get("fit")
+    if isinstance(fit, dict):
+        for key, value in fit.items():
+            label = key.replace("_", " ")
+            if isinstance(value, bool):
+                rows.append((label, value))
+            elif isinstance(value, int):
+                rows.append((label, value))
+            elif isinstance(value, float):
+                rows.append((label, f"{value:.6f}"))
+            elif isinstance(value, list) and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+            ):
+                rows.append((label, "[" + ", ".join(f"{item:.2e}" for item in value) + "]"))
+            elif isinstance(value, list):
+                rows.append((label, ", ".join(str(item) for item in value)))
+            else:
+                rows.append((label, value))
+    if "floor_share" in summary:
+        rows.append(("floor share", f"{summary['floor_share']:.6f}"))
+    return rows
+
+
+def _render_map(block: list[list[float]], levels: str = " .:-=+*#%@") -> list[str]:
+    """Render a grid of numbers as ASCII, scaled to its own peak."""
+    if not block or not block[0]:
+        return []
+    peak = max((abs(value) for row in block for value in row), default=0.0)
+    if peak <= 0.0:
+        return ["." * len(block[0]) for _ in block]
+    lines = []
+    for row in block:
+        lines.append(
+            "".join(levels[int(min(abs(value) / peak, 1.0) * (len(levels) - 1))] for value in row)
+        )
+    return lines
+
+
 #: Seconds the operator gets to bring the game window forward in ``input-test``.
 #: A first run is awkward: the operator has to read the message, find the game
 #: window and click into it, all while the shell that launched the command is
@@ -924,13 +1188,13 @@ def _look_rerun_hint(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
-def _look_window_warning(width: int, height: int, config: Config) -> str | None:
+def _large_window_warning(width: int, height: int, config: Config) -> str | None:
     """Explain an oversized client area, without doing anything about it.
 
-    A big window is not an error - the operator may want one - but the
-    specification recommends roughly 1280x650 to 1280x720, because a phase
-    correlation over a very large frame is slower and its estimate is no more
-    meaningful for the extra pixels. This reports that and stops.
+    A big window is not an error - the operator may want one - but a large frame
+    costs proportionally more to capture and analyse, and the extra pixels add no
+    information that a smaller window would not have carried. This reports that
+    and stops.
     """
     pixels = int(width) * int(height)
     if pixels <= config.look_large_window_pixels:
@@ -938,7 +1202,7 @@ def _look_window_warning(width: int, height: int, config: Config) -> str | None:
     return (
         f"WARNING: the client area is {width}x{height} ({pixels} pixels), above the\n"
         f"  configured look_large_window_pixels={config.look_large_window_pixels}.\n"
-        f"  LOOK-001 is recommended at about "
+        f"  AutoCraft is recommended at about "
         f"{LOOK_RECOMMENDED_MAX_WIDTH}x{LOOK_RECOMMENDED_MAX_HEIGHT} or smaller.\n"
         "  AutoCraft will not resize your window - that would change the thing being\n"
         "  measured. Resize it yourself, or raise look_large_window_pixels if you mean it."
@@ -1067,7 +1331,7 @@ def cmd_look_test(args: argparse.Namespace) -> int:
             ]
         )
 
-        warning = _look_window_warning(window_width, window_height, config)
+        warning = _large_window_warning(window_width, window_height, config)
         if warning is not None:
             print()
             print(warning)
@@ -1464,6 +1728,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="also serve the read-only observer page for this run (never enables input)",
     )
     p_observe.set_defaults(func=cmd_observe)
+
+    p_perceive = sub.add_parser(
+        "perceive-test",
+        help="learn the scene from live frames and report what changed (never sends input)",
+    )
+    p_perceive.add_argument("--seconds", type=float, default=30.0, help="how long to watch (default: 30)")
+    p_perceive.add_argument("--steps", type=int, default=None, help="stop after this many frames")
+    p_perceive.set_defaults(func=cmd_perceive_test)
 
     p_loop = sub.add_parser("loop", help="run the bounded agent loop (V0 policy is no-op)")
     p_loop.add_argument("--steps", type=int, default=5, help="maximum loop iterations (default: 5)")

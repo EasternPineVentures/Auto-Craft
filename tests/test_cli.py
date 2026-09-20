@@ -12,16 +12,19 @@ with sentinels that fail loudly if anything reaches for them.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from autocraft import cli
 from autocraft.agent.action import Action, ActionResult
+from autocraft.agent.observation import Observation
 from autocraft.config import Config
 from autocraft.control.safety import SafetyDecision
-from autocraft.vision.frame import ScreenRegion
+from autocraft.vision.frame import Frame, ScreenRegion
 from autocraft.vision.window import TargetStatus, WindowInfo
 
 
@@ -1028,12 +1031,516 @@ class TestLookTestFocusOrdering:
         assert harness.guard.authorize_calls == []
 
 
+# --------------------------------------------------------------------------
+# VISION-001: perceive-test
+# --------------------------------------------------------------------------
+
+
+def _perceive_status(*, force: bool = False) -> TargetStatus:
+    """A modest, focused target: small enough that no size warning fires."""
+    window = WindowInfo(
+        handle=0x40724,
+        title="Luanti 5.17.0",
+        region=ScreenRegion(0, 0, 1280, 720),
+        visible=True,
+        minimized=False,
+        process_id=1234,
+    )
+    return TargetStatus(
+        found=True,
+        window=window,
+        is_foreground=True,
+        foreground_handle=window.handle,
+        foreground_title=window.title,
+        reason="",
+    )
+
+
+def _perceive_minimized_status(*, force: bool = False) -> TargetStatus:
+    status = _perceive_status()
+    assert status.window is not None
+    window = WindowInfo(
+        handle=status.window.handle,
+        title=status.window.title,
+        region=status.window.region,
+        visible=True,
+        minimized=True,
+        process_id=status.window.process_id,
+    )
+    return TargetStatus(
+        found=True,
+        window=window,
+        is_foreground=False,
+        foreground_handle=0x999,
+        foreground_title="Some Other App",
+        reason="target window is minimized",
+    )
+
+
+def _plain_frame(size: int = 64, value: int = 40) -> Frame:
+    """A frame with no structure at all: every cell is the same."""
+    return Frame(
+        image=np.full((size, size, 3), value, dtype=np.uint8),
+        timestamp=time.time(),
+    )
+
+
+def _bright_quadrant_frame(size: int = 64, *, quadrant: int = 0, value: int = 220) -> Frame:
+    """A frame whose top-left quarter is far brighter than the rest."""
+    image = np.full((size, size, 3), 40, dtype=np.uint8)
+    half = size // 2
+    row = 0 if quadrant < 2 else half
+    col = 0 if quadrant % 2 == 0 else half
+    image[row : row + half, col : col + half] = value
+    return Frame(image=image, timestamp=time.time())
+
+
+class FakeObserver:
+    """An observer that hands out canned frames and counts what was asked of it.
+
+    The real :class:`~autocraft.agent.observation.Observer` captures the screen.
+    This one cannot, which is the point: the tests below prove that
+    ``perceive-test`` reads the world only through the observer seam, and that
+    its model sees exactly the frames it was handed and no others.
+    """
+
+    def __init__(self, frames: list[Frame], window: WindowInfo) -> None:
+        self.frames = list(frames)
+        self.window = window
+        self.indices: list[int] = []
+
+    def observe(
+        self,
+        index: int = 0,
+        *,
+        capture: bool = True,
+        force_discovery: bool = False,
+    ) -> Observation:
+        self.indices.append(index)
+        if not self.frames:
+            raise AssertionError("perceive-test asked for more frames than the test supplied")
+        # The last frame repeats, so a test that under-supplies frames fails on
+        # the assertion above rather than on a run that mysteriously never ends.
+        frame = self.frames[0] if len(self.frames) == 1 else self.frames.pop(0)
+        return Observation(
+            index=index,
+            timestamp=time.time(),
+            window=self.window,
+            frame=frame,
+        )
+
+
+@dataclass
+class PerceiveRuntime:
+    """The subset of ``Runtime`` that ``cmd_perceive_test`` actually uses."""
+
+    locator: SequenceLocator
+    config: Config
+    observer: FakeObserver
+    #: A hard failure: the command must read frames through the observer, never
+    #: by reaching for the capturer itself.
+    capturer: object = field(default_factory=ForbiddenCapturer)
+
+    def close(self) -> None:
+        """``cmd_perceive_test`` closes the runtime on every exit path."""
+
+
+@dataclass
+class PerceiveHarness:
+    """Everything a test needs to observe one ``perceive-test`` run."""
+
+    config: Config
+    locator: SequenceLocator
+    observer: FakeObserver
+
+    @property
+    def result_path(self) -> Path:
+        """The one ``perceive_result.json`` this run wrote."""
+        found = sorted(Path(self.config.runs_dir).glob("*/perceive_result.json"))
+        assert len(found) == 1, f"expected exactly one result file, found {found}"
+        return found[0]
+
+    def result_payload(self) -> dict:
+        """The parsed ``perceive_result.json`` from this run."""
+        import json
+
+        return json.loads(self.result_path.read_text(encoding="utf-8"))
+
+
+def _install_perceive_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    statuses: list[TargetStatus],
+    *,
+    frames: list[Frame] | None = None,
+    **config_kwargs: object,
+) -> PerceiveHarness:
+    """Wire ``perceive-test`` to fakes with no input machinery reachable.
+
+    ``_build_guard`` is replaced with a hard failure as well as the input
+    classes, so a run that reaches this harness cannot authorise a movement, let
+    alone make one. Any of those being constructed fails the test loudly.
+    """
+    config = Config(data_dir=tmp_path / "data", **config_kwargs)
+    locator = SequenceLocator(statuses=list(statuses))
+    # The observer is handed a window even when the script's first status has
+    # none, so a "no window matched" test fails on the command's refusal rather
+    # than on the harness.
+    window = statuses[0].window or _perceive_status().window
+    assert window is not None
+    observer = FakeObserver(frames if frames is not None else [], window)
+
+    def factory(config: Config, *, config_source: str) -> PerceiveRuntime:
+        return PerceiveRuntime(locator=locator, config=config, observer=observer)
+
+    monkeypatch.setattr(cli, "_load", lambda args: (config, "test"))
+    monkeypatch.setattr(cli, "_build_runtime", factory)
+    monkeypatch.setattr(cli, "_build_guard", ForbiddenInputBackend)
+    for name in ("Keyboard", "Mouse", "ActionExecutor", "SafetyGuard"):
+        monkeypatch.setattr(cli, name, ForbiddenInputBackend)
+    return PerceiveHarness(config=config, locator=locator, observer=observer)
+
+
+def _run_perceive_test(*argv: str) -> int:
+    args = cli.build_parser().parse_args(["perceive-test", *argv])
+    return cli.cmd_perceive_test(args)
+
+
+class TestPerceiveTestObservationOnly:
+    """``perceive-test`` measures the scene. It must never be able to act on it."""
+
+    def test_it_prints_an_observation_only_banner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "4") == 0
+
+        output = capsys.readouterr().out
+        assert "OBSERVATION ONLY" in output
+        assert "nothing is pretrained" in output
+        assert "No input was sent" in output
+
+    def test_no_input_machinery_is_ever_constructed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # The harness makes every input class - and the safety guard that would
+        # authorise a movement - raise on construction. Reaching exit 0 proves
+        # none of them existed.
+        _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "4") == 0
+
+    def test_it_reads_frames_only_through_the_observer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # The runtime's capturer raises if anything calls it. The command still
+        # has to produce a fitted model, so the frames can only have arrived via
+        # ``observer.observe``.
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "4") == 0
+        assert harness.result_payload()["model"]["fitted"] is True
+        assert harness.observer.indices == [0, 1, 2, 3]
+
+    def test_the_result_records_no_verdict(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        # The layer measures; the operator decides. A machine-readable "pass"
+        # would quietly turn this into an evaluator.
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "4") == 0
+
+        payload = harness.result_payload()
+        for forbidden in ("pass", "passed", "fail", "failed", "verdict", "ok"):
+            assert forbidden not in payload
+            assert forbidden not in payload["summary"]
+
+    def test_it_says_no_verdict_was_reached(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "4") == 0
+
+        output = capsys.readouterr().out
+        assert "no verdict was reached" in output
+
+
+class TestPerceiveTestTargetVetting:
+    """Nothing is observed when there is nothing valid to observe."""
+
+    def test_a_missing_window_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_perceive_harness(monkeypatch, tmp_path, [_missing_status()])
+
+        assert _run_perceive_test("--steps", "4") == 1
+
+        captured = capsys.readouterr()
+        assert "nothing observed" in captured.err
+        assert harness.observer.indices == []
+        assert not list(Path(harness.config.runs_dir).glob("*/perceive_result.json"))
+
+    def test_a_minimized_window_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_perceive_harness(
+            monkeypatch, tmp_path, [_perceive_minimized_status()]
+        )
+
+        assert _run_perceive_test("--steps", "4") == 1
+
+        captured = capsys.readouterr()
+        assert "minimized" in captured.err
+        assert harness.observer.indices == []
+
+    def test_a_window_bigger_than_recommended_only_warns(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # ``_focused_status`` is 3840x1950, well over the recommended size. The
+        # command must warn and then measure anyway - it never resizes the window.
+        _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_focused_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "4") == 0
+
+        output = capsys.readouterr().out
+        assert "will not resize" in output
+        assert "3840x1950" in output
+
+
+class TestPerceiveTestBounds:
+    """A run always stops, and says which bound stopped it."""
+
+    def test_steps_bound_the_run(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=2,
+        )
+
+        assert _run_perceive_test("--steps", "7", "--seconds", "600") == 0
+
+        payload = harness.result_payload()
+        assert payload["summary"]["stop_reason"] == "reached the 7-step limit"
+        assert len(harness.observer.indices) == 7
+
+    def test_the_seconds_default_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        args = cli.build_parser().parse_args(["perceive-test"])
+        assert args.seconds == 30.0
+        assert args.steps is None
+
+    def test_a_warm_up_that_never_finishes_is_reported_as_such(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=20,
+        )
+
+        assert _run_perceive_test("--steps", "5") == 0
+
+        output = capsys.readouterr().out
+        assert "warm-up never completed" in output
+        assert "The run ended before the model had a warm-up window" in output
+
+        # The measurement is persisted even when it is incomplete: "the warm-up
+        # never finished" is a result, and the record says which case it was.
+        payload = harness.result_payload()
+        assert payload["summary"]["complete"] is False
+        assert payload["summary"]["steady_frames"] == 0
+        # An unscored row carries no ``score`` key at all rather than a null one.
+        assert "score" not in payload["timeline"][-1]
+
+
+class TestPerceiveTestLearnsTheScene:
+    """The command has to actually learn, or it is just a screenshot loop."""
+
+    def test_the_model_is_fitted_from_this_runs_own_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=3,
+            perception_grid=4,
+        )
+
+        assert _run_perceive_test("--steps", "6") == 0
+
+        model = harness.result_payload()["model"]
+        assert model["fitted"] is True
+        assert model["frames_seen"] == 3
+        assert model["fit"]["frames"] == 2  # the first frame is only a baseline
+        assert model["fit"]["cells"] == 16
+        assert model["grid"] == 4
+
+    def test_a_still_scene_is_reported_as_still(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=3,
+            perception_grid=4,
+        )
+
+        assert _run_perceive_test("--steps", "6") == 0
+
+        summary = harness.result_payload()["summary"]
+        assert summary["steady_frames"] == 3
+        assert summary["changed_cells_mean"] == 0.0
+        assert summary["changed_cells_max"] == 0
+
+    def test_a_change_after_the_warm_up_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # Three identical frames to learn "nothing moves here", then a quarter of
+        # the picture jumps from 40 to 220 luma. The learned allowance is the
+        # 2.0 floor, so all four cells in that quarter must be flagged.
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[
+                _plain_frame(),
+                _plain_frame(),
+                _plain_frame(),
+                _bright_quadrant_frame(),
+            ],
+            perception_fit_frames=3,
+            perception_grid=4,
+        )
+
+        assert _run_perceive_test("--steps", "6") == 0
+
+        summary = harness.result_payload()["summary"]
+        assert summary["steady_frames"] == 3
+        assert summary["changed_cells_mean"] == 4.0
+        assert summary["changed_cells_max"] == 4
+        assert summary["total_excess_mean"] > 0.0
+
+        # The change is localised, not smeared over the whole grid.
+        assert summary["changed_fraction_mean"] == 0.25
+
+    def test_the_accumulated_map_points_at_where_it_moved(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[
+                _plain_frame(),
+                _plain_frame(),
+                _plain_frame(),
+                _bright_quadrant_frame(),
+            ],
+            perception_fit_frames=3,
+            perception_grid=4,
+        )
+
+        assert _run_perceive_test("--steps", "6") == 0
+
+        accumulated = harness.result_payload()["accumulated_excess"]
+        moved = [
+            (row, col)
+            for row, values in enumerate(accumulated)
+            for col, value in enumerate(values)
+            if value > 0.0
+        ]
+        assert moved == [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+    def test_the_measurement_is_persisted_before_it_is_printed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # A live run once lost 45 seconds of capture to a formatting error in the
+        # reporting path. The numbers now reach disk first, so a crash while
+        # printing cannot destroy the measurement.
+        harness = _install_perceive_harness(
+            monkeypatch,
+            tmp_path,
+            [_perceive_status()],
+            frames=[_plain_frame()],
+            perception_fit_frames=3,
+            perception_grid=4,
+        )
+
+        def explode(model: object) -> list[tuple[str, object]]:
+            raise RuntimeError("a formatting error in the reporting path")
+
+        monkeypatch.setattr(cli, "_perceive_model_rows", explode)
+
+        with pytest.raises(RuntimeError, match="formatting error"):
+            _run_perceive_test("--steps", "6")
+
+        payload = harness.result_payload()
+        assert payload["summary"]["complete"] is True
+        assert payload["summary"]["steady_frames"] == 3
+        assert len(payload["timeline"]) == 6
+
+
 class TestParserSurface:
     """The command surface is part of the contract; pin it down."""
 
     def test_all_documented_commands_exist(self) -> None:
         parser = cli.build_parser()
-        for command in ("status", "capture", "observe", "input-test", "look-test", "keys", "config"):
+        for command in (
+            "status",
+            "capture",
+            "observe",
+            "input-test",
+            "look-test",
+            "perceive-test",
+            "keys",
+            "config",
+        ):
             args = parser.parse_args([command])
             assert callable(args.func)
 
