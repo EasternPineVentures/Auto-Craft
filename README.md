@@ -233,7 +233,7 @@ Touching the game is always explicit.
 | `capture` | no | Saves exactly one client-area frame. Prints the path and dimensions. |
 | `observe` | no | Observes for a bounded time. Reports frames captured, achieved FPS, dropped/failed frames, and focus state. |
 | `loop` | no | Runs the bounded agent loop with the no-op policy. |
-| `input-test` | **yes** | Explicit smoke test. Requires `--yes`. Sends one tiny bounded action and then releases everything. |
+| `input-test` | **yes** | Explicit smoke test. Prints the bounded action, requires `--yes`, gives you a few seconds to focus the game, re-verifies that exact window is foreground, sends one tiny bounded action and then releases everything. |
 | `keys` | no | Lists every supported key name. |
 | `config` | no | Prints the effective configuration and where it came from. |
 | `observer` | no | Serves the local read-only observer page. Never enables control. |
@@ -378,10 +378,12 @@ is released on a normal exit, on an exception, on `Ctrl+C`, on focus loss, and
 on emergency stop. A failed release leaves the input tracked as still held so
 the next release-all retries it, and `atexit` runs a final release.
 
-**Bounded actions.** Key holds are clamped to a maximum duration. Mouse
-movement is clamped to a maximum delta per command. Deltas above the limit are
-**rejected, not silently clamped** — the agent's intent is never quietly
-rewritten into a different action.
+**Bounded actions.** Key hold duration is clamped to the configured maximum
+(`max_key_hold_seconds`) — holding longer than asked for is always safe, so a
+long hold is shortened rather than refused. Mouse deltas are different: a
+relative move whose delta exceeds `max_mouse_delta` on either axis is
+**rejected, not clamped** — the agent's intent is never quietly rewritten into
+a different action. So: holds may be clamped, mouse deltas are refused.
 
 **Rate limiting.** Actions are paced by a minimum interval. Rate limiting
 never consumes the "too many consecutive failures" budget; it waits instead of
@@ -389,9 +391,15 @@ refusing, so pacing cannot masquerade as a safety stop.
 
 **No autonomy by default.** `status`, `capture`, `observe`, `loop`, `keys`,
 `config`, and `observer` never inject input. Only `input-test` can, and it
-requires an explicit `--yes`, states clearly what it is about to do, verifies
-the game window is foreground, sends exactly one small action, releases it, and
-exits.
+requires an explicit `--yes`, states clearly what it is about to do, sends
+exactly one small action, releases it, and exits. It checks foreground in the
+only order that works from a shell: locate and vet the target, print the bounded
+action, demand `--yes` *before* any injection machinery is constructed, and only
+then start a short countdown for you to focus the game. After the countdown it
+re-queries the window and refuses unless that exact window is foreground; the
+guard then re-checks foreground again inside the actuator call itself, so focus
+moving in between is still caught. Every refusal path injects nothing and every
+exit path releases everything.
 
 **The observer cannot reach the actuators.** The observer page and the thought
 system are downstream of the agent, not upstream of it. Starting the page
@@ -422,13 +430,18 @@ covered:
 - window geometry and client-area transformations
 - target-window matching and foreground detection
 - action validation and the input vocabulary
-- mouse-delta limits
-- key state tracking and release-all behaviour
+- mouse-delta limits: deltas above the maximum are rejected, not clamped
+- key state tracking and release-all behaviour, including that a failed
+  backend release keeps the input tracked so a later release-all retries it
 - foreground-window rejection
 - the no-op decision policy
 - bounded agent loop behaviour, including capture failure
 - telemetry serialisation
 - the CLI safety gate: `input-test` refuses before any input object exists
+- the `input-test` ordering: a shell being foreground at launch is fine, and
+  the post-countdown re-query refuses on lost focus, a vanished target, a
+  newly-minimised target, or a changed window handle — with zero input sent
+  on every refusal path
 - the capture-rate warning
 - the display contract: exact snapshot keys, strict-JSON round-trip, frame
   downscaling and JPEG encoding
@@ -442,7 +455,7 @@ covered:
 - the memory-honesty property: no thought may reference a memory that is not
   in its context
 
-The suite is 485 tests and runs in about 19 seconds. Everything that talks to
+The suite is 515 tests and runs in about 20 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---

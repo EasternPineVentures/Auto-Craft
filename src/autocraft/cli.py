@@ -515,8 +515,48 @@ def cmd_observe(args: argparse.Namespace) -> int:
         runtime.close()
 
 
+#: Seconds the operator gets to bring the game window forward in ``input-test``.
+#: Long enough to alt-tab comfortably, short enough that the operator is not
+#: left wondering whether the command has hung. Overridable so tests need no
+#: real delay.
+FOCUS_HANDOFF_SECONDS = 5.0
+
+
+def _confirm_target_focus(locator: WindowLocator, *, expected_handle: int) -> tuple[bool, str]:
+    """Re-check the target window immediately before injection.
+
+    Returns ``(ready, reason)``. The check is repeated *after* the focus
+    handoff on purpose: the window matched before the countdown may since have
+    been closed, minimised, or replaced by a different window, and the
+    foreground lock is a promise about the *exact* window the operator was told
+    to focus - not merely about "some matching window".
+    """
+    status = locator.status(force=True)
+    if not status.found or status.window is None:
+        return False, "the target window disappeared during the focus countdown"
+    if status.window.minimized:
+        return False, "the target window is minimized"
+    if status.window.handle != expected_handle:
+        return False, (
+            f"the target window changed during the focus countdown "
+            f"(expected 0x{expected_handle:X}, found 0x{status.window.handle:X})"
+        )
+    if not status.is_foreground:
+        return False, "the target window is not the foreground window (foreground lock active)"
+    return True, ""
+
+
 def cmd_input_test(args: argparse.Namespace) -> int:
-    """The one command that can inject input. Explicit, bounded, single action."""
+    """The one command that can inject input. Explicit, bounded, single action.
+
+    The ordering here is load-bearing. ``input-test`` is normally launched from
+    a shell, so at the first check the *shell* is the foreground window -
+    refusing on that would make the documented smoke test impossible to run.
+    So: locate and vet the target, print the bounded action, demand ``--yes``
+    before any injection machinery exists, and only then give the operator a
+    window to focus the game. Focus is re-checked after that handoff, and the
+    guard independently re-checks it again inside the actuator call.
+    """
     config, source = _load(args)
     config.ensure_directories()
     runtime = _build_runtime(config, config_source=source)
@@ -524,12 +564,6 @@ def cmd_input_test(args: argparse.Namespace) -> int:
         status = runtime.locator.status(force=True)
         if not status.found or status.window is None:
             print(f"no target window matched {config.target_title_patterns!r}; nothing sent", file=sys.stderr)
-            return 1
-        if not status.is_foreground:
-            print(
-                "the target window is not the foreground window; refusing to inject input",
-                file=sys.stderr,
-            )
             return 1
         if status.window.minimized:
             print("the target window is minimized; nothing sent", file=sys.stderr)
@@ -540,8 +574,11 @@ def cmd_input_test(args: argparse.Namespace) -> int:
             print(f"unknown smoke action {args.action!r}", file=sys.stderr)
             return 2
 
+        target_title = status.window.title
+        target_handle = status.window.handle
+
         print("INPUT SMOKE TEST")
-        print(f"  target    : {status.window.title!r} (0x{status.window.handle:X})")
+        print(f"  target    : {target_title!r} (0x{target_handle:X})")
         print(f"  action    : {action.describe()}")
         print(f"  press {config.emergency_stop_key.upper()} at any time to abort and release everything")
         print("  this is the only AutoCraft command that sends input to the game")
@@ -553,61 +590,78 @@ def cmd_input_test(args: argparse.Namespace) -> int:
             return 3
 
         guard = _build_guard(config, runtime.locator)
+        guard.install_atexit()
         keyboard = Keyboard(guard, guard.backend, config)
         mouse = Mouse(guard, guard.backend, config)
         executor = ActionExecutor(keyboard, mouse)
         recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
-        guard.install_atexit()
-        guard.release_all("input-test start")
 
-        print()
-        print(f"  sending in 1s - switch to the game window now (run id {recorder.run_id})")
-        for remaining in (1,):
-            time.sleep(remaining)
+        exit_code = 1
+        result_dict: dict[str, Any] = {
+            "attempted": False,
+            "executed": False,
+            "description": action.describe(),
+        }
+        try:
+            guard.release_all("input-test start")
 
-        decision = guard.authorize(action.describe())
-        if not decision.allowed:
-            result_dict = {
-                "attempted": False,
-                "executed": False,
-                "blocked_reason": decision.reason,
-                "description": action.describe(),
-            }
-            print(f"  blocked: {decision.reason}")
-            exit_code = 1
-        else:
-            guard.wait_for_rate_limit()
-            result = executor.execute(action)
-            guard.note_action()
-            result_dict = result.to_dict()
-            print(f"  attempted : {result.attempted}")
-            print(f"  executed  : {result.executed}")
-            print(f"  duration  : {result.duration:.3f}s")
-            if result.blocked_reason:
-                print(f"  blocked   : {result.blocked_reason}")
-            if result.error:
-                print(f"  error     : {result.error}")
-            exit_code = 0 if result.ok else 1
+            print()
+            print(f"  focus {target_title!r} now - sending in {FOCUS_HANDOFF_SECONDS:g}s")
+            print(f"  run id    : {recorder.run_id}")
+            time.sleep(FOCUS_HANDOFF_SECONDS)
 
-        released_keys = guard.release_all("input-test end")
-        released_buttons = guard.release_buttons("input-test end")
-        recorder.record_step(
-            {
-                "index": 0,
-                "observation": {"window": status.to_dict()},
-                "action": action.to_dict(),
-                "result": result_dict,
-            }
-        )
-        recorder.record_safety_events(guard.events)
-        record = recorder.finish(status="smoke-test", stop_reason="single bounded action completed")
-        guard.shutdown("input-test finished")
-        print()
-        print("  released keys   :", ", ".join(released_keys) or "none")
-        print("  released buttons:", ", ".join(released_buttons) or "none")
-        print("  telemetry       :", record.directory)
-        print()
-        print("Nothing else will be sent. AutoCraft is idle.")
+            ready, refusal = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
+            if not ready:
+                result_dict["blocked_reason"] = refusal
+                print(f"  refused: {refusal}", file=sys.stderr)
+                print("  nothing was sent", file=sys.stderr)
+                exit_code = 1
+            else:
+                # Deliberate defence in depth, not duplicated bookkeeping: the
+                # check above reads the window, this one goes through the guard
+                # that will actually gate the actuator, and it is what catches
+                # focus changing in the moment between the two.
+                decision = guard.authorize(action.describe())
+                if not decision.allowed:
+                    result_dict["blocked_reason"] = decision.reason
+                    print(f"  blocked: {decision.reason}")
+                    exit_code = 1
+                else:
+                    guard.wait_for_rate_limit()
+                    result = executor.execute(action)
+                    guard.note_action()
+                    result_dict = result.to_dict()
+                    print(f"  attempted : {result.attempted}")
+                    print(f"  executed  : {result.executed}")
+                    print(f"  duration  : {result.duration:.3f}s")
+                    if result.blocked_reason:
+                        print(f"  blocked   : {result.blocked_reason}")
+                    if result.error:
+                        print(f"  error     : {result.error}")
+                    exit_code = 0 if result.ok else 1
+        finally:
+            # Every exit path releases, including Ctrl+C during the countdown and
+            # every refusal above. ``release_all`` already covers mouse buttons,
+            # so there is no separate button release to report.
+            released = guard.release_all("input-test end")
+            guard.shutdown("input-test finished")
+            recorder.record_step(
+                {
+                    "index": 0,
+                    "observation": {"window": status.to_dict()},
+                    "action": action.to_dict(),
+                    "result": result_dict,
+                }
+            )
+            recorder.record_safety_events(guard.events)
+            record = recorder.finish(
+                status="smoke-test", stop_reason="single bounded action completed"
+            )
+            print()
+            print("  released inputs :", ", ".join(released) or "none")
+            print("  telemetry       :", record.directory)
+            print()
+            print("Nothing else will be sent. AutoCraft is idle.")
         return exit_code
     finally:
         runtime.close()

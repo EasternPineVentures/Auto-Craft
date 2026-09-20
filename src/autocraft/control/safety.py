@@ -267,28 +267,38 @@ class SafetyGuard:
 
         for name, pressed_at in list(self._held_keys.items()):
             if now - pressed_at >= limit:
-                self._force_release_key(name, f"held longer than {limit:g}s")
-                released.append(name)
+                if self._force_release_key(name, f"held longer than {limit:g}s"):
+                    released.append(name)
         for button, pressed_at in list(self._held_buttons.items()):
             if now - pressed_at >= limit:
-                self._force_release_button(button, f"held longer than {limit:g}s")
-                released.append(f"mouse:{button}")
+                if self._force_release_button(button, f"held longer than {limit:g}s"):
+                    released.append(f"mouse:{button}")
         return tuple(released)
 
     def release_keys(self, reason: str = "release requested") -> tuple[str, ...]:
-        """Release every held key, returning the names that were released."""
+        """Release every held key, returning only the names that came up.
+
+        A key whose backend release fails is *not* reported here: the caller
+        must not be told a key was released when it may still be physically
+        down. It stays tracked, and the next ``release_all`` retries it.
+        """
         released: list[str] = []
         for name in list(self._held_keys):
-            self._force_release_key(name, reason)
-            released.append(name)
+            if self._force_release_key(name, reason):
+                released.append(name)
         return tuple(released)
 
     def release_buttons(self, reason: str = "release requested") -> tuple[str, ...]:
-        """Release every held mouse button, returning the names released."""
+        """Release every held mouse button, returning only the ones that came up.
+
+        Failing releases are excluded for the same reason as ``release_keys``:
+        a report of "released" that did not happen is worse than a report of
+        nothing, because it hides the input that is still down.
+        """
         released: list[str] = []
         for button in list(self._held_buttons):
-            self._force_release_button(button, reason)
-            released.append(button)
+            if self._force_release_button(button, reason):
+                released.append(button)
         return tuple(released)
 
     def release_all(self, reason: str = "release_all") -> tuple[str, ...]:
@@ -300,26 +310,59 @@ class SafetyGuard:
             self._record(KIND_RELEASE, f"{reason}: released {', '.join(released)}")
         return tuple(released)
 
-    def _force_release_key(self, name: str, reason: str) -> None:
-        self._held_keys.pop(name, None)
+    def _force_release_key(self, name: str, reason: str) -> bool:
+        """Release one key, forgetting it only once the backend accepts it.
+
+        The held record is the guard's only memory of what may still be
+        physically down. Removing it *before* the backend call would mean a
+        failed release silently strands the key: ``release_all`` retries
+        whatever is still tracked, so forgetting a key the backend refused to
+        release makes the retry impossible and the key stays down forever.
+
+        Returns True when the key was released, False when it was not.
+        """
         try:
-            self._backend.key_up(KEY_NAME_TO_VK[name])
+            virtual_key = KEY_NAME_TO_VK[name]
+        except KeyError:
+            # Not a name the backend can act on, so no retry could ever
+            # succeed and no such key can be physically held. Drop it rather
+            # than tracking an entry that can never be released.
+            self._held_keys.pop(name, None)
+            self._record(
+                KIND_ERROR, f"cannot release unknown key {name!r}; dropped from held state"
+            )
+            return False
+        try:
+            self._backend.key_up(virtual_key)
         except Exception as exc:  # noqa: BLE001 - release attempts must not raise
             self._record(KIND_RELEASE_FAILED, f"key_up {name} failed: {exc}")
-            return
-        self._record(KIND_HOLD_LIMIT if "held longer" in reason else KIND_RELEASE, f"released key {name} ({reason})")
+            return False
+        self._held_keys.pop(name, None)
+        self._record(
+            KIND_HOLD_LIMIT if "held longer" in reason else KIND_RELEASE,
+            f"released key {name} ({reason})",
+        )
+        return True
 
-    def _force_release_button(self, button: str, reason: str) -> None:
-        self._held_buttons.pop(button, None)
+    def _force_release_button(self, button: str, reason: str) -> bool:
+        """Release one mouse button, forgetting it only on success.
+
+        Same invariant as ``_force_release_key``: a button the backend could
+        not release stays tracked so a later ``release_all`` retries it.
+
+        Returns True when the button was released, False when it was not.
+        """
         try:
             self._backend.mouse_button_up(button)
         except Exception as exc:  # noqa: BLE001 - release attempts must not raise
             self._record(KIND_RELEASE_FAILED, f"mouse_button_up {button} failed: {exc}")
-            return
+            return False
+        self._held_buttons.pop(button, None)
         self._record(
             KIND_HOLD_LIMIT if "held longer" in reason else KIND_RELEASE,
             f"released mouse button {button} ({reason})",
         )
+        return True
 
     # -- emergency stop ---------------------------------------------------
 

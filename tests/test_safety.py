@@ -238,11 +238,24 @@ class TestReleaseAll:
         assert fake_input.key_ups == [ord("W")]
 
     def test_release_survives_a_failing_backend(self, guard, fake_input) -> None:
+        """A failed release must be retried later, not forgotten.
+
+        The held record is the guard's only memory of what may still be
+        physically down. Dropping it because the backend errored would strand
+        the input in the game forever, with nothing left to retry.
+        """
         guard.register_key_down("w")
         fake_input.fail_on.add("key_up")
         # Must not raise: refusing to release is the unsafe behaviour.
-        guard.release_all("backend is broken")
+        assert guard.release_all("backend is broken") == ()
+        assert guard.held_keys == ("w",)
+        assert any(event.kind == "release_failed" for event in guard.events)
+
+        # Once the backend recovers, the same release-all finishes the job.
+        fake_input.fail_on.clear()
+        assert guard.release_all("backend recovered") == ("w",)
         assert guard.held_keys == ()
+        assert fake_input.key_ups == [ord("W")]
 
     def test_context_manager_releases_on_exit(self, config, fake_input, clock) -> None:
         guard = SafetyGuard(config, fake_input, target_is_foreground=lambda: True, clock=clock)
@@ -250,6 +263,147 @@ class TestReleaseAll:
         with guard:
             keyboard.press("w")
         assert ord("W") in fake_input.key_ups
+
+
+class TestForcedReleaseFailureTracking:
+    """Held state may only be dropped once the backend release actually worked.
+
+    The invariant is one-directional: a release that did *not* happen must not
+    be recorded as one that did. Every path below therefore checks both that the
+    input stays tracked and that the failure is visible in the event log.
+    """
+
+    def test_a_failed_key_release_keeps_the_key_retryable(self, guard, fake_input) -> None:
+        # 1. input tracked held
+        guard.register_key_down("w")
+        assert guard.held_keys == ("w",)
+
+        # 2. backend release fails
+        fake_input.fail_on.add("key_up")
+
+        # 3. release_all returns safely
+        first = guard.release_all("forced")
+
+        # 4. input remains tracked
+        assert first == ()
+        assert guard.held_keys == ("w",)
+
+        # 5. release_failed recorded
+        failed = [event for event in guard.events if event.kind == "release_failed"]
+        assert len(failed) == 1
+        assert "w" in failed[0].detail
+
+        # 6. backend recovers
+        fake_input.fail_on.clear()
+
+        # 7. second release_all retries
+        second = guard.release_all("retry")
+
+        # 8. release succeeds
+        assert second == ("w",)
+        assert fake_input.key_ups == [ord("W")]
+
+        # 9. input leaves held tracking
+        assert guard.held_keys == ()
+
+    def test_a_failed_button_release_keeps_the_button_retryable(self, guard, fake_input) -> None:
+        # 1. input tracked held
+        guard.register_button_down("left")
+        assert guard.held_buttons == ("left",)
+
+        # 2. backend release fails
+        fake_input.fail_on.add("mouse_button_up")
+
+        # 3. release_all returns safely
+        first = guard.release_all("forced")
+
+        # 4. input remains tracked
+        assert first == ()
+        assert guard.held_buttons == ("left",)
+
+        # 5. release_failed recorded
+        failed = [event for event in guard.events if event.kind == "release_failed"]
+        assert len(failed) == 1
+        assert "left" in failed[0].detail
+
+        # 6. backend recovers
+        fake_input.fail_on.clear()
+
+        # 7. second release_all retries
+        second = guard.release_all("retry")
+
+        # 8. release succeeds
+        assert second == ("mouse:left",)
+        assert fake_input.button_ups == ["left"]
+
+        # 9. input leaves held tracking
+        assert guard.held_buttons == ()
+
+    def test_a_key_and_a_button_can_fail_independently(self, guard, fake_input) -> None:
+        guard.register_key_down("w")
+        guard.register_button_down("right")
+        fake_input.fail_on.add("key_up")
+
+        released = guard.release_all("partial failure")
+
+        # The button came up, so it is reported and forgotten; the key did not,
+        # so it is neither reported nor forgotten.
+        assert released == ("mouse:right",)
+        assert guard.held_keys == ("w",)
+        assert guard.held_buttons == ()
+
+    def test_release_keys_does_not_report_a_release_that_did_not_happen(self, guard, fake_input) -> None:
+        guard.register_key_down("w")
+        fake_input.fail_on.add("key_up")
+        assert guard.release_keys("forced") == ()
+
+    def test_release_buttons_does_not_report_a_release_that_did_not_happen(
+        self, guard, fake_input
+    ) -> None:
+        guard.register_button_down("left")
+        fake_input.fail_on.add("mouse_button_up")
+        assert guard.release_buttons("forced") == ()
+
+    def test_enforce_hold_limits_does_not_claim_a_failed_release(
+        self, guard, fake_input, config, clock
+    ) -> None:
+        guard.register_key_down("w")
+        clock.advance(config.max_key_hold_seconds + 0.01)
+        fake_input.fail_on.add("key_up")
+
+        assert guard.enforce_hold_limits() == ()
+        # Still tracked, so the next release-all can try again.
+        assert guard.held_keys == ("w",)
+
+    def test_a_failing_release_never_raises_from_emergency_stop(self, guard, fake_input) -> None:
+        guard.register_key_down("w")
+        fake_input.fail_on.add("key_up")
+        # The emergency stop must complete even when the backend is broken; an
+        # exception here would abort the cleanup that everything else depends on.
+        guard.trigger_emergency_stop("test")
+        assert guard.stop_requested is True
+        assert guard.held_keys == ("w",)
+
+    def test_a_failing_release_never_raises_from_shutdown(self, guard, fake_input) -> None:
+        guard.register_key_down("w")
+        fake_input.fail_on.add("key_up")
+        guard.shutdown("test")
+        assert guard.held_keys == ("w",)
+
+    def test_an_unknown_held_key_name_is_dropped_not_retried_forever(
+        self, guard, fake_input
+    ) -> None:
+        """A name with no virtual key can never be released, so it cannot be kept.
+
+        Keeping it would be a phantom hold that every future release-all would
+        fail on. It also used to raise ``KeyError`` from inside the release path.
+        """
+        guard.register_key_down("definitely-not-a-key")
+
+        assert guard.release_all("forced") == ()
+        assert guard.held_keys == ()
+        assert fake_input.key_ups == []
+        assert any(event.kind == "error" for event in guard.events)
 
 
 class TestEmergencyStop:
