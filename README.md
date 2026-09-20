@@ -756,7 +756,10 @@ will ever call it. Nothing here knows what a tree is.
 2. **Scores.** Each frame is divided into a grid of cells and each cell is scored
    with deterministic, local evidence: texture, edge density, colour spread,
    local contrast, and how much it differs from its neighbours. Cells are merged
-   into a small candidate set, at most `wake_max_target_candidates` of them.
+   into a small candidate set, at most `wake_max_target_candidates` of them. A
+   merged region that covers the whole frame is refused rather than offered:
+   a region the size of the frame has no surroundings to be salient *against*,
+   and no room to be located *in*.
 3. **Chooses.** Candidates are ranked by
    `salience + novelty + persistence - recently_seen_penalty - excessive_distance_penalty`.
    The weights are a named, documented constant
@@ -875,10 +878,414 @@ arrived, not from the plan: what the agent looked at is a measurement.
 - **Salience is not semantics.** The chosen region is whatever has the most
   local structure, novelty and persistence. On a busy scene it will sometimes
   pick something a human would not.
+- **A low-contrast frame used to yield the whole frame as its one region.** The
+  first live run found this the hard way (see the section below). Each salience
+  cue is normalised by its own frame maximum, so on a frame with almost no
+  variation the little there is gets inflated to fill the range, every cell
+  clears the threshold, and the map's single group spans the entire frame. A
+  region the size of the frame is not a region and cannot be tracked — it leaves
+  the matcher exactly one legal position, so it "matches" itself wherever it is
+  assumed to be, at a confidence of 1.0, and the distance to it can never change.
+  This is now refused in three places rather than tuned around: `find_candidates`
+  and `candidate_from_cells` decline a box that covers the frame, and `refine`
+  and `_refine_scaled` decline a search region that offers the template only one
+  position. The refusal is geometric, not a size cap, so a large-but-bounded
+  region is still located normally. The honest consequence is that a sky-only
+  scene now scans, finds nothing, and says so, instead of "successfully" centring
+  the sky.
 - **Re-acquisition is shallow.** If a target is lost mid-centring, the agent
   gets `wake_max_center_moves` attempts to find it again by searching outward.
   If it stays lost, the target is abandoned and the run ends rather than
   wandering.
+
+#### The first live run, and what it exposed
+
+The first live WAKE-001 run happened on the operator's machine against Luanti
+5.17.0, in a 3222x1928 client area:
+
+```powershell
+python -m autocraft wake-test --focus-delay 20 --yes
+```
+
+Run `20260920T063805Z-7b7a82a2`; the measurement is
+`data/runs/wake/wake_result.json`. The run failed, and the operator's own
+description of it is the most valuable artefact this milestone produced:
+
+> Looked around, picked a candidate, then it seemed like it started going down
+> and looking at the ground. Not centring anything. It stopped early after
+> repeated attempts. Then the terminal threw a crash after it stopped.
+
+Both halves of that report are reproducible from the record, and neither is a
+tuning problem. This section is the forensic pass: what was recorded, what was
+**not** recorded, and the two defects the run proved.
+
+The run is preserved exactly as it happened. Nothing here was rewritten to make
+the run look better, and the fix described below is a general defect fix, not a
+change made until this one run looked right.
+
+##### What the record says, in the run's own words
+
+`run.json` for this run is complete: `status: "stopped"`, `step_count: 16`,
+`executed_steps: 16`, `blocked_steps: 0`, **`safety_events: []`**, `errors: []`,
+`duration: 40.27 s`, `stop_reason: "policy stop (every one of the 3 candidate(s)
+attempted was abandoned; last reason: the same correction was attempted 3 times
+with no measurable progress)"`. So the run was recorded cleanly by the loop
+before anything else went wrong. **There were no safety events at all** in this
+run — nothing was ever blocked, rate-limited, or emergency-stopped.
+
+The console printed 41 lines. Counted by kind, they are:
+
+| kind | count |
+|---|---|
+| `WAKE_STARTED` | 1 |
+| `VIEW_REVISITED` | 1 |
+| `VIEW_CAPTURED` | 2 |
+| `CANDIDATE_FOUND` | 2 |
+| `SCAN_MOVE` | 1 |
+| `NEW_VIEW_OBSERVED` | 1 |
+| `TARGET_SELECTED` | 3 |
+| `CENTERING_PROGRESS` | 14 |
+| `STUCK_PATTERN_DETECTED` | 5 |
+| `STRATEGY_CHANGED` | 7 |
+| `STRATEGY_FAILED` | 3 |
+| `WAKE_ABORTED` | 1 |
+
+The 14 `CENTERING_PROGRESS` events correspond to the 14 centring moves; the 15th
+mouse move is the single scan move.
+
+##### Every movement the run made
+
+Reconstructed from `steps.ndjson` (16 rows) and the event stream. `t` is seconds
+since step 0's `started_at`. `distance` is the target's distance from the frame
+centre as reported by the policy. `move` is the policy's own centring-move
+counter, which resets whenever a new target is selected.
+
+| # | t (s) | dx | dy | band | distance | conf | move | what else happened at this step |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 0.000 | +60 | 0 | — | — | — | scan 1 | the scan move; no target yet |
+| 1 | 1.651 | +20 | +20 | medium | 216.4 | 1.000 | 1 | target A selected: centre (1788.0, 1088.6) |
+| 2 | 2.789 | +20 | +20 | medium | 216.4 | 0.640 | 2 | |
+| 3 | 3.937 | +6 | +6 | fine | 216.4 | 0.550 | 3 | stuck: 3x (+20,+20) medium; band forced to fine |
+| 4 | 5.086 | +6 | +6 | fine | 216.4 | 0.646 | 4 | |
+| 5 | 6.259 | +6 | +6 | fine | 216.4 | 0.664 | 5 | |
+| 6 | 8.364 | −6 | −6 | fine | 130.4 | 0.902 | 1 | stuck; target A failed; target B selected: centre (1533.5, 859.1) |
+| 7 | 9.476 | −6 | −6 | fine | 130.4 | 0.686 | 2 | |
+| 8 | 11.526 | +20 | +20 | medium | 216.4 | 0.846 | 1 | stuck; target B failed; target A selected again |
+| 9 | 12.647 | +10 | +10 | medium | 216.4 | 0.479 | 2 | |
+| 10 | 13.818 | +20 | +20 | medium | 216.4 | 0.710 | 3 | the only step whose VERIFY frame registered as changed |
+| 11 | 14.976 | +20 | +20 | medium | 216.4 | 0.635 | 4 | |
+| 12 | 16.124 | +6 | +6 | fine | 216.4 | 0.655 | 5 | stuck; band forced to fine |
+| 13 | 17.294 | +6 | +6 | fine | 216.4 | 0.815 | 6 | |
+| 14 | 18.451 | +6 | +6 | fine | 216.4 | 0.692 | 7 | |
+| 15 | 19.593 | — | — | — | — | — | — | stuck; target A failed again; run aborted, no move sent |
+
+Two things are visible in that table before any interpretation. **Every centring
+move has `dx == dy`** — not one is purely horizontal or vertical. And **the
+reported `distance` never changes within a target**: 216.4 for target A across
+eleven separate moves, 130.4 for target B across three. The policy believed it
+was making progress fourteen times and made none.
+
+##### What the record does *not* contain
+
+The record cannot answer several of the questions this table invites, and it is
+better to say so than to infer:
+
+- **per-step target centre, before and after** — missing. Only the run-level
+  `final_target_offset` and the centres inside the three `TARGET_SELECTED`
+  events exist.
+- **per-step target distance before *and* after** — only the single `distance`
+  the policy used to size the move is recorded, not the measured distance on the
+  far side of it. That is why "no progress" has to be inferred from the
+  *constancy* of the number rather than read off two numbers.
+- **per-step state, strategy and stuck status** — missing from `steps.ndjson`.
+  They appear only inside the corresponding events, which is a different file.
+- **per-step progress classification** — missing. Only the run-level
+  `dead_repetition_ratio: 1.0` and `productive_repetition_ratio: 0.0` exist.
+- **per-step candidate identity** — missing. The three `TARGET_SELECTED` events
+  carry the centres, and the run-level `target_changes: 2` counts the switches,
+  but a step cannot be joined to the candidate it was acting on.
+- **per-step mapping source** — missing. It is run-level and constant:
+  `mapping.source: "unmeasured"`.
+- **frame images** — none survived. `save_frames_every` defaults to `0` and
+  `wake-test` exposes no flag for it, so every step's `capture_path` is `None`.
+  The only frame that left a trace is step 0's `observation.frame` payload:
+  3222x1928, `mean_luma` 137.132, screen rect (615, 85)-(3837, 2013).
+
+The record also cannot say *how far* a mouse count moves the view, and does not
+pretend to: `mapping` is `{"pixels_per_delta_x": null, "pixels_per_delta_y":
+null, "quality": null, "source": "unmeasured"}`.
+
+##### Why the camera drifted downward
+
+The drift is not a vertical bias, and it is not the scene. It is a single
+defect with a chain that the record and an offline reproduction both confirm.
+
+**1. The salience map is normalised per frame, so a low-contrast frame is
+inflated.** `salience_map` divides each cue by its own frame maximum
+(`_normalise`). On the sky-and-ground view the run was looking at, the raw
+spread is small, so the normalisation stretches it.
+
+**2. The threshold is relative to that peak, so on a low-contrast frame every
+cell passes it.** `find_candidates` thresholds at
+`max(min_salience, peak_fraction * peak)` = `max(0.15, 0.45 * peak)`. On a
+synthetic low-contrast sky the peak comes out at 0.9657, so the threshold is
+0.4346 and **all 64 of 64 cells clear it**. They merge into one group whose
+bounding box is the entire frame. All three `TARGET_SELECTED` events in the live
+run carry exactly that:
+
+```json
+{"bbox": [0, 0, 3222, 1928], "centre": [1788.0, 1088.6], "confidence": 1.0, "salience": 0.3399}
+```
+
+**3. A frame-sized candidate makes relocation a fixed point.** `_locate` builds
+`TargetPatch.of(frame, candidate.bbox)`. With a full-frame bbox **the patch is
+the whole frame**. Correlating a whole-frame template against a whole-frame
+region leaves `matchTemplate` exactly one legal position, so the match is always
+at the patch's own origin and `_relocation_of` returns `patch.centre` unchanged
+— with `confidence 1.0`, because a perfect self-match is a perfect match. The
+"found" location is not a measurement of the target; it is the target's own
+assumed position echoed back. Reproduced from scratch offline: `locate` on a
+full-frame patch returns exactly the frame centre `(1611.0, 964.0)` at
+`confidence 1.0`, while the same call on a properly sized 320x240 patch returns
+the correct `(1560.0, 820.0)`.
+
+**4. So the offset never changes, and the loop cannot converge.** The target
+centres are `(1788.0, 1088.6)` and `(1533.5, 859.1)`; the frame centre is
+`(1611.0, 964.0)`. The offsets are therefore `(+177.0, +124.6)` (distance
+216.4) and `(−77.5, −104.9)` (distance 130.4) — which are exactly the run-level
+`final_target_offset: [177.0, 124.6]` and exactly the distances in the movement
+table. **The centre never moved once.** Distance stayed at 216.4, the progress
+model scored every attempt `0.0`, the repetition guard fired every third
+attempt, and the run walked through three candidates and 15 moves to a truthful
+`failed`.
+
+**5. And the diagonal is a consequence, not a cause.** With no measured
+pixels-per-count ratio, `_step_counts` sizes each axis **independently** by the
+band's fixed count, so any offset with two non-zero components yields
+`|dx| == |dy|`. That is why every correction in the table is a perfect
+diagonal, and why the reported `direction` is always `"right"` or `"left"` —
+`direction_of` names an axis from the dominant component, and the vertical half
+of every one of those moves is invisible in the report. `(+20, +20)` is not a
+"right" correction. It is a right-and-down correction, fourteen times in a row,
+which is the downward drift the operator saw.
+
+**What this rules out.** The vertical-calibration hypothesis is not merely
+unsupported, it is impossible here: `_centre` feeds
+`note_observation(shift_x=offset_x − previous_offset_x, ...)`, and because the
+relocation is a fixed point that shift is exactly `0` every time.
+`MotionCalibration.observe` rejects any sample whose ratio is not `> 0`, so no
+sample is ever taken and the calibration stays `unmeasured` for the whole run.
+There was never a bias to have. A HUD or hotbar region is a real secondary
+attraction on a busy frame, but it is not what happened here — the candidate was
+the whole frame, HUD included.
+
+##### The fix: a region that covers the frame is not a region
+
+The defect is fixed at the source, in `wake/salience.py`, by refusing the two
+degenerate shapes rather than by tuning any threshold. Two small predicates do
+it:
+
+- `_spans_frame(bbox, width, height)` — true when a box covers the frame from
+  edge to edge. `find_candidates` skips such a group, and
+  `candidate_from_cells` returns `None` for it. This is the upstream fix and the
+  clean statement of the defect: the whole frame has no surroundings, so it is
+  not a local feature of the scene at all, and its "salience" is the frame's
+  global contrast wearing a region's clothing.
+- `_has_search_room(region_width, region_height, patch_width, patch_height)` —
+  false when a search region offers the template only one legal position.
+  `refine` and `_refine_scaled` return `None` in that case. This is the general
+  rule the first one is a special case of, and it protects every caller of the
+  matcher, not just the policy: **a template always matches itself perfectly, so
+  a lone position is not a location.** A score cannot detect this — the
+  self-match scores 1.0 — so it is refused by geometry instead. The rule allows
+  room along *either* axis, because a region exactly as wide as the patch can
+  still say whether the target moved up or down.
+
+Both predicates are deliberately narrow, and the tests pin that narrowness. A
+region larger than the frame is refused too, but a band that spans the full width
+is not (it is a real feature), and a large-but-bounded 120x90 region in a
+160x120 frame is still found and still relocated. The rule is about covering the
+frame, not about size.
+
+There is no scene-specific threshold anywhere in the fix, no "never look down",
+no hardcoded direction, and no change to `BAND_COUNTS`, the salience weights, the
+progress epsilon or the repetition guard. The three candidates, the 15 moves, the
+constant 216.4 px distance and the diagonal are all consequences of the target
+never moving; fixing the target fixes them.
+
+The honest consequence is a different and better failure. On a synthetic
+sky-only scene the old code selected the full frame, ran 14 centring moves at a
+distance that never changed, and reached `WakeState.COMPLETE` — it believed it had
+centred the sky. The same scene now scans, finds nothing, and ends `FAILED` with
+`"nothing visually salient was found in 12 scan movement(s)"`: zero
+`TARGET_SELECTED` events, zero `CENTERING_PROGRESS` events, `candidate_count 0`.
+A truthful "there was nothing to look at" is the outcome this milestone is
+supposed to produce.
+
+Six tests cover it, using the panning `FakeWorld` scene and a synthetic gradient
+sky. Five of them fail against the pre-fix code — the frame-sized candidate, the
+direct `candidate_from_cells` call, the over-broad-region boundary, the
+frame-sized patch through both matcher passes, and the sky-only run. The sixth,
+`test_a_bounded_region_is_still_located`, passes both before and after, and
+exists precisely so that over-refusal cannot be mistaken for a fix.
+
+##### Why the motion was choppy
+
+Measured over the 15 mouse moves, decomposing each step at
+`action.created_at`, `result.started_at`/`result.finished_at` and
+`finished_at`:
+
+| phase | min | median | mean | max | total | share |
+|---|---|---|---|---|---|---|
+| pre-move: capture, salience, match, decide, focus check | 0.656 | 1.027 | **1.160** | 1.992 | 17.394 | **90.609%** |
+| mouse execution (`SendInput` returns) | 0.0002 | 0.0002 | **0.0003** | 0.0011 | 0.005 | **0.026%** |
+| post-move: VERIFY capture + `frame.difference` | 0.107 | 0.117 | **0.120** | 0.139 | 1.797 | **9.361%** |
+| whole step | 0.774 | 1.156 | 1.280 | 2.103 | 19.196 | |
+| inter-step gap | 0.0017 | 0.0021 | 0.0021 | 0.0034 | 0.032 | 0.16% |
+
+The run took 20.249 s of behaviour (the record's 40.27 s `duration` includes the
+operator's own `--focus-delay 20` countdown). The step rate was therefore about
+**0.78 moves per second**, and the mouse itself accounts for 0.026% of the time
+between moves. **There is no deliberate settle delay**: `_pace` is a no-op
+unless a step interval is configured, the inter-step gap is 2 ms, and the only
+gap between injecting a move and looking at the result is the VERIFY capture
+itself (~0.09 s of grab). So the choppiness is not a pacing choice and not a
+slow input path — it is capture and decision latency on a 3222x1928 frame, and
+the frame size is the reason.
+
+An offline reproduction of the same degenerate case on this machine attributes
+the cost directly:
+
+| operation at 3222x1928 | 3222x1928 | 1280x720 |
+|---|---|---|
+| `salience_map` (grid 8) | 0.221 s | 0.038 s |
+| `find_candidates` (grid 8) | 0.454 s | 0.077 s |
+| `locate`, coarse pass (`refine` scale 4) | 0.637 s | 0.091 s |
+| `locate`, fine pass (`refine` window 16) | 0.567 s | 0.071 s |
+| `locate`, both passes | 1.228 s | 0.164 s |
+
+The degenerate full-frame template match is the single largest term, and it is a
+direct consequence of the defect above: the search window is bounded by design,
+but a frame-sized *template* is not, so both passes end up correlating the whole
+frame against itself. The offline figures were taken at a different time from
+the live run and are the same order of magnitude as, not a decomposition of, the
+recorded 1.16 s pre-move mean; the recorded numbers are the authoritative ones.
+
+Two secondary readings fall out of the same data. `frame_changed` is `False` for
+14 of the 15 moves even though the view demonstrably moved (mean luma falls
+137.1 to 82.0 across the run). `Frame.difference` compares 16x16 block means and
+divides by 255, and the loop's threshold is `0.01` — documented as "about 2.5
+levels out of 255" — while the recorded differences are 0.000128 to 0.001579,
+about 0.03 to 0.4 levels. Only step 10, at 0.0424, tripped it. Given that VERIFY
+runs about 0.09 s after the injection and every later step sees a large change,
+the honest reading is that **the game has not redrawn by the time VERIFY looks**:
+the latency between a relative mouse move and a visible response is bounded
+below by ~0.1 s and above by ~0.65 s by this record, and is not pinned more
+precisely. VERIFY is currently paying ~0.12 s per step for information that
+arrives too early to be true. That is a measurement, not a defect in the
+sensor — and it is worth fixing, but not in this pass.
+
+##### The crash, and the rule it produced
+
+After the loop had already stopped cleanly, the CLI raised:
+
+```
+ValueError: dictionary update sequence element #0 has length 9; 2 is required
+```
+
+Two defects, one visible and one stacked behind it.
+
+The visible one: the plan was serialised with `[dict(row) for row in
+_wake_plan(config)]`. `_wake_plan` returns seven `(label, text)` pairs, and
+`dict()` on a 2-tuple treats it as a key/value pair — so it tried to unpack the
+nine-character string `"behaviour"` into a key and a value. The plan is now
+serialised by an explicit `_wake_plan_payload` that names its two fields, and
+`_wake_plan` itself is untouched because the table printer consumes those
+tuples.
+
+The stacked one: `AgentLoop.run()`'s `finally` closes the run recorder, so the
+CLI's later attempt to write the plan step into the same recorder raised
+`RuntimeError: run ... is already closed`. That is why the run's `run.json` was
+complete while the command still died.
+
+The rule this produced is a durability invariant, and it is now enforced
+structurally rather than by care: **the measurement is written and the run is
+closed before anything non-essential is allowed to fail.** The plan step is
+recorded *before* the loop runs, while the recorder is open. Closing out is
+guarded, and a failure to close is reported rather than raised. And the four
+presentation steps — publishing to the observer page, finishing the publisher,
+stopping the observer server, printing the summary — are each attempted
+separately, each one's failure reported as a `warning:` line on stderr, and none
+of them able to skip the cleanup that follows it or lose the result file.
+
+The regression coverage drives the whole `wake-test` command through the real
+finalisation path, including terminal-completion and early-stop, and the tests
+fail against the old code with the byte-for-byte error above.
+
+##### Smooth mouse motion: designed, deferred
+
+The measured choppiness has a second cause that this pass did **not** fix: a
+relative move is one instantaneous `SendInput` jump. The design for
+`move_relative_smooth(total_dx, total_dy, duration, microsteps)` is recorded here
+so it can be implemented deliberately rather than improvised:
+
+- The total is divided into `microsteps` integer deltas that **sum exactly** to
+  the requested total on each axis, with the rounding remainder distributed
+  rather than dropped, so smoothing can never change where the view ends up.
+- The total is clamped by `max_mouse_delta` **before** division, not per
+  microstep, so the existing hardware ceiling keeps its meaning.
+- The sleep between microsteps lives in the input layer's injected sleeper, not
+  in the policy, and the policy makes no decision inside the interpolation. A
+  smooth move is one action with one `ActionRecord`, one duration and one
+  verification — interpolation is not a place for autonomy.
+- Focus re-check, rate limiting, hold limits and the emergency stop are enforced
+  on **every** microstep, not only at the start, and an abort mid-move leaves
+  the already-sent deltas sent and says so in the record. A partially applied
+  move is reported as partial, never as complete.
+- Held-input semantics are unchanged: smoothing applies to relative movement
+  only, and no key state is interpolated.
+- Tests drive it with fake input only, and assert the sum invariant, the clamp
+  order, abort mid-move, and that no real input is ever constructed.
+
+This is deliberately larger than the correction pass and is deferred. It is a
+motion-quality change, and it would be dishonest to ship it in the same commit
+as a defect fix, because then the next live run could not attribute what changed.
+
+##### The next live run
+
+The operator resizes Luanti by hand to about **1280x720** before the run.
+AutoCraft never resizes the window: the window is the thing being measured, and
+changing it to make a measurement easier would make the measurement worthless.
+The 3222x1928 size is what produced both the ~1.3 s step time and the
+low-contrast normalisation blow-up above, and `look_large_window_pixels` (921600)
+warns rather than acts for exactly this reason.
+
+The comparison axes for run 2 against run 1, in the order they should be read:
+
+1. **Cadence** — step time and the pre-move share. Run 1: 1.28 s per step, 90.6%
+   pre-move. At 1280x720 the offline figures above put the decision cost at
+   about 0.22 s instead of 1.46 s, so a step time in the 0.3-0.4 s range is the
+   prediction, not a result.
+2. **Candidate choice** — does `CANDIDATE_FOUND` report more than one candidate,
+   and is any `TARGET_SELECTED` bbox still the whole frame? Run 1: one
+   candidate, frame-sized, three times.
+3. **Target path** — does the reported `distance` change between consecutive
+   moves, or is it constant again? Run 1: constant, which is the signature of
+   the fixed point.
+4. **Dead repetition** — `dead_repetition_ratio` and `productive_repetition_ratio`.
+   Run 1: 1.0 and 0.0.
+5. **Downward drift** — are the corrections still `dx == dy` on every move, and
+   does the view's mean luma fall by 55 levels again? Run 1: yes and yes.
+6. **Truthful emptiness** — if a view has nothing in it, does the run say so, or
+   does it name the whole frame a target? Run 1: the latter, three times. The
+   fix should make this the "nothing visually salient was found" outcome, and a
+   run that reports that has succeeded at being honest, not failed at centring.
+
+Until run 2 exists, no claim is made that the defect is gone. The fix is
+implemented and offline-verified — the frame-sized candidate is refused, the
+frame-sized patch cannot be located, and a sky-only scene ends with a truthful
+"nothing there" — but an offline reproduction is not the operator's screen. Only
+a live run can say the view stops walking into the ground.
 
 #### What it does not do
 
@@ -1184,6 +1591,14 @@ covered:
   offers nothing, that the returned candidates are real `CandidateTarget`s, that
   a candidate marked failed is not offered again, and that the scoring weights
   are explicit and documented
+- the WAKE-001 frame-covering refusal, the fix for the first live run's defect: a
+  synthetic low-contrast sky offers no candidate at all, `candidate_from_cells`
+  refuses a box that covers the frame, a box larger than the frame is refused
+  while a full-width band is not, a frame-sized patch is refused by both matcher
+  passes, a large-but-bounded region is still located — so that over-refusal
+  cannot be mistaken for a fix — and a sky-only scene runs to `FAILED` with a
+  truthful "nothing visually salient" reason, zero `TARGET_SELECTED` events and
+  zero `CENTERING_PROGRESS` events instead of centring the sky
 - the WAKE-001 centring: that the movement band follows the distance, that a
   sign flip is recorded as an overshoot with the reversed axis named, that a
   panning scene converges inside the dead zone, that the controller self-measures
@@ -1211,8 +1626,20 @@ covered:
   connection or a subprocess, and none exposes a pass/fail verdict
 - the `wake-test` safety gate: refusal before any input object exists, the plan
   printed without claiming a result, and a dry run that sends nothing
+- the `wake-test` finalisation path, driven through the whole command: that the
+  plan is serialised as named fields and never as `(label, text)` pairs, that the
+  plan step is recorded while the recorder is still open, that the run is
+  finished exactly once, and that an early stop and a terminal completion both
+  reach the same close-out
+- the `wake-test` durability rule: the summary, the observer page publish, the
+  publisher and the observer server are each made to fail on purpose, one at a
+  time, and the result file is still written and the cleanup still runs — with
+  the failure reported as a warning rather than swallowed
+- the `wake-test` crash regression: the exact `dict()`-on-a-2-tuple defect that
+  killed the first live run is pinned as still raising, so the fix cannot be
+  undone by a plausible-looking tidy-up
 
-The suite is 796 tests and runs in about 23 seconds. Everything that talks to
+The suite is 820 tests and runs in about 25 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---

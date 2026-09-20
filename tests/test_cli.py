@@ -21,7 +21,7 @@ import pytest
 
 from autocraft import cli
 from autocraft.agent.action import Action, ActionResult
-from autocraft.agent.observation import Observation
+from autocraft.agent.observation import Observation, WindowStatus
 from autocraft.config import Config
 from autocraft.control.safety import SafetyDecision
 from autocraft.vision.frame import Frame, ScreenRegion
@@ -252,7 +252,7 @@ def _minimized_status(*, force: bool = False) -> TargetStatus:
 
 
 def _replaced_window_status(*, force: bool = False) -> TargetStatus:
-    """A different matching window, focused — e.g. a second game instance."""
+    """A different matching window, focused Ã¢â‚¬â€ e.g. a second game instance."""
     window = WindowInfo(
         handle=0x51A00,
         title="Luanti 5.17.0",
@@ -308,9 +308,29 @@ class FakeGuard:
         self.shutdown_calls: list[str] = []
         self.atexit_installed = False
         self.events: list[object] = []
+        # The remaining attributes are the rest of the surface ``AgentLoop``
+        # reads. ``input-test`` and ``look-test`` never get far enough to touch
+        # them, but ``wake-test`` runs the loop for real.
+        self.blocked_streak = 0
+        self.last_block_reason = ""
+        self.stop_reason = ""
+        self.should_stop_for_blocks = False
 
     def install_atexit(self) -> None:
         self.atexit_installed = True
+
+    def check_emergency_stop(self) -> bool:
+        return False
+
+    def enforce_hold_limits(self) -> list[object]:
+        return []
+
+    def record_block(self, reason: str) -> None:
+        self.last_block_reason = reason
+        self.blocked_streak += 1
+
+    def record_success(self) -> None:
+        self.blocked_streak = 0
 
     def release_all(self, reason: str = "release_all") -> list[str]:
         self.release_all_calls.append(reason)
@@ -1556,3 +1576,523 @@ class TestParserSurface:
         assert args.steps is not None or args.seconds is not None
         assert args.steps == 5
         assert args.seconds == 10.0
+
+
+# --------------------------------------------------------------------------
+# WAKE-001: wake-test
+# --------------------------------------------------------------------------
+#
+# The first live wake-test run ended in a traceback *after* the behaviour had
+# already stopped and saved its measurement:
+#
+#     ValueError: dictionary update sequence element #0 has length 9;
+#                 2 is required
+#
+# Two defects were behind it. The finalisation block built the recorded plan
+# with ``[dict(row) for row in _wake_plan(config)]``; ``_wake_plan`` yields
+# ``(label, text)`` pairs, and ``dict()`` on a pair treats it as a sequence of
+# key/value pairs, so it tried to unpack the label ``'behaviour'`` - nine
+# characters - into two items. Because that exception fired first, it also hid
+# a second one waiting behind it: the agent loop had already closed the
+# telemetry recorder, so the finalisation block's own ``record_step`` and
+# ``record_safety_events`` would have raised ``RuntimeError``.
+#
+# What these tests pin is therefore the *shape* of the finalisation, not just
+# the absence of one exception: the measurement must be written before
+# reporting runs, no failure in reporting may skip the cleanup or the printed
+# summary, and the run record must be readable afterwards on every exit path.
+
+
+def _wake_status(*, force: bool = False) -> TargetStatus:
+    """A small, focused target: below the size warning, and ready to act on."""
+    window = WindowInfo(
+        handle=0x40724,
+        title="Luanti 5.17.0",
+        region=ScreenRegion(0, 105, 1280, 720),
+        visible=True,
+        minimized=False,
+        process_id=1234,
+    )
+    return TargetStatus(
+        found=True,
+        window=window,
+        is_foreground=True,
+        foreground_handle=window.handle,
+        foreground_title=window.title,
+        reason="",
+    )
+
+
+def _wake_unfocused_status(*, force: bool = False) -> TargetStatus:
+    """The same window, but the shell still has the foreground."""
+    focused = _wake_status(force=force)
+    return TargetStatus(
+        found=True,
+        window=focused.window,
+        is_foreground=False,
+        foreground_handle=0x111,
+        foreground_title="PowerShell",
+        reason="the target window is not the foreground window",
+    )
+
+
+class WakeObserver:
+    """A fake observer that returns one fixed low-contrast frame.
+
+    The frame is deliberately flat. That is what the live run was looking at
+    when it drifted: a low-contrast view makes every cell of the salience map
+    look equally interesting, which is enough to keep the policy busy until one
+    of its budgets runs out. The point of the test is the *finalisation*, so a
+    scene the policy cannot converge on is exactly the right input - it is the
+    path that ends with the loop closing the recorder underneath the CLI.
+    """
+
+    def __init__(self, width: int = 160, height: int = 120) -> None:
+        rng = np.random.default_rng(3)
+        self.image = rng.integers(120, 140, size=(height, width, 3), dtype=np.uint8)
+        self.calls = 0
+
+    def observe(
+        self, index: int = 0, *, capture: bool = True, force_discovery: bool = False
+    ) -> Observation:
+        self.calls += 1
+        status = WindowStatus(found=True, title="Luanti 5.17.0", is_foreground=True)
+        return Observation(
+            index=index,
+            timestamp=0.0,
+            window=status,
+            frame=Frame(self.image.copy(), float(index)),
+        )
+
+
+class FakeWakeServer:
+    """Stands in for the observer HTTP server; records that it was stopped."""
+
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class FakeWakePublisher:
+    """Stands in for the live panel publisher."""
+
+    def __init__(self) -> None:
+        self.finished: list[object] = []
+
+    def finish(self, run_record: object) -> None:
+        self.finished.append(run_record)
+
+
+@dataclass
+class WakeRuntime:
+    """The subset of ``Runtime`` that ``cmd_wake_test`` uses."""
+
+    locator: SequenceLocator
+    config: Config
+    observer: WakeObserver
+
+    def close(self) -> None:
+        """``cmd_wake_test`` closes the runtime on every exit path."""
+
+
+@dataclass
+class WakeHarness:
+    """Everything a test needs to observe one ``wake-test`` run."""
+
+    config: Config
+    locator: SequenceLocator
+    guard: FakeGuard
+    world: WakeObserver
+    executor: FakeExecutor
+    publisher: FakeWakePublisher
+    server: FakeWakeServer
+
+    @property
+    def wake_dir(self) -> Path:
+        return Path(self.config.runs_dir) / "wake"
+
+    def result_payload(self) -> dict:
+        """The parsed ``wake_result.json`` from this run."""
+        import json
+
+        return json.loads((self.wake_dir / "wake_result.json").read_text(encoding="utf-8"))
+
+    def run_payload(self) -> dict:
+        """The parsed ``run.json`` from this run's telemetry directory."""
+        import json
+
+        return json.loads((Path(self.config.runs_dir) / self.run_id / "run.json").read_text(encoding="utf-8"))
+
+    def step_rows(self) -> list[dict]:
+        """Every row of ``steps.ndjson`` from this run's telemetry directory."""
+        import json
+
+        path = Path(self.config.runs_dir) / self.run_id / "steps.ndjson"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    @property
+    def run_id(self) -> str:
+        """The one telemetry directory this run created."""
+        candidates = [
+            entry.name
+            for entry in Path(self.config.runs_dir).iterdir()
+            if entry.is_dir() and entry.name != "wake"
+        ]
+        assert len(candidates) == 1, candidates
+        return candidates[0]
+
+
+def _install_wake_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    statuses: list[TargetStatus],
+    *,
+    config: Config | None = None,
+    observer_flag: bool = False,
+) -> WakeHarness:
+    """Wire ``wake-test`` to fakes all the way down to the actuator boundary.
+
+    No real window, no real sleep, and no real mouse: ``Keyboard`` and ``Mouse``
+    become plain objects, so a test that reaches the actuator reaches something
+    with no ``move_relative`` at all rather than moving the operator's pointer.
+    The budgets are tightened so a policy that cannot converge still stops
+    quickly instead of working through the shipped defaults.
+    """
+    config = config or Config(
+        data_dir=tmp_path / "data",
+        wake_max_scan_moves=2,
+        wake_max_center_moves=2,
+        wake_max_moves=6,
+        wake_max_seconds=20.0,
+    )
+    locator = SequenceLocator(statuses=list(statuses))
+    guard = FakeGuard()
+    world = WakeObserver()
+    executor = FakeExecutor()
+    publisher = FakeWakePublisher()
+    server = FakeWakeServer()
+    monkeypatch.setattr(cli, "_load", lambda args: (config, "test"))
+    monkeypatch.setattr(
+        cli,
+        "_build_runtime",
+        lambda config, *, config_source: WakeRuntime(locator=locator, config=config, observer=world),
+    )
+    monkeypatch.setattr(cli, "_build_guard", lambda config, locator: guard)
+    monkeypatch.setattr(cli, "Keyboard", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "Mouse", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "ActionExecutor", lambda *a, **k: executor)
+    monkeypatch.setattr(cli, "FOCUS_HANDOFF_SECONDS", 0.0)
+    if observer_flag:
+        monkeypatch.setattr(cli, "_start_observer", lambda *a, **k: (server, publisher))
+    return WakeHarness(
+        config=config,
+        locator=locator,
+        guard=guard,
+        world=world,
+        executor=executor,
+        publisher=publisher,
+        server=server,
+    )
+
+
+def _run_wake_test(*argv: str) -> int:
+    args = cli.build_parser().parse_args(["wake-test", *argv])
+    return cli.cmd_wake_test(args)
+
+
+class TestWakePlanPayload:
+    """The recorded plan keeps the shape the record intends."""
+
+    def test_the_payload_is_a_list_of_labelled_objects(self) -> None:
+        payload = cli._wake_plan_payload(Config())
+
+        assert isinstance(payload, list) and payload
+        for row in payload:
+            assert isinstance(row, dict)
+            assert set(row) == {"step", "detail"}
+            assert isinstance(row["step"], str) and row["step"]
+            assert isinstance(row["detail"], str) and row["detail"]
+
+    def test_every_plan_row_reaches_the_payload(self) -> None:
+        config = Config()
+        payload = cli._wake_plan_payload(config)
+
+        assert [row["step"] for row in payload] == [label for label, _ in cli._wake_plan(config)]
+        assert [row["detail"] for row in payload] == [text for _, text in cli._wake_plan(config)]
+
+    def test_the_payload_is_json_serialisable(self) -> None:
+        import json
+
+        json.dumps(cli._wake_plan_payload(Config()))
+
+    def test_dict_of_a_plan_pair_is_what_used_to_crash(self) -> None:
+        # The exact defect, pinned so it cannot come back through a refactor
+        # that "simplifies" the helper back into a comprehension.
+        config = Config()
+        with pytest.raises(ValueError, match="dictionary update sequence element #0"):
+            [dict(row) for row in cli._wake_plan(config)]
+
+        # ``dict`` over the whole sequence is fine - the pairs are the labels.
+        assert set(dict(cli._wake_plan(config))) == {
+            "behaviour",
+            "movement budget",
+            "centring budget",
+            "time limit",
+            "confidence floor",
+            "keyboard",
+            "game state read",
+        }
+
+    def test_the_printed_table_still_gets_pairs(self) -> None:
+        # ``_print_table`` consumes ``(label, text)`` pairs, so the fix must not
+        # have changed ``_wake_plan`` itself.
+        rows = cli._wake_plan(Config())
+        assert all(isinstance(row, tuple) and len(row) == 2 for row in rows)
+
+class TestWakeFinalisation:
+    """``wake-test`` must survive to the end of a run on every exit path.
+
+    The live failure was not that the behaviour went wrong - it was that the
+    command then threw while reporting, which skipped the observer shutdown and
+    the printed summary and made a finished, saved measurement look like a
+    crash. These tests drive the real command through the real finalisation.
+    """
+
+    def test_a_finished_behaviour_leaves_a_readable_result(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The behaviour runs for real here, so ``AgentLoop`` closes the
+        # telemetry recorder from its own ``finally`` before the CLI's does -
+        # the exact ordering that hid the second defect.
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        exit_code = _run_wake_test("--yes")
+        capsys.readouterr()
+
+        assert exit_code in (0, 1)
+        payload = harness.result_payload()
+        assert payload["status"] in {"completed", "failed", "aborted"}
+        assert payload["run_id"]
+        assert payload["steps"] >= 0
+        assert payload["notes"], "every record carries its limitation notes"
+
+    def test_the_behaviour_actually_moved_the_policy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # Guards against the finalisation tests passing because nothing ran.
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        payload = harness.result_payload()
+        assert payload["steps"] > 0
+        assert payload["events"], "the policy emitted an event stream"
+        assert harness.world.calls > 0, "the observer was asked for frames"
+
+    def test_the_run_telemetry_is_finalised_not_left_running(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        record = harness.run_payload()
+        # The loop finalises the telemetry from its own ``finally`` block, and
+        # ``RunRecorder.finish`` is idempotent: the second call returns the same
+        # record without rewriting it. So the loop's own verdict is what stands,
+        # rather than being relabelled "wake-test" after the fact.
+        assert record["status"] == "stopped"
+        assert record["finished_at"]
+        assert record["errors"] == []
+        assert record["executed_steps"] >= 1
+        assert record["stop_reason"]
+
+    def test_the_plan_is_recorded_before_anything_moves(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The plan used to be appended from the finalisation block, after the
+        # loop had already closed the recorder. It is written up front now, and
+        # this is the test that would have caught the original crash.
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        rows = harness.step_rows()
+        plan_rows = [row for row in rows if row["action"].get("kind") == "wake-test"]
+        assert len(plan_rows) == 1, [row["action"].get("kind") for row in rows]
+
+        plan = plan_rows[0]["action"]["plan"]
+        assert isinstance(plan, list) and plan
+        assert all(set(row) == {"step", "detail"} for row in plan)
+        assert plan[0]["step"] == "behaviour"
+
+    def test_the_plan_row_precedes_the_behaviour_steps(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        indices = [row["index"] for row in harness.step_rows()]
+        assert indices[0] == -1, indices
+        assert indices == sorted(indices), indices
+
+    def test_the_safety_sweep_reaches_the_telemetry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        # The run released the input on the way in and again on the way out.
+        assert "wake-test start" in harness.guard.release_all_calls
+        assert "wake-test end" in harness.guard.release_all_calls
+        assert "wake-test finished" in harness.guard.shutdown_calls
+        assert harness.run_payload()["safety_events"] == []
+
+    def test_an_early_stop_also_leaves_a_readable_result(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The target is focused at discovery and gone by the countdown's end, so
+        # the command stops before the behaviour begins - the other path into
+        # the finalisation block, where ``result`` is set by the CLI itself.
+        harness = _install_wake_harness(
+            monkeypatch, tmp_path, [_wake_status(), _wake_unfocused_status()]
+        )
+
+        assert _run_wake_test("--yes") == 1
+        captured = capsys.readouterr()
+
+        assert "nothing was sent" in captured.err
+        payload = harness.result_payload()
+        assert payload["status"] == "aborted"
+        assert payload["moves_sent"] == 0
+        assert "foreground" in payload["stop_reason"]
+        # The plan is still recorded: an early stop is a run too.
+        plan_rows = [
+            row for row in harness.step_rows() if row["action"].get("kind") == "wake-test"
+        ]
+        assert len(plan_rows) == 1
+
+    def test_the_summary_is_printed(self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys) -> None:
+        _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+
+        assert "WAKE-001 summary" in capsys.readouterr().out
+
+
+class TestWakeReportingCannotBreakTheRun:
+    """Reporting is not the run, and it must not be able to end one early.
+
+    Each of these makes one presentational piece fail and then asserts that the
+    measurement was already on disk, that the remaining cleanup still ran, and
+    that the operator was told what went wrong rather than shown a traceback.
+    """
+
+    def test_a_failing_summary_does_not_lose_the_result_or_the_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_wake_harness(
+            monkeypatch, tmp_path, [_wake_status()], observer_flag=True
+        )
+
+        def explode(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("the terminal went away")
+
+        monkeypatch.setattr(cli, "_print_wake_summary", explode)
+
+        exit_code = _run_wake_test("--yes", "--observer")
+        captured = capsys.readouterr()
+
+        assert exit_code in (0, 1)
+        assert "the summary failed" in captured.err
+        assert "the terminal went away" in captured.err
+        # The measurement survived, and the rest of the cleanup still ran.
+        assert harness.result_payload()["run_id"]
+        assert harness.server.stop_calls == 1
+        assert harness.publisher.finished
+
+    def test_a_failing_panel_update_does_not_skip_the_summary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_wake_harness(
+            monkeypatch, tmp_path, [_wake_status()], observer_flag=True
+        )
+
+        from autocraft.observer.state import ObserverState
+
+        def explode(self: object, **kwargs: object) -> None:
+            raise RuntimeError("the panel is not listening")
+
+        monkeypatch.setattr(ObserverState, "publish_wake", explode)
+
+        _run_wake_test("--yes", "--observer")
+        captured = capsys.readouterr()
+
+        assert "the live panel update failed" in captured.err
+        assert "WAKE-001 summary" in captured.out
+        assert harness.server.stop_calls == 1
+
+    def test_a_failing_publisher_finish_does_not_skip_the_observer_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        harness = _install_wake_harness(
+            monkeypatch, tmp_path, [_wake_status()], observer_flag=True
+        )
+
+        def explode(run_record: object) -> None:
+            raise RuntimeError("the observer socket is gone")
+
+        monkeypatch.setattr(harness.publisher, "finish", explode)
+
+        _run_wake_test("--yes", "--observer")
+        captured = capsys.readouterr()
+
+        assert "the observer publisher failed" in captured.err
+        assert harness.server.stop_calls == 1
+        assert "WAKE-001 summary" in captured.out
+
+
+class TestFinishWakeRunRecorder:
+    """The telemetry close-out tolerates a recorder the loop already closed."""
+
+    def test_it_returns_the_record_when_the_recorder_is_already_closed(self, tmp_path) -> None:
+        from autocraft.telemetry.recorder import RunRecorder
+        from autocraft.wake import WakeRecorder
+
+        recorder = RunRecorder.new_run(tmp_path / "runs")
+        recorder.finish(status="stopped", stop_reason="the loop stopped it")
+        assert recorder.closed is True
+
+        wake_recorder = WakeRecorder(tmp_path / "wake", run_id="x", clock=lambda: 0.0)
+        result = wake_recorder.finish(status="aborted", stop_reason="nothing to do")
+        guard = FakeGuard()
+
+        record = cli._finish_wake_run_recorder(recorder, result, guard)
+
+        assert record is not None
+        assert record.run_id == recorder.run_id
+        assert record.status == "stopped", "the loop's verdict is not overwritten"
+
+    def test_it_returns_none_rather_than_raising_when_finish_fails(self, tmp_path) -> None:
+        from autocraft.telemetry.recorder import RunRecorder
+        from autocraft.wake import WakeRecorder
+
+        recorder = RunRecorder.new_run(tmp_path / "runs")
+
+        def explode(**kwargs: object) -> None:
+            raise RuntimeError("the disk went away")
+
+        recorder.finish = explode  # type: ignore[method-assign]
+        wake_recorder = WakeRecorder(tmp_path / "wake", run_id="x", clock=lambda: 0.0)
+        result = wake_recorder.finish(status="aborted", stop_reason="nothing to do")
+
+        assert cli._finish_wake_run_recorder(recorder, result, FakeGuard()) is None

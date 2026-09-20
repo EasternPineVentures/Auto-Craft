@@ -139,6 +139,44 @@ DEFAULT_MATCH_CONFIDENCE = 0.35
 #: numbers for such a template, so it is refused rather than trusted.
 _MIN_PATCH_CONTRAST = 1.0
 
+
+def _has_search_room(
+    region_width: int,
+    region_height: int,
+    patch_width: int,
+    patch_height: int,
+) -> bool:
+    """Whether a template has somewhere to move inside its search region.
+
+    A matcher that is offered exactly one legal position has not located
+    anything: it has echoed back the position it was handed, with a perfect
+    score, because a template always matches itself perfectly. That is not a
+    weak measurement, it is not a measurement at all, and it is the one failure
+    mode that cannot be detected by looking at the score. So it is refused by
+    geometry instead. The template needs room along *either* axis - a region
+    exactly as wide as the patch can still say whether the target moved up or
+    down.
+    """
+    return int(region_width) > int(patch_width) or int(region_height) > int(patch_height)
+
+
+def _spans_frame(bbox: Sequence[int], width: int, height: int) -> bool:
+    """Whether a box covers the entire frame.
+
+    A region that covers everything has no surroundings, so it is not a local
+    feature of the scene at all - its "salience" is the frame's global contrast
+    wearing a region's clothing. Such a box also cannot be tracked, because a
+    frame-sized patch leaves the matcher no position to search. Both problems
+    are the same problem, and the honest answer to it is to decline the region
+    rather than to name the whole screen as a target.
+    """
+    return (
+        int(bbox[0]) <= 0
+        and int(bbox[1]) <= 0
+        and int(bbox[2]) >= int(width)
+        and int(bbox[3]) >= int(height)
+    )
+
 #: How much of the relocation score is given up for being far from where the
 #: target was predicted to be. Small, because the prediction is only a hint - the
 #: point of relocating is to follow the target, not to stay put.
@@ -575,7 +613,9 @@ def find_candidates(
         limit: Maximum number of candidates to return.
 
     Returns:
-        Candidates sorted by salience, strongest first. Empty for a flat frame.
+        Candidates sorted by salience, strongest first. Empty for a flat frame,
+        and empty for a frame whose only candidate would be the whole frame -
+        see :func:`_spans_frame`.
     """
     image = frame.image if isinstance(frame, Frame) else np.asarray(frame)
     if image.ndim != 3 or image.shape[2] != 3:
@@ -605,6 +645,11 @@ def find_candidates(
         y0 = min(box[1] for box in cell_boxes_group)
         x1 = max(box[2] for box in cell_boxes_group)
         y1 = max(box[3] for box in cell_boxes_group)
+        if _spans_frame((x0, y0, x1, y1), width, height):
+            # Every cell cleared the threshold, which on a low-contrast frame
+            # means the threshold said nothing about the scene. The whole frame
+            # is not a region, and it cannot be tracked, so it is not offered.
+            continue
         total = float(weights.sum())
         if total <= 0.0:
             continue
@@ -659,6 +704,10 @@ def candidate_from_cells(
     y0 = min(box[1] for box in group)
     x1 = max(box[2] for box in group)
     y1 = max(box[3] for box in group)
+    if _spans_frame((x0, y0, x1, y1), width, height):
+        # Same refusal as find_candidates: a box covering the whole frame is not
+        # a region, and a frame-sized patch cannot be located.
+        return None
     weights = flat[chosen]
     total = float(weights.sum())
     centres = np.array([((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0) for box in group], dtype=np.float64)
@@ -783,10 +832,13 @@ def refine(
     Returns:
         A :class:`Relocation` whose ``centre`` is the target's centre, or ``None``
         when the patch is too flat to match, the search region is smaller than the
-        patch, or the best score is below ``min_score``. Returning ``None`` for a
-        flat patch is the only honest answer: a featureless template matches every
-        location equally well, and reporting the best of those would be inventing a
-        position.
+        patch or exactly the patch, or the best score is below ``min_score``.
+        Returning ``None`` for a flat patch is the only honest answer: a
+        featureless template matches every location equally well, and reporting the
+        best of those would be inventing a position. Returning ``None`` when the
+        region is exactly the patch is the same honesty applied to geometry: a
+        template always matches itself perfectly, so the "match" would be the
+        patch's own assumed position, not a measurement of where it went.
     """
     image = frame.image if isinstance(frame, Frame) else np.asarray(frame)
     height, width = int(image.shape[0]), int(image.shape[1])
@@ -826,6 +878,11 @@ def refine(
         right = min(width, int(math.ceil(predicted[0] + half_width + radius)))
         bottom = min(height, int(math.ceil(predicted[1] + half_height + radius)))
     if right - left < patch_width or bottom - top < patch_height:
+        return None
+    if not _has_search_room(right - left, bottom - top, patch_width, patch_height):
+        # The region is exactly the patch, so there is one legal position and the
+        # match would be the patch's own origin echoed back at a perfect score.
+        # That is the identity, not a location.
         return None
     region = np.ascontiguousarray(image[top:bottom, left:right])
 
@@ -868,6 +925,11 @@ def _refine_scaled(
         right = min(small_width, int(math.ceil(centre_x + patch_width / 2.0 + radius)))
         bottom = min(small_height, int(math.ceil(centre_y + patch_height / 2.0 + radius)))
     if right - left < patch_width or bottom - top < patch_height:
+        return None
+    if not _has_search_room(right - left, bottom - top, patch_width, patch_height):
+        # One legal position at this scale too, so the coarse pass would return
+        # the patch's own origin. Refusing lets locate fall through to the
+        # full-resolution pass, which applies the same rule.
         return None
     region = np.ascontiguousarray(small_frame[top:bottom, left:right])
 

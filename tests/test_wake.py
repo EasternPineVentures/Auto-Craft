@@ -113,6 +113,21 @@ def panned(image: np.ndarray, dx: int, dy: int) -> np.ndarray:
     return out
 
 
+def gradient_sky(height: int = 120, width: int = 160, seed: int = 7) -> np.ndarray:
+    """A smooth vertical gradient with faint noise: the shape of an empty sky.
+
+    This is the frame that broke the first live run. Every salience cue is
+    normalised by its own frame maximum, so a frame with almost no variation has
+    its small variation inflated to fill the range, every cell clears the
+    threshold, and the "region" the map reports is the entire frame.
+    """
+    rng = np.random.default_rng(seed)
+    ramp = np.linspace(150.0, 168.0, height, dtype=np.float32)[:, None, None]
+    image = np.repeat(ramp, width, axis=1).repeat(3, axis=2)
+    image += rng.normal(0.0, 1.2, size=image.shape).astype(np.float32)
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # VIEW MEMORY
 # ---------------------------------------------------------------------------
@@ -226,6 +241,103 @@ def test_touching_regions_are_merged_rather_than_split() -> None:
     image = with_blob(image, y0=40, y1=60, x0=20, x1=60)
     image = with_blob(image, y0=60, y1=80, x0=60, x1=100)
     assert len(find_candidates(image, grid=8)) == 1
+
+
+def test_a_frame_covering_region_is_not_a_candidate() -> None:
+    """The whole frame is not a region, and cannot be treated as one.
+
+    On the first live run every cell of an empty sky cleared the salience
+    threshold, so the map's single group spanned the entire frame. That group
+    was accepted as a target, and a target the size of the frame cannot be
+    tracked: it leaves the matcher no position to search, so it "matches" itself
+    perfectly wherever it is assumed to be, and the distance to it can never
+    change. Declining the region is the only honest answer.
+    """
+    sky = gradient_sky()
+    assert find_candidates(sky, grid=8) == [], "a sky-only frame has no region in it"
+
+
+def test_a_frame_covering_region_is_refused_when_named_directly() -> None:
+    """The same refusal must hold for the explicit "use these cells" entry point."""
+    from autocraft.wake.salience import candidate_from_cells
+
+    sky = gradient_sky()
+    every_cell = tuple(range(64))
+    assert candidate_from_cells(sky, every_cell, grid=8) is None
+
+
+def test_a_region_larger_than_the_frame_is_still_refused() -> None:
+    """The rule is about covering the frame, not about an exact match on its size."""
+    from autocraft.wake.salience import _spans_frame
+
+    assert _spans_frame((0, 0, 160, 120), 160, 120) is True
+    assert _spans_frame((-4, -4, 200, 200), 160, 120) is True
+    # A band spanning the full width is a real feature and must survive.
+    assert _spans_frame((0, 40, 160, 80), 160, 120) is False
+    assert _spans_frame((10, 10, 150, 110), 160, 120) is False
+
+
+def test_a_frame_sized_patch_cannot_be_located() -> None:
+    """A template always matches itself perfectly, so a lone position is no location.
+
+    With a frame-sized patch, every pass - the block-averaged one and the
+    full-resolution one - is offered exactly one legal position, and reports it
+    back at a confidence of 1.0. That is the identity, not a measurement of where
+    the target went. ``locate`` used to return the patch's own centre here, which
+    is what made the centring loop a fixed point: the target never moved, the
+    distance never changed, and the same correction was re-issued until the
+    budget ran out.
+    """
+    from autocraft.wake.salience import refine
+
+    sky = gradient_sky()
+    frame = frame_of(sky)
+    patch = TargetPatch(image=sky, origin=(0, 0), centre=(80.0, 60.0))
+
+    assert refine(frame, patch) is None
+    assert refine(frame, patch, scale=4) is None
+    assert locate(frame, patch) is None
+    assert locate(frame, patch, window=16) is None
+
+
+def test_a_bounded_region_is_still_located() -> None:
+    """Refusing the frame-sized region must not refuse real regions.
+
+    The rule is geometry, not a size cap: a region that covers the frame has one
+    legal position, and a region that does not has many.
+    """
+    image = with_blob(scene(), y0=25, y1=95, x0=25, x1=135)
+    frame = frame_of(image)
+    candidate = find_candidates(frame, grid=8)[0]
+    assert 0 < candidate.bbox[0] and candidate.bbox[2] < image.shape[1], "the region must be bounded"
+    patch = TargetPatch.of(frame, candidate.bbox, centre=candidate.centre)
+
+    shifted = frame_of(panned(image, 6, 4))
+    found = locate(shifted, patch, predicted=candidate.centre)
+    assert found is not None
+    assert found.centre[0] == pytest.approx(candidate.centre[0] + 6, abs=2.0)
+    assert found.centre[1] == pytest.approx(candidate.centre[1] + 4, abs=2.0)
+
+
+def test_a_sky_only_scene_selects_no_target_at_all() -> None:
+    """The operator-visible face of the defect: it must not chase the sky.
+
+    The first live run printed "Target moved closer to centre." fourteen times
+    while the measured distance stayed at 216.4 px, and drifted the camera down
+    because every "right" correction was equally downward. None of that should
+    happen on a scene with nothing in it: the run should scan, find nothing, and
+    say so.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    sky = gradient_sky(height=240, width=320)
+    _run_policy(policy, [sky])
+
+    assert policy.state is WakeState.FAILED
+    kinds = [event.kind for event in policy.drain_events()]
+    assert kinds.count(WakeEventKind.TARGET_SELECTED) == 0
+    assert kinds.count(WakeEventKind.CENTERING_PROGRESS) == 0
+    assert policy.scan_moves <= policy.max_scan_moves
+    assert "nothing visually salient" in (policy.stop_reason or "")
 
 
 def test_salience_map_renders_as_rows_of_text() -> None:

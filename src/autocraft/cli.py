@@ -64,7 +64,7 @@ from .observer import (
 )
 from .observer.snapshot import AgentMode, EventKind, WakeReport
 from .perception import PerceptionReport, PerceptionSession, StabilityModel
-from .telemetry.recorder import RunRecorder
+from .telemetry.recorder import RunRecord, RunRecorder
 from .thoughts.model import ThoughtEvent, ThoughtTone, ThoughtTrigger
 from .vision.capture import CaptureError, MssCaptureBackend, ScreenCapturer
 from .vision.window import (
@@ -1693,6 +1693,119 @@ def _wake_plan(config: Config) -> list[tuple[str, Any]]:
     ]
 
 
+def _wake_plan_payload(config: Config) -> list[dict[str, str]]:
+    """The plan in the shape the run telemetry stores it.
+
+    ``_wake_plan`` yields ``(label, text)`` pairs, which is what the printed
+    table wants. The record wants one object per step: a list of single-key
+    objects is unreadable, and a list of bare pairs loses the labels.
+
+    This is a separate function rather than a comprehension at the call site
+    because the two shapes are easy to confuse, and confusing them fails in a
+    way that names neither. ``dict(row)`` on a ``(label, text)`` pair does not
+    build ``{label: text}`` - it treats the pair as a sequence of key/value
+    pairs and tries to unpack the label itself. That is how a nine-character
+    label produced ``dictionary update sequence element #0 has length 9; 2 is
+    required`` during the first live wake-test run, after the behaviour had
+    already finished and stopped.
+    """
+    return [{"step": str(label), "detail": str(text)} for label, text in _wake_plan(config)]
+
+
+def _note_reporting_failure(what: str, exc: BaseException) -> None:
+    """Say that reporting failed without letting it stop anything else.
+
+    Reporting is not the run. A finished measurement must still be handed to
+    the operator, the input must still be released, and the observer must still
+    be stopped - so a failure here is printed and stepped over.
+    """
+    print(f"warning: {what} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _finish_wake_run_recorder(
+    recorder: RunRecorder, result: WakeResult, guard: Any
+) -> RunRecord | None:
+    """Sweep the last safety events and close out the run telemetry.
+
+    Both calls are best-effort. The agent loop writes ``run.json`` and closes
+    the recorder from its own ``finally`` block, so by the time the behaviour
+    ends this is the idempotent second call that hands back the same record -
+    and the safety sweep has normally already happened too. Neither may be the
+    reason a finished run loses its cleanup or its summary.
+    """
+    run_record: RunRecord | None = None
+    try:
+        recorder.record_safety_events(guard.events)
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break the run
+        _note_reporting_failure("the final safety sweep", exc)
+    try:
+        run_record = recorder.finish(
+            status="wake-test",
+            stop_reason=result.stop_reason or "wake-test finished",
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break the run
+        _note_reporting_failure("the run telemetry summary", exc)
+    return run_record
+
+
+def _present_wake_outcome(
+    result: WakeResult,
+    *,
+    run_record: RunRecord | None,
+    wake_state: Any,
+    publisher: Any,
+    observer_server: Any,
+    policy: WakeDecisionPolicy,
+    window: tuple[int, int],
+    released: bool,
+    interrupted: bool,
+) -> None:
+    """Publish, stop, and print - each attempted on its own.
+
+    Every piece here is presentation or cleanup, and none of them is allowed to
+    skip the others. On the first live wake-test run a single presentational
+    exception inside the finalisation block skipped the observer shutdown and
+    the whole printed summary, so the operator saw a traceback instead of the
+    numbers the run had already measured and saved.
+    """
+    if wake_state is not None:
+        try:
+            wake_state.publish_wake(
+                available=True,
+                status=result.status,
+                state=result.state,
+                run_id=run_record.run_id if run_record is not None else "",
+                window_width=window[0],
+                window_height=window[1],
+                stop_reason=result.stop_reason,
+                **_wake_panel_fields(policy.report()),
+            )
+        except Exception as exc:  # noqa: BLE001 - display must never break the run
+            _note_reporting_failure("the live panel update", exc)
+    if publisher is not None:
+        try:
+            if run_record is not None:
+                publisher.finish(run_record)
+        except Exception as exc:  # noqa: BLE001 - display must never break the run
+            _note_reporting_failure("the observer publisher", exc)
+    if observer_server is not None:
+        try:
+            observer_server.stop()
+        except Exception as exc:  # noqa: BLE001 - cleanup must never break the run
+            _note_reporting_failure("stopping the observer server", exc)
+    try:
+        _print_wake_summary(
+            result,
+            released=released,
+            telemetry=run_record.directory if run_record is not None else "",
+        )
+    except Exception as exc:  # noqa: BLE001 - the summary is reporting, not the run
+        _note_reporting_failure("the summary", exc)
+    if interrupted:
+        print()
+        print("Nothing else will be sent. AutoCraft is idle.")
+
+
 def cmd_wake_test(args: argparse.Namespace) -> int:
     """WAKE-001: wake up, look around, turn toward something that stands out.
 
@@ -1783,6 +1896,21 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
         keyboard = Keyboard(guard, guard.backend, config)
         executor = ActionExecutor(keyboard, mouse)
         recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+        # Record what this command intends *before* anything moves. The agent
+        # loop writes run.json and closes the recorder when the behaviour ends,
+        # so a step appended afterwards is rejected - and a rejected append must
+        # never be what stops the run from being finalized. Writing it here is
+        # also the honest order: this row describes the plan, not the outcome.
+        # The outcome is the steps the loop appends below it, plus the
+        # measurement in wake_result.json. Index -1 keeps this row ahead of the
+        # loop's step 0 instead of colliding with it.
+        recorder.record_step(
+            {
+                "index": -1,
+                "observation": {"window": status.to_dict()},
+                "action": {"kind": "wake-test", "plan": _wake_plan_payload(config)},
+            }
+        )
 
         state = ObserverState(config)
         observer_server = None
@@ -1898,6 +2026,13 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
             print("\ninterrupted by Ctrl+C; releasing everything")
             exit_code = 130
         finally:
+            # Order matters, and it is the whole point of this block. Releasing
+            # input is safety, not reporting, so it goes first and unguarded.
+            # The measurement (wake_result.json) is finalized next, before any
+            # reporting is attempted. Reporting then happens through helpers
+            # that attempt each piece separately, so one presentational failure
+            # can no longer skip the observer shutdown or the printed summary -
+            # which is exactly what happened on the first live run.
             released = guard.release_all("wake-test end")
             guard.shutdown("wake-test finished")
             if result is None:
@@ -1906,42 +2041,18 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
                     stop_reason="stopped before the behaviour began",
                     state=policy.state.value,
                 )
-            recorder.record_step(
-                {
-                    "index": 0,
-                    "observation": {"window": status.to_dict()},
-                    "action": {"kind": "wake-test", "plan": [dict(row) for row in _wake_plan(config)]},
-                    "result": result.to_dict(),
-                }
+            run_record = _finish_wake_run_recorder(recorder, result, guard)
+            _present_wake_outcome(
+                result,
+                run_record=run_record,
+                wake_state=wake_state,
+                publisher=publisher,
+                observer_server=observer_server,
+                policy=policy,
+                window=(window_width, window_height),
+                released=released,
+                interrupted=interrupted,
             )
-            recorder.record_safety_events(guard.events)
-            run_record = recorder.finish(
-                status="wake-test",
-                stop_reason=result.stop_reason or "wake-test finished",
-            )
-            if wake_state is not None:
-                try:
-                    wake_state.publish_wake(
-                        available=True,
-                        status=result.status,
-                        state=result.state,
-                        run_id=run_record.run_id,
-                        window_width=window_width,
-                        window_height=window_height,
-                        stop_reason=result.stop_reason,
-                        **_wake_panel_fields(policy.report()),
-                    )
-                except Exception:  # noqa: BLE001 - display must never break the run
-                    pass
-            if publisher is not None:
-                publisher.finish(run_record)
-            if observer_server is not None:
-                observer_server.stop()
-
-            _print_wake_summary(result, released=released, telemetry=run_record.directory)
-            if interrupted:
-                print()
-                print("Nothing else will be sent. AutoCraft is idle.")
         return exit_code
     finally:
         runtime.close()
