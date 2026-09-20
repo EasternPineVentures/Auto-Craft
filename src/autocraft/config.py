@@ -114,8 +114,15 @@ DEFAULT_LOOK_MAX_STEPS: int = 10
 DEFAULT_LOOK_LARGE_WINDOW_PIXELS: int = 1280 * 720
 
 #: The calibration series: injected deltas, in mouse counts, each tried in both
-#: directions. Small on purpose - calibration is a bounded probe, not a sweep.
-DEFAULT_LOOK_CALIBRATION_DELTAS: tuple[int, ...] = (2, 5, 10, 20)
+#: directions. Bounded on purpose - calibration is a probe, not a sweep.
+#:
+#: A series has to bracket the answer, so this one ascends to
+#: :data:`DEFAULT_MAX_MOUSE_DELTA`, the largest delta the actuator will accept in
+#: one command. It used to stop at 20. The first live trial then showed that a
+#: delta of 10 in a 3222x1928 window moved the picture by less than the method
+#: can resolve, so a series topping out at 20 would spend every trial below the
+#: resolution of the instrument and report near-zero estimates for all of them.
+DEFAULT_LOOK_CALIBRATION_DELTAS: tuple[int, ...] = (5, 10, 25, 50, 100, 200)
 
 
 class ConfigError(ValueError):

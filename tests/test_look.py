@@ -1034,6 +1034,16 @@ class TestTrialSpec:
         assert len(deltas) <= config.look_max_steps, "the series must fit inside the step bound"
         assert all(delta > 0 for delta in deltas)
         assert list(deltas) == sorted(deltas), "the series must ascend"
+        # The series is refused outright if any entry is above the per-axis
+        # bound, so the shipped default has to respect it. The top of the series
+        # is the largest delta the actuator will accept in one command: a series
+        # that cannot reach the bound cannot bracket the answer.
+        assert max(deltas) <= config.max_mouse_delta, (
+            "the default series would be refused by its own per-axis bound"
+        )
+        assert max(deltas) == config.max_mouse_delta, (
+            "the series should reach the largest delta one command can carry"
+        )
 
 
 # ---------------------------------------------------------------------------

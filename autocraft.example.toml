@@ -81,5 +81,7 @@ max_steps = 10
 # recommended 1280x720. It warns; it never resizes your game window.
 large_window_pixels = 921600
 # Injected mouse deltas, in counts, tried in both directions by
-# --calibrate-horizontal and --calibrate-vertical.
-calibration_deltas = [2, 5, 10, 20]
+# --calibrate-horizontal and --calibrate-vertical. The series has to bracket the
+# answer, and no entry may exceed max_mouse_delta, or the whole series is
+# refused before anything is sent.
+calibration_deltas = [5, 10, 25, 50, 100, 200]

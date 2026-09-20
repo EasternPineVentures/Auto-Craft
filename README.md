@@ -354,7 +354,7 @@ picture move, and does moving back put it back?** That is a measurement, not a
 capability — it is the number TREE-001 would need before anything can be aimed.
 
 ```powershell
-python -m autocraft look-test --dx 10 --dy 0 --steps 1 --yes
+python -m autocraft look-test --dx 200 --dy 0 --steps 1 --yes
 ```
 
 One trial is a fixed nine-step sequence, and nothing about it is adaptive:
@@ -392,6 +392,43 @@ The quality number that comes back from phase correlation is deliberately **not*
 normalised to `0..1`. It is a relative response: read it as an ordering (this
 match is stronger than that one), never as a score with a meaning of its own.
 
+#### The first live trial
+
+`look-test` has now been run once against Luanti 5.17.0, recorded as run
+`20260920T034854Z-e339cbaa`: one trial at `(+10, +0)` in a 3222x1928 client
+area. That is the `--dx 10` example this section used to document, and the run is
+the reason the example is now `--dx 200`.
+
+The mechanism worked end to end. Two movements were sent, three frames were
+captured, the record was written, and `released inputs: none`. Reversibility was
+excellent: A→C differs by 0.033 luma levels against 4.655 for A→B, and
+`difference_ac.png` is 15 KB against 1.4 MB for `difference_ab.png`.
+
+**The mapping was not measured.** The 4.655-luma A→B difference is not a camera
+pan. It is 0.910% of pixels, in two compact clusters at the top-right corner and
+the left edge, whose 1D profiles disagree about the shift and whose brightness
+gain is about 1.0 — an overlay flickering, not the scene moving. Measuring the
+textured content directly is decisive: the bottom band (rows 1440–1928, patch
+standard deviation 19–53) spans the frame, and phase correlation across it
+returns `dx 0.00, dy 0.00` at quality 0.93–0.998 for every patch — left, centre
+and right alike, and 0.60 at the extreme right edge still gave `dx 0.04`. A
+translation would show a constant non-zero shift; a camera yaw would show a shift
+that varies with `x`. Neither is present. Relative to each other, the frames did
+not move.
+
+So 10 counts moved the picture by less than this method can resolve — under about
+0.02 px on this content. That is a statement about the size of the injected
+delta, not about the instrument: the same run measured its own control, A against
+C, at zero shift with quality up to 1.000.
+
+The consequence is the opposite of "the mapping is tiny". A 10-count delta moving
+the picture by less than 0.02 px implies a sensitivity well below anything a game
+ships, which makes it more likely that the camera look was never engaged — Luanti
+applies mouse motion to the camera only while the pointer is captured. A large
+delta settles which it is, which is why the calibration series now ascends to
+`max_mouse_delta`. If a 200-count delta also moves the picture by nothing
+measurable, the cause is engagement, not sensitivity.
+
 #### Calibration
 
 The mapping is not assumed to be linear, so `look-test` will run a bounded
@@ -402,10 +439,17 @@ python -m autocraft look-test --calibrate-horizontal --yes
 python -m autocraft look-test --calibrate-vertical --yes
 ```
 
-The series is config `look_calibration_deltas` (`[2, 5, 10, 20]` by default),
-one trial per delta, and it is capped by config `look_max_steps` (10 by
+The series is config `look_calibration_deltas` (`[5, 10, 25, 50, 100, 200]` by
+default), one trial per delta, and it is capped by config `look_max_steps` (10 by
 default). A series longer than that bound is refused outright, so editing the
 config cannot produce an unbounded run.
+
+A series has to bracket the answer, so the default one ascends to
+`max_mouse_delta` — the largest delta the actuator will accept in a single
+command. Every entry also goes through that same per-axis bound, and the whole
+series is refused if any entry exceeds it. The actuator would reject an oversized
+delta anyway, but only after a frame had already been captured, which would leave
+a row of failed trials and nothing to say why.
 
 #### Bounds and refusals
 
@@ -416,6 +460,7 @@ Every plan is finite; there is no unbounded mode. These are all usage errors
 |---|---|
 | `--dx 0 --dy 0` | Nothing moved means nothing could be measured. That is not a measurement of zero. |
 | `--dx`/`--dy` above `max_mouse_delta` | Refused, not clamped — the same rule as `input-test`. |
+| A calibration series with an entry above `max_mouse_delta` | Refused up front, rather than failing one trial at a time mid-run. |
 | `--steps 0` or above `look_max_steps` | The trial count is capped by config. |
 | `--settle` negative, `nan`, `inf`, or above 10s | A settle is a bounded wait, not a delay you can make arbitrary. |
 | `--focus-delay` negative, `nan` or `inf` | Rejected before anything else happens. |
@@ -698,7 +743,7 @@ covered:
   count, a non-positive or unbounded settle, and a calibration series longer
   than `look_max_steps` are each refused with the configured bound named
 
-The suite is 643 tests and runs in about 21 seconds. Everything that talks to
+The suite is 644 tests and runs in about 21 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -773,16 +818,19 @@ why the default countdown is now 10 seconds and `--focus-delay` exists.
 wiring, nothing more. Still unverified: sustained autonomous movement, repeated
 closed-loop control, camera calibration, the relationship between `dx`/`dy` and
 how far the view actually rotates, perception, navigation, model-backed
-decisions, and long-running autonomous play. A `mouse-move` of `(10, 0)` turned
-the camera *some* amount; it says nothing about the pixels-per-count ratio.
+decisions, and long-running autonomous play. A `mouse-move` of `(10, 0)` was
+accepted by the game, but the LOOK-001 trial measured no picture movement from it,
+so even that much is now in doubt.
 
-**The LOOK-001 trial has not been run against the live game.** The tool for it
-exists — `look-test`, documented above — and the machinery behind it is covered
-by the suite, but every one of those tests uses synthetic frames and a fake
-mouse. So at this commit there is **no live measurement**: no pixels-per-delta
-ratio, no reversibility figure, and no evidence about how repeatable either is.
-Those numbers are what the next manual run produces, and until it happens they
-should be treated as unknown rather than as approximately known.
+**The LOOK-001 trial has been run once, and it did not measure the mapping.** The
+tool exists — `look-test`, documented above — and one live trial at `(+10, +0)` is
+now on record. It established that the mechanism works (two movements sent, three
+frames captured, nothing left held) and that reversibility is excellent (0.007).
+It did **not** establish a pixels-per-delta ratio: the picture did not move by a
+measurable amount at 10 counts, so the ratio that run reported came from an
+estimate indistinguishable from zero. There is still no live mapping number, no
+evidence about repeatability, and no answer to whether the camera look was engaged
+at all. See [The first live trial](#the-first-live-trial).
 
 **A measured ratio is a ratio for one configuration.** Even once the trial has
 run, a pixels-per-delta figure is specific to that window size, that field of
@@ -802,15 +850,29 @@ how much of a frame is stable while the camera moves.
 
 The bounded version of that is implemented: `look-test` injects a known relative
 mouse movement, captures A/B/C, and reports the measured displacement and its
-reversibility, with a calibration series for the mapping ratio. What it has not
-done is run against the live game. That is the next step, and it is a manual
-one:
+reversibility, with a calibration series for the mapping ratio. It has now been
+run against the live game once, at `(+10, +0)`, and that run did not measure the
+mapping — 10 counts moved the picture by less than the method can resolve. So the
+next step is the same measurement with a delta large enough to produce one:
 
 ```powershell
-python -m autocraft look-test --dx 10 --dy 0 --steps 1
+python -m autocraft look-test --calibrate-horizontal --yes
 ```
 
-(If that reports `invalid choice: 'look-test'`, you are running from a different
+The series ascends to `max_mouse_delta` (200), so it brackets the answer instead
+of starting below the resolution of the instrument. A single large delta is the
+cheaper first probe:
+
+```powershell
+python -m autocraft look-test --dx 200 --dy 0 --steps 1 --yes
+```
+
+Click inside the game window during the countdown before either of these. If a
+200-count delta still moves the picture by nothing measurable, the cause is that
+the camera look is not engaged rather than that sensitivity is low, and that is a
+different problem to solve.
+
+(If either reports `invalid choice: 'look-test'`, you are running from a different
 worktree than the branch — see
 [Working from a git worktree](#working-from-a-git-worktree).)
 

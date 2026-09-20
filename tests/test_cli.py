@@ -908,10 +908,10 @@ class TestLookTestCalibration:
         assert _run_look_test("--calibrate-horizontal") == 3
 
         output = capsys.readouterr().out
-        assert "horizontal calibration series at x deltas [2, 5, 10, 20]" in output
-        assert "4 (bounded; there is no unbounded mode)" in output
-        # Four trials, each moving out and back.
-        assert "8 movement(s) planned" in output
+        assert "horizontal calibration series at x deltas [5, 10, 25, 50, 100, 200]" in output
+        assert "6 (bounded; there is no unbounded mode)" in output
+        # Six trials, each moving out and back.
+        assert "12 movement(s) planned" in output
 
     def test_the_vertical_series_runs_on_the_other_axis(
         self, fake_cli_env, no_real_input, capsys
@@ -919,7 +919,7 @@ class TestLookTestCalibration:
         assert _run_look_test("--calibrate-vertical") == 3
 
         output = capsys.readouterr().out
-        assert "vertical calibration series at y deltas [2, 5, 10, 20]" in output
+        assert "vertical calibration series at y deltas [5, 10, 25, 50, 100, 200]" in output
         assert "  calibration : yes" in output
 
     def test_the_rerun_hint_keeps_the_calibration_flag(
@@ -952,6 +952,25 @@ class TestLookTestCalibration:
 
         stderr = capsys.readouterr().err
         assert "11 entries, above the look_max_steps bound of 10" in stderr
+
+    def test_a_series_above_the_per_axis_bound_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The series goes through the same per-axis bound as a single --dx. The
+        # actuator refuses an oversized delta anyway, but only mid-trial, after a
+        # frame has been captured - so the series is refused here instead, while
+        # nothing has been sent and no injection machinery exists.
+        config = Config(
+            data_dir=tmp_path / "data",
+            look_calibration_deltas=(5, 10, 500),
+        )
+        monkeypatch.setattr(cli, "_load", lambda args: (config, "test"))
+
+        assert _run_look_test("--calibrate-horizontal") == 2
+
+        stderr = capsys.readouterr().err
+        assert "look_calibration_deltas contains 500, above max_mouse_delta=200" in stderr
+        assert "rather than clamping it" in stderr
 
 
 class TestLookTestFocusOrdering:

@@ -855,12 +855,25 @@ def _look_plan(args: argparse.Namespace, config: Config) -> tuple[tuple[TrialSpe
             f"look_max_steps={config.look_max_steps}"
         )
 
+    limit = int(config.max_mouse_delta)
+
     if args.calibrate_horizontal or args.calibrate_vertical:
         deltas = tuple(int(value) for value in config.look_calibration_deltas)
         if len(deltas) > config.look_max_steps:
             raise ValueError(
                 f"look_calibration_deltas has {len(deltas)} entries, above the "
                 f"look_max_steps bound of {config.look_max_steps}"
+            )
+        # The series goes through the same per-axis bound as a single delta. The
+        # actuator refuses an oversized one anyway, but that refusal lands
+        # mid-trial, after a frame has already been captured, and it would turn
+        # the series into a row of failures with nothing to say why.
+        oversized = [delta for delta in deltas if delta > limit]
+        if oversized:
+            raise ValueError(
+                f"look_calibration_deltas contains {max(oversized)}, above "
+                f"max_mouse_delta={limit} per axis; AutoCraft refuses an "
+                "oversized movement rather than clamping it"
             )
         if args.calibrate_horizontal:
             specs = tuple(
@@ -874,7 +887,6 @@ def _look_plan(args: argparse.Namespace, config: Config) -> tuple[tuple[TrialSpe
         )
         return specs, f"vertical calibration series at y deltas {list(deltas)}"
 
-    limit = int(config.max_mouse_delta)
     if abs(int(args.dx)) > limit or abs(int(args.dy)) > limit:
         raise ValueError(
             f"delta ({args.dx}, {args.dy}) exceeds max_mouse_delta={limit} per axis; "
