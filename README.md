@@ -292,6 +292,20 @@ Leaving off `--yes` is a safe dry run: it prints the action, prints the exact
 command to repeat it for real, and exits with code `3` without ever
 constructing any injection machinery.
 
+### The mouse smoke test
+
+The other actuator class has its own variant, which turns the camera rather than
+moving the character:
+
+```powershell
+python -m autocraft input-test --action mouse-move --dx 10 --dy 0 --yes
+```
+
+Same ordering and the same rules. `dx`/`dy` are **relative** counts, not screen
+coordinates, so display scaling and DPI awareness cannot distort them. Deltas
+above `max_mouse_delta` (200 by default) are refused rather than clamped, so a
+typo fails loudly instead of yanking the view around.
+
 ---
 
 ## The observer page
@@ -543,12 +557,19 @@ noticed between steps, so a step that blocks inside the capture or input backend
 delays the response. A guaranteed asynchronous kill switch needs extra OS work
 (a low-level keyboard hook, or a watchdog process) and is not implemented.
 
-**Input injection is verified on one machine, by one bounded action.** The test
-suite still never sends real input — the `SendInput` path is covered by unit
-tests against a fake backend — so the live evidence is a manual smoke test, not
-an automated one. That smoke test has now passed: `input-test` moved a character
-in Luanti 5.17.0, reporting `executed: true` and `duration: 0.051s` for
-`--hold 0.05`, with `released inputs: none` and exit code `0`.
+**Both actuator classes are verified against the live game.** The test suite
+still never sends real input — the `SendInput` path is covered by unit tests
+against a fake backend — so the live evidence is a manual smoke test, not an
+automated one. Two such smoke tests have passed against Luanti 5.17.0:
+
+| Command | Reported | In-game effect |
+|---|---|---|
+| `input-test --action key-tap --key w --hold 0.05 --yes` | `executed: true`, `duration: 0.051s`, `released inputs: none`, exit `0` | character moved |
+| `input-test --action mouse-move --dx 10 --dy 0 --yes` | `executed: true`, `duration: 0.001s`, `released inputs: none`, exit `0` | camera turned |
+
+So window discovery, the foreground lock, the focus handoff, and real
+`SendInput` for *both* keyboard and relative mouse reach the actual game.
+Cleanup left no tracked held input in either run.
 
 The read-only half of the boundary was exercised first, against the same live
 window: window discovery, client-area geometry, `capture`, and the foreground
@@ -557,9 +578,13 @@ refused at the post-countdown focus check because the launching shell still held
 focus when the handoff elapsed. The refusal worked exactly as intended, which is
 why the default countdown is now 10 seconds and `--focus-delay` exists.
 
-What is *not* verified: only the keyboard path has been sent to the game, not
-the mouse path; and no sustained or repeated input has been exercised, because
-`input-test` sends exactly one bounded action by design.
+**What two bounded smoke tests do not establish.** They prove the actuator
+wiring, nothing more. Still unverified: sustained autonomous movement, repeated
+closed-loop control, camera calibration, the relationship between `dx`/`dy` and
+how far the view actually rotates, perception, navigation, model-backed
+decisions, and long-running autonomous play. A `mouse-move` of `(10, 0)` turned
+the camera *some* amount; it says nothing about the pixels-per-count ratio,
+which would need a calibration pass that does not exist in V0.
 
 ---
 
