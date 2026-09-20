@@ -227,7 +227,14 @@ branch may not have the command you are typing. The symptom is a confusing
 `invalid choice: 'look-test' (choose from status, capture, ...)` for a command
 that plainly exists on your branch.
 
-Two ways to keep this straight:
+The quickest way to see which checkout you are actually running:
+
+```powershell
+python -c "import autocraft; print(autocraft.__file__)"
+```
+
+If that names a different worktree than the one you are standing in, that is
+your answer. Two ways to keep it straight:
 
 ```powershell
 # Point this shell at the checkout you actually mean, for this session:
@@ -236,6 +243,11 @@ $env:PYTHONPATH = "C:\path\to\this\worktree\src"
 # Or make one worktree the canonical install, and run from there:
 python -m pip install -e ".[dev]"
 ```
+
+Set `PYTHONPATH` as its own command, on its own line. Pasting it together with
+the `python -m autocraft` line makes PowerShell treat it as a *continuation* of
+that command — you will see a `>>` prompt, the assignment is swallowed as extra
+arguments, and the variable is never set.
 
 The test suite is unaffected either way: `pyproject.toml` sets
 `pythonpath = ["src"]`, so pytest always imports the worktree it is running in.
