@@ -596,12 +596,24 @@ work:
   50 frames in the quiet recorded set, and 41.05 → 73.44 over 40 seconds in one
   live run. Any global threshold is chasing that drift.
 
-On the recorded set, a flat `8.0` cutoff reported a mean of **0.70** changed
-cells (range 0–1) — it **misses the animated band entirely**. The learned model,
-on the same frames, reported a mean of **16.50** (range 1–21) and localized the
-band to rows 12–13, columns 3–13 of a 16x16 grid, with **zero** false positives
-across the other 87% of the grid. That comparison is the entire justification for
-this layer.
+On the recorded set, a flat `8.0` cutoff measured against the fitted centre
+reported a mean of **0.70** changed cells (range 0–1) — it **misses the animated
+band entirely**. Measured frame-to-frame instead it sees *nothing at all*: across
+all 59 consecutive pairs, **zero** cells ever differ by more than 8.0, because the
+animation cycles past in steps smaller than that. The learned model, on the same
+frames, reported a mean of **16.50** (range 1–21) and localized the band to rows
+12–13, columns 3–13 of a 16x16 grid, with **zero** false positives across the
+other 87% of the grid.
+
+It is worth being blunt about what that does and does not prove. With
+`floor_share` at 0.996, the model's answer *on this recording* is a flat `2.0`
+cutoff with extra bookkeeping — the learned spread and the regression term
+contribute almost nothing, so the same 16.50 comes out of the floor alone. What
+the recorded set proves is that a fixed cutoff chosen by hand fails: `8.0` misses
+the band, and `2.0` works, and nothing in the data says which of those two you
+are holding. What sets the bound is what the model is for; whether it sets it
+*well* is what the two live runs below are evidence about, and the answer there is
+not flattering.
 
 #### What it learns
 
