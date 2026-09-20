@@ -32,6 +32,8 @@ __all__ = [
     "DEFAULT_MAX_KEY_HOLD_SECONDS",
     "DEFAULT_MAX_MOUSE_DELTA",
     "DEFAULT_MIN_ACTION_INTERVAL",
+    "DEFAULT_OBSERVER_HOST",
+    "DEFAULT_OBSERVER_PORT",
     "DEFAULT_TARGET_TITLE_PATTERNS",
     "ENV_PREFIX",
     "SUPPORTED_IMAGE_FORMATS",
@@ -72,6 +74,18 @@ DEFAULT_MAX_CONSECUTIVE_BLOCKS: int = 5
 DEFAULT_IMAGE_FORMAT = "png"
 SUPPORTED_IMAGE_FORMATS: tuple[str, ...] = ("png", "jpg", "jpeg", "bmp")
 
+#: The observer page is a local instrument, not a service. It binds the loopback
+#: interface unless the operator explicitly opts into something wider, and it is
+#: read-only in every configuration: it can display agent state but has no code
+#: path that reaches the control layer.
+DEFAULT_OBSERVER_HOST: str = "127.0.0.1"
+DEFAULT_OBSERVER_PORT: int = 8765
+
+#: Hosts the observer will bind without an explicit ``--allow-remote``. Anything
+#: else is refused so a diagnostic page never becomes an open network listener
+#: by accident.
+LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are missing, malformed or unsafe."""
@@ -94,6 +108,24 @@ class Config:
         min_action_interval: Minimum spacing between injected input events.
         max_consecutive_blocks: Blocked actions tolerated before the loop stops.
         data_dir: Root directory for generated captures and run records.
+        observer_host: Interface the observer page binds.
+        observer_port: TCP port the observer page binds.
+        observer_frame_max_width: Display frames are downscaled to at most this
+            many pixels wide before being handed to the browser. This bounds the
+            cost of the dashboard and keeps it off the capture-critical path.
+        observer_frame_live_seconds: Frame age at or below which the game view is
+            reported as ``live``.
+        observer_frame_stale_seconds: Frame age above which the game view is
+            reported as ``stale``. Must exceed ``observer_frame_live_seconds``.
+        observer_max_events: Upper bound on retained timeline entries. The
+            observer must not grow without limit during a long run.
+        observer_poll_ms: How often the page re-reads the snapshot. Sent to the
+            browser so the page's cadence and the server's expectations cannot
+            drift apart.
+        thoughts_enabled: Whether AutoCraft expresses thoughts at all.
+        thought_min_interval_seconds: Hard cooldown between expressed thoughts.
+        thought_max_per_minute: Ceiling on thoughts in any trailing minute.
+        thought_history_max: How many recent thoughts the observer retains.
     """
 
     target_title_patterns: tuple[str, ...] = DEFAULT_TARGET_TITLE_PATTERNS
@@ -106,6 +138,17 @@ class Config:
     min_action_interval: float = DEFAULT_MIN_ACTION_INTERVAL
     max_consecutive_blocks: int = DEFAULT_MAX_CONSECUTIVE_BLOCKS
     data_dir: Path = Path("data")
+    observer_host: str = DEFAULT_OBSERVER_HOST
+    observer_port: int = DEFAULT_OBSERVER_PORT
+    observer_frame_max_width: int = 960
+    observer_frame_live_seconds: float = 1.0
+    observer_frame_stale_seconds: float = 5.0
+    observer_max_events: int = 200
+    observer_poll_ms: int = 1000
+    thoughts_enabled: bool = True
+    thought_min_interval_seconds: float = 25.0
+    thought_max_per_minute: float = 3.0
+    thought_history_max: int = 20
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_title_patterns", tuple(str(p) for p in self.target_title_patterns))
@@ -118,6 +161,17 @@ class Config:
         object.__setattr__(self, "min_action_interval", float(self.min_action_interval))
         object.__setattr__(self, "max_consecutive_blocks", int(self.max_consecutive_blocks))
         object.__setattr__(self, "require_foreground", bool(self.require_foreground))
+        object.__setattr__(self, "observer_host", str(self.observer_host).strip())
+        object.__setattr__(self, "observer_port", int(self.observer_port))
+        object.__setattr__(self, "observer_frame_max_width", int(self.observer_frame_max_width))
+        object.__setattr__(self, "observer_frame_live_seconds", float(self.observer_frame_live_seconds))
+        object.__setattr__(self, "observer_frame_stale_seconds", float(self.observer_frame_stale_seconds))
+        object.__setattr__(self, "observer_max_events", int(self.observer_max_events))
+        object.__setattr__(self, "observer_poll_ms", int(self.observer_poll_ms))
+        object.__setattr__(self, "thoughts_enabled", bool(self.thoughts_enabled))
+        object.__setattr__(self, "thought_min_interval_seconds", float(self.thought_min_interval_seconds))
+        object.__setattr__(self, "thought_max_per_minute", float(self.thought_max_per_minute))
+        object.__setattr__(self, "thought_history_max", int(self.thought_history_max))
         self._validate()
 
     # -- derived paths ----------------------------------------------------
@@ -160,6 +214,17 @@ class Config:
             "data_dir": str(self.data_dir),
             "captures_dir": str(self.captures_dir),
             "runs_dir": str(self.runs_dir),
+            "observer_host": self.observer_host,
+            "observer_port": self.observer_port,
+            "observer_frame_max_width": self.observer_frame_max_width,
+            "observer_frame_live_seconds": self.observer_frame_live_seconds,
+            "observer_frame_stale_seconds": self.observer_frame_stale_seconds,
+            "observer_max_events": self.observer_max_events,
+            "observer_poll_ms": self.observer_poll_ms,
+            "thoughts_enabled": self.thoughts_enabled,
+            "thought_min_interval_seconds": self.thought_min_interval_seconds,
+            "thought_max_per_minute": self.thought_max_per_minute,
+            "thought_history_max": self.thought_history_max,
         }
 
     # -- validation -------------------------------------------------------
@@ -192,6 +257,48 @@ class Config:
         if self.image_format not in SUPPORTED_IMAGE_FORMATS:
             supported = ", ".join(SUPPORTED_IMAGE_FORMATS)
             raise ConfigError(f"image_format must be one of {supported}, got {self.image_format!r}")
+        if not self.observer_host:
+            raise ConfigError("observer_host must not be empty")
+        if any(ch.isspace() for ch in self.observer_host):
+            raise ConfigError(f"observer_host must not contain whitespace, got {self.observer_host!r}")
+        if not 1 <= self.observer_port <= 65535:
+            raise ConfigError(f"observer_port must be between 1 and 65535, got {self.observer_port}")
+        if self.observer_frame_max_width < 64:
+            raise ConfigError(
+                f"observer_frame_max_width must be at least 64, got {self.observer_frame_max_width}"
+            )
+        if self.observer_frame_live_seconds <= 0:
+            raise ConfigError(
+                "observer_frame_live_seconds must be greater than 0, "
+                f"got {self.observer_frame_live_seconds}"
+            )
+        if self.observer_frame_stale_seconds <= self.observer_frame_live_seconds:
+            raise ConfigError(
+                "observer_frame_stale_seconds must be greater than observer_frame_live_seconds, "
+                f"got {self.observer_frame_stale_seconds} <= {self.observer_frame_live_seconds}"
+            )
+        if self.observer_max_events < 10:
+            raise ConfigError(
+                f"observer_max_events must be at least 10, got {self.observer_max_events}"
+            )
+        if self.observer_poll_ms < 200:
+            raise ConfigError(
+                f"observer_poll_ms must be at least 200, got {self.observer_poll_ms}"
+            )
+        if self.thought_min_interval_seconds < 0:
+            raise ConfigError(
+                "thought_min_interval_seconds must not be negative, "
+                f"got {self.thought_min_interval_seconds}"
+            )
+        if self.thought_max_per_minute < 0:
+            raise ConfigError(
+                "thought_max_per_minute must not be negative, "
+                f"got {self.thought_max_per_minute}"
+            )
+        if self.thought_history_max < 1:
+            raise ConfigError(
+                f"thought_history_max must be at least 1, got {self.thought_history_max}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +370,21 @@ _TOML_SECTIONS: dict[str, dict[str, tuple[str, Callable[..., Any]]]] = {
     "paths": {
         "data_dir": ("data_dir", lambda v, source: Path(str(v))),
     },
+    "observer": {
+        "host": ("observer_host", lambda v, source: str(v)),
+        "port": ("observer_port", _as_int),
+        "frame_max_width": ("observer_frame_max_width", _as_int),
+        "frame_live_seconds": ("observer_frame_live_seconds", _as_float),
+        "frame_stale_seconds": ("observer_frame_stale_seconds", _as_float),
+        "max_events": ("observer_max_events", _as_int),
+        "poll_ms": ("observer_poll_ms", _as_int),
+    },
+    "thoughts": {
+        "enabled": ("thoughts_enabled", _as_bool),
+        "min_interval_seconds": ("thought_min_interval_seconds", _as_float),
+        "max_per_minute": ("thought_max_per_minute", _as_float),
+        "history_max": ("thought_history_max", _as_int),
+    },
 }
 
 _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
@@ -276,6 +398,17 @@ _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
     "MIN_ACTION_INTERVAL": ("min_action_interval", _as_float),
     "MAX_CONSECUTIVE_BLOCKS": ("max_consecutive_blocks", _as_int),
     "DATA_DIR": ("data_dir", lambda v, source: Path(str(v))),
+    "OBSERVER_HOST": ("observer_host", lambda v, source: str(v)),
+    "OBSERVER_PORT": ("observer_port", _as_int),
+    "OBSERVER_FRAME_MAX_WIDTH": ("observer_frame_max_width", _as_int),
+    "OBSERVER_FRAME_LIVE_SECONDS": ("observer_frame_live_seconds", _as_float),
+    "OBSERVER_FRAME_STALE_SECONDS": ("observer_frame_stale_seconds", _as_float),
+    "OBSERVER_MAX_EVENTS": ("observer_max_events", _as_int),
+    "OBSERVER_POLL_MS": ("observer_poll_ms", _as_int),
+    "THOUGHTS_ENABLED": ("thoughts_enabled", _as_bool),
+    "THOUGHT_MIN_INTERVAL_SECONDS": ("thought_min_interval_seconds", _as_float),
+    "THOUGHT_MAX_PER_MINUTE": ("thought_max_per_minute", _as_float),
+    "THOUGHT_HISTORY_MAX": ("thought_history_max", _as_int),
 }
 
 

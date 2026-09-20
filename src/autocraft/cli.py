@@ -30,6 +30,16 @@ from .control.keyboard import Keyboard
 from .control.keymap import known_key_names
 from .control.mouse import Mouse
 from .control.safety import SafetyGuard
+from .observer import (
+    LoopPublisher,
+    ObserverError,
+    ObserverServer,
+    ObserverState,
+    demo_state,
+    publish_safety_from,
+    resolve_bind_host,
+)
+from .observer.snapshot import AgentMode
 from .telemetry.recorder import RunRecorder
 from .vision.capture import CaptureError, MssCaptureBackend, ScreenCapturer
 from .vision.window import (
@@ -255,6 +265,134 @@ def _capture_rate_warning(effective_fps: float, target_fps: float) -> str | None
     )
 
 
+def _fan_out(callbacks: Sequence[Any]) -> Any:
+    """Combine step callbacks into one, preserving order and dropping ``None``.
+
+    No exception handling here on purpose: the observer publisher is already
+    total, so anything that does raise is a real bug and should not be hidden
+    behind a silent dashboard.
+    """
+    live = [callback for callback in callbacks if callback is not None]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+
+    def _call(payload: Any) -> None:
+        for callback in live:
+            callback(payload)
+
+    return _call
+
+
+def _start_observer(
+    config: Config,
+    *,
+    run_id: str,
+    goal: str | None = None,
+    intention: str | None = None,
+    safety: Any = None,
+    express_thoughts: bool = True,
+) -> tuple[ObserverServer | None, LoopPublisher | None]:
+    """Start the read-only observer page for a run.
+
+    Deliberately constructs nothing from :mod:`autocraft.control`: starting the
+    page must never make game control possible, so no input backend and no safety
+    guard are created here. The caller supplies whatever safety facts it already
+    has, or none.
+
+    A page that cannot bind its port is reported and skipped, and the pair
+    ``(None, None)`` is returned. The run is the important thing and the page is
+    an accessory, so a port already in use must not end an observation.
+    """
+    state = ObserverState(config)
+    try:
+        server = ObserverServer(
+            state, host=config.observer_host, port=config.observer_port
+        )
+    except (OSError, ObserverError) as exc:
+        print(
+            f"observer page unavailable: could not bind "
+            f"{config.observer_host}:{config.observer_port} ({exc})",
+            file=sys.stderr,
+        )
+        return None, None
+    publisher = LoopPublisher(
+        state,
+        goal=goal,
+        intention=intention,
+        safety=safety,
+        express_thoughts=express_thoughts,
+    )
+    publisher.begin(run_id)
+    url = server.start()
+    print(f"observer page: {url}  (read-only, loopback, Ctrl+C to stop)")
+    if state.demo:
+        print("observer page is showing DEMO data")
+    return server, publisher
+
+
+def cmd_observer(args: argparse.Namespace) -> int:
+    """Serve the local observer page. Read-only: it cannot touch the game."""
+    config, _source = _load(args)
+    host = args.host if args.host is not None else config.observer_host
+    try:
+        bind_host = resolve_bind_host(host, allow_remote=bool(args.allow_remote))
+    except ValueError as exc:
+        print(f"observer: {exc}", file=sys.stderr)
+        return 2
+    port = int(args.port if args.port is not None else config.observer_port)
+    if port <= 0 or port > 65535:
+        print(f"observer: port {port} is outside 1-65535", file=sys.stderr)
+        return 2
+
+    if args.demo:
+        state = demo_state(config)
+    else:
+        state = ObserverState(config)
+        state.begin_run("-", goal="")
+        state.publish_safety(control_available=False)
+        state.publish_mode(
+            AgentMode.IDLE,
+            note="observer only: no agent loop is running and no input is possible",
+        )
+        state.publish_event(
+            "Observer started with no agent attached. Start 'loop --observer' or "
+            "'observe --observer' to publish a live run.",
+            now=time.time(),
+        )
+
+    try:
+        server = ObserverServer(
+            state, host=bind_host, port=port, allow_remote=bool(args.allow_remote)
+        )
+    except (OSError, ObserverError) as exc:
+        print(f"observer: could not bind {bind_host}:{port} ({exc})", file=sys.stderr)
+        return 1
+    try:
+        url = server.start()
+    except OSError as exc:
+        server.stop()
+        print(f"observer: could not bind {bind_host}:{port} ({exc})", file=sys.stderr)
+        return 1
+    print(f"observer page: {url}")
+    if state.demo:
+        print("DEMO data: every value on this page is scripted, not measured.")
+    if bind_host not in {"127.0.0.1", "localhost", "::1"}:
+        print(
+            f"WARNING: bound to {bind_host}, which is not loopback. "
+            "Anyone who can reach this port can read the run state."
+        )
+    print("read-only: the page cannot inject input, and this command never starts the agent")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping observer")
+    finally:
+        server.stop()
+    return 0
+
+
 def cmd_observe(args: argparse.Namespace) -> int:
     """Observe for a bounded time. Reports rates. Never injects input."""
     config, source = _load(args)
@@ -279,10 +417,22 @@ def cmd_observe(args: argparse.Namespace) -> int:
 
     print(f"observing for {args.seconds:g}s at up to {config.capture_fps:g} fps (observation only, no input)")
     print(f"run id: {recorder.run_id}")
+    observer_server = None
+    publisher = None
+    if args.observer:
+        observer_server, publisher = _start_observer(
+            config,
+            run_id=recorder.run_id,
+            goal="Observe only: V0 sets no goal.",
+            intention="Watch the target window and report what changes.",
+            safety=lambda: {"control_available": False},
+        )
     try:
         while time.time() < deadline:
             loop_started = time.monotonic()
             observation = runtime.observer.observe(captured + failed)
+            if publisher is not None:
+                publisher.on_observation(observation)
             if observation.frame is None:
                 failed += 1
             else:
@@ -325,6 +475,8 @@ def cmd_observe(args: argparse.Namespace) -> int:
             status="observed",
             stop_reason=f"observation window of {args.seconds:g}s ended",
         )
+        if publisher is not None:
+            publisher.finish(record)
         mean_diff = sum(differences) / len(differences) if differences else 0.0
         effective_fps = captured / elapsed
         print()
@@ -358,6 +510,8 @@ def cmd_observe(args: argparse.Namespace) -> int:
         print("\ninterrupted by Ctrl+C; no input was sent")
         return 130
     finally:
+        if observer_server is not None:
+            observer_server.stop()
         runtime.close()
 
 
@@ -473,9 +627,22 @@ def cmd_loop(args: argparse.Namespace) -> int:
     config, source = _load(args)
     config.ensure_directories()
     runtime = _build_runtime(config, config_source=source)
+    observer_server = None
+    publisher = None
     try:
         guard = _build_guard(config, runtime.locator)
         recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+        if args.observer:
+            observer_server, publisher = _start_observer(
+                config,
+                run_id=recorder.run_id,
+                goal="Run the bounded V0 loop without touching the game.",
+                intention="Observe, decide with the no-op policy, and record every step.",
+                safety=lambda: publish_safety_from(guard),
+            )
+        progress = _fan_out(
+            [_progress_printer(args.quiet), None if publisher is None else publisher.on_step]
+        )
         loop = AgentLoop(
             config=config,
             observer=runtime.observer,
@@ -483,12 +650,15 @@ def cmd_loop(args: argparse.Namespace) -> int:
             policy=NoOpDecisionPolicy(),
             recorder=recorder,
             save_frames_every=args.save_frames_every,
-            progress=_progress_printer(args.quiet),
+            progress=progress,
+            on_observation=None if publisher is None else publisher.on_observation,
         )
         print(f"policy: {loop.policy_name} (V0 cannot play the game by design)")
         print(f"bounds: steps={args.steps} seconds={args.seconds}")
         print(f"run id: {recorder.run_id}")
         record = loop.run(max_steps=args.steps, max_seconds=args.seconds)
+        if publisher is not None:
+            publisher.finish(record)
         print()
         print("Run summary")
         _print_table(
@@ -506,6 +676,8 @@ def cmd_loop(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
+        if observer_server is not None:
+            observer_server.stop()
         runtime.close()
 
 
@@ -609,6 +781,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_observe.add_argument("--steps", type=int, default=None, help="stop after this many frames")
     p_observe.add_argument("--save-frames", type=int, default=0, help="save at most N frames into the run directory")
     p_observe.add_argument("--duration-report", type=int, default=0, help="print progress every N frames")
+    p_observe.add_argument(
+        "--observer",
+        action="store_true",
+        help="also serve the read-only observer page for this run (never enables input)",
+    )
     p_observe.set_defaults(func=cmd_observe)
 
     p_loop = sub.add_parser("loop", help="run the bounded agent loop (V0 policy is no-op)")
@@ -616,7 +793,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_loop.add_argument("--seconds", type=float, default=10.0, help="maximum wall-clock seconds (default: 10)")
     p_loop.add_argument("--save-frames-every", type=int, default=0, help="persist a frame every N steps (default: 0)")
     p_loop.add_argument("--quiet", action="store_true", help="do not print per-step progress")
+    p_loop.add_argument(
+        "--observer",
+        action="store_true",
+        help="also serve the read-only observer page for this run (does not add any control path)",
+    )
     p_loop.set_defaults(func=cmd_loop)
+
+    p_observer = sub.add_parser(
+        "observer",
+        help="serve the local read-only observer page (never starts the agent, never sends input)",
+    )
+    p_observer.add_argument("--demo", action="store_true", help="show clearly-labelled scripted demo data")
+    p_observer.add_argument("--host", default=None, help="bind address (default: config observer_host, loopback)")
+    p_observer.add_argument("--port", type=int, default=None, help="bind port (default: config observer_port)")
+    p_observer.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="permit a non-loopback bind; off by default because the page is unauthenticated",
+    )
+    p_observer.set_defaults(func=cmd_observer)
 
     p_input = sub.add_parser(
         "input-test",

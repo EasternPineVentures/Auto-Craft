@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>AutoCraft Observer</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">AUTOCRAFT OBSERVER</span>
+      <span class="brand-note">read-only local view</span>
+    </div>
+    <div class="topbar-right">
+      <span id="demo-badge" class="badge badge-demo" hidden>DEMO DATA</span>
+      <span id="connection" class="badge badge-muted">connecting</span>
+      <span id="run-id" class="mono muted">-</span>
+    </div>
+  </header>
+
+  <p id="demo-notice" class="demo-notice" hidden>
+    Every value on this page is synthetic demo data. It is not a recording of a
+    real run and it is not evidence that anything works.
+  </p>
+
+  <main class="grid">
+
+    <!-- game view ------------------------------------------------------ -->
+    <section class="panel panel-frame" aria-labelledby="h-frame">
+      <div class="panel-head">
+        <h2 id="h-frame">Game view</h2>
+        <div class="panel-head-right">
+          <span id="frame-freshness" class="badge badge-muted">no frame</span>
+          <span id="frame-age" class="mono muted">-</span>
+        </div>
+      </div>
+      <div class="frame-stage">
+        <img id="frame-image" alt="Latest captured Luanti client area" hidden>
+        <div id="frame-empty" class="empty-stage">
+          <p class="empty-title">No frame has been captured.</p>
+          <p class="empty-body">
+            Start a run, or launch with <code>--demo</code>, and the latest client
+            area capture appears here. The observer never captures anything itself.
+          </p>
+        </div>
+      </div>
+      <dl class="kv kv-row" id="frame-meta">
+        <div><dt>size</dt><dd class="mono" id="frame-size">-</dd></div>
+        <div><dt>source</dt><dd class="mono" id="frame-source">-</dd></div>
+        <div><dt>mean luma</dt><dd class="mono" id="frame-luma">-</dd></div>
+        <div><dt>signature</dt><dd class="mono" id="frame-signature">-</dd></div>
+      </dl>
+    </section>
+
+    <!-- safety --------------------------------------------------------- -->
+    <section class="panel panel-safety" aria-labelledby="h-safety">
+      <div class="panel-head">
+        <h2 id="h-safety">Safety status</h2>
+        <span id="safety-verdict" class="badge badge-muted">unknown</span>
+      </div>
+      <ul class="status-list" id="safety-list">
+        <li data-key="window_found"><span class="status-label">target window</span><span class="status-value" id="s-window">-</span></li>
+        <li data-key="window_foreground"><span class="status-label">focus</span><span class="status-value" id="s-focus">-</span></li>
+        <li data-key="input_enabled"><span class="status-label">input</span><span class="status-value" id="s-input">-</span></li>
+        <li data-key="emergency_stop"><span class="status-label">emergency stop</span><span class="status-value" id="s-estop">-</span></li>
+        <li data-key="held_inputs"><span class="status-label">held inputs</span><span class="status-value" id="s-held">-</span></li>
+      </ul>
+      <p class="footnote" id="safety-note">
+        The observer displays the safety layer's own verdict. It cannot bypass it.
+      </p>
+    </section>
+
+    <!-- agent state ---------------------------------------------------- -->
+    <section class="panel panel-state" aria-labelledby="h-state">
+      <div class="panel-head">
+        <h2 id="h-state">Agent state</h2>
+        <span id="mode" class="badge badge-mode">IDLE</span>
+      </div>
+      <p class="mode-note" id="mode-note"></p>
+      <dl class="kv">
+        <div><dt>current goal</dt><dd id="goal">-</dd></div>
+        <div><dt>current intention</dt><dd id="intention">-</dd></div>
+        <div><dt>last action</dt><dd class="mono" id="last-action">-</dd></div>
+        <div><dt>last result</dt><dd class="mono" id="action-result">-</dd></div>
+        <div><dt>observation</dt><dd class="mono" id="observation">-</dd></div>
+      </dl>
+      <div class="confidence">
+        <div class="confidence-head">
+          <span class="status-label">confidence</span>
+          <span class="mono" id="confidence-value">-</span>
+        </div>
+        <div class="bar bar-strong"><span id="confidence-bar" style="--v:0"></span></div>
+      </div>
+      <div class="beliefs">
+        <h3>Beliefs</h3>
+        <p class="empty-body" id="beliefs-empty">No interpreted objects yet.</p>
+        <ul class="belief-list" id="belief-list"></ul>
+      </div>
+    </section>
+
+    <!-- affect --------------------------------------------------------- -->
+    <section class="panel panel-affect" aria-labelledby="h-affect">
+      <div class="panel-head">
+        <h2 id="h-affect">Affect</h2>
+        <span class="badge badge-muted">simulated</span>
+      </div>
+      <ul class="affect-list" id="affect-list"></ul>
+      <p class="footnote">
+        Functional state that steers tone and pacing. Not a claim of experience.
+      </p>
+    </section>
+
+    <!-- thought -------------------------------------------------------- -->
+    <section class="panel panel-thought" aria-labelledby="h-thought">
+      <div class="panel-head">
+        <h2 id="h-thought">Thought</h2>
+        <div class="panel-head-right">
+          <span id="thought-tone" class="badge badge-tone">-</span>
+          <span id="thought-intensity" class="mono muted">-</span>
+        </div>
+      </div>
+      <blockquote class="thought-text" id="thought-text">
+        Nothing expressed yet. Thoughts are paced by a cooldown, so silence is normal.
+      </blockquote>
+      <p class="thought-meta mono muted" id="thought-meta"></p>
+      <ol class="thought-history" id="thought-history"></ol>
+      <p class="footnote">
+        Expression only. A thought is never a command and cannot produce input.
+      </p>
+    </section>
+
+    <!-- metrics -------------------------------------------------------- -->
+    <section class="panel panel-metrics" aria-labelledby="h-metrics">
+      <div class="panel-head">
+        <h2 id="h-metrics">Run metrics</h2>
+      </div>
+      <dl class="kv kv-grid">
+        <div><dt>run id</dt><dd class="mono" id="m-run">-</dd></div>
+        <div><dt>runtime</dt><dd class="mono" id="m-runtime">-</dd></div>
+        <div><dt>frames observed</dt><dd class="mono" id="m-frames">-</dd></div>
+        <div><dt>capture fps</dt><dd class="mono" id="m-capture-fps">-</dd></div>
+        <div><dt>loop rate</dt><dd class="mono" id="m-loop-rate">-</dd></div>
+        <div><dt>actions attempted</dt><dd class="mono" id="m-attempted">-</dd></div>
+        <div><dt>actions executed</dt><dd class="mono" id="m-executed">-</dd></div>
+        <div><dt>actions blocked</dt><dd class="mono" id="m-blocked">-</dd></div>
+        <div><dt>safety events</dt><dd class="mono" id="m-safety">-</dd></div>
+        <div><dt>errors</dt><dd class="mono" id="m-errors">-</dd></div>
+        <div><dt>thoughts expressed</dt><dd class="mono" id="m-thoughts">-</dd></div>
+        <div><dt>blocked streak</dt><dd class="mono" id="m-streak">-</dd></div>
+      </dl>
+      <p class="footnote" id="block-reason"></p>
+    </section>
+
+    <!-- events --------------------------------------------------------- -->
+    <section class="panel panel-events" aria-labelledby="h-events">
+      <div class="panel-head">
+        <h2 id="h-events">Recent events</h2>
+        <span class="mono muted" id="event-count">0</span>
+      </div>
+      <ol class="event-list" id="event-list"></ol>
+      <p class="empty-body" id="events-empty">No events yet.</p>
+    </section>
+
+    <!-- memory --------------------------------------------------------- -->
+    <section class="panel panel-memory" aria-labelledby="h-memory">
+      <div class="panel-head">
+        <h2 id="h-memory">Memory</h2>
+        <span class="badge badge-muted">short term</span>
+      </div>
+      <ol class="event-list event-list-muted" id="memory-list"></ol>
+      <p class="empty-body" id="memory-empty">Nothing retained yet.</p>
+      <p class="footnote">
+        V0 keeps a bounded timeline and no long-term store, so these entries are
+        the same events listed above. A thought only refers to a memory when the
+        text is actually present here.
+      </p>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <span id="footer-status">connecting</span>
+    <span class="muted">polling <span id="footer-poll">-</span></span>
+    <span class="muted">AutoCraft never controls the game process</span>
+  </footer>
+
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

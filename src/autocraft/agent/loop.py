@@ -81,6 +81,7 @@ class AgentLoop:
         clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
         progress: Callable[[StepRecord], None] | None = None,
+        on_observation: Callable[[Any], None] | None = None,
         change_threshold: float = 0.01,
         save_frames_every: int = 0,
     ) -> None:
@@ -95,7 +96,15 @@ class AgentLoop:
                 when omitted, so a run is always recorded.
             clock: Wall clock, injectable for tests.
             sleeper: Sleep function, injectable for tests.
-            progress: Optional callback invoked after each step.
+            progress: Optional callback invoked after each step. Receives the
+                serialised :class:`StepRecord`, which deliberately excludes the
+                pixels.
+            on_observation: Optional callback invoked with the raw
+                :class:`~autocraft.agent.observation.Observation` as soon as it is
+                taken. This exists because ``progress`` cannot carry a frame -
+                telemetry must not serialise raw video - and a display layer needs
+                the pixels. Read-only by construction: the callback is handed the
+                observation and returns nothing.
             change_threshold: Mean absolute luminance difference (0..1 scale)
                 counted as "the image changed" during VERIFY. The default of
                 ``0.01`` corresponds to about 2.5 levels out of 255, which is
@@ -112,6 +121,7 @@ class AgentLoop:
         self._clock = clock
         self._sleep = sleeper
         self._progress = progress
+        self._on_observation = on_observation
         self._change_threshold = float(change_threshold)
         self._save_frames_every = int(save_frames_every)
 
@@ -253,6 +263,9 @@ class AgentLoop:
         started_at = self._clock()
         observation = self._observer.observe(index)
         observation_payload = observation.to_dict()
+
+        if self._on_observation is not None:
+            self._on_observation(observation)
 
         if observation.frame is not None and self._save_frames_every > 0:
             if index % self._save_frames_every == 0:

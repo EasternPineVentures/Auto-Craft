@@ -105,9 +105,14 @@ near future:
 - no privileged game-state access of any kind
 - no autonomous survival play
 - no agent frameworks (LangChain or similar)
-- no vector databases, Docker, web dashboard, Electron, React, or databases
+- no vector databases, Docker, Electron, React, or databases
 - no cloud services, multiplayer, or chat integrations
 - no game mods, and no modification of the game installation
+
+The local observer page is a deliberate, narrow exception to "no web
+dashboard", and it is drawn tightly: it is read-only, it is loopback-only, it
+has no build step, no framework, and no dependency the agent does not already
+need. See [The observer page](#the-observer-page).
 
 ---
 
@@ -128,12 +133,22 @@ ACTUATORS     control/    Action -> real keyboard / mouse events
 SAFETY        control/safety.py   gates every actuator call
   |
 EVALUATOR     (future)    scores runs using privileged truth the agent never sees
+
+                    ---- published state, one direction only ----
+
+DISPLAY       observer/   ObserverSnapshot -> HTTP -> browser
+  ^
+EXPRESSION    thoughts/   ThoughtEvent (generated, never acted on)
 ```
+
+The last two boxes are deliberately **below** the arrow, not beside it.
+`observer/` and `thoughts/` read published facts; nothing in them can reach
+`control/`. That is enforced by import structure and pinned by tests.
 
 ```
 src/autocraft/
   config.py              frozen Config: window patterns, limits, directories
-  cli.py                 the seven commands
+  cli.py                 the eight commands
   vision/
     window.py            Win32 window discovery + client-area geometry
     capture.py           mss-backed client-area capture
@@ -149,8 +164,21 @@ src/autocraft/
     action.py            the human-input vocabulary + ActionExecutor
     decision.py          DecisionPolicy protocol + NoOpDecisionPolicy
     loop.py              the bounded OBSERVE..RECORD loop
+  thoughts/
+    model.py             ThoughtEvent, ThoughtContext, the tone vocabulary
+    generate.py          ThoughtGenerator protocol + template / scripted sources
+    engine.py            ThoughtPolicy: cooldown, rate ceiling, quiet periods
+  observer/
+    snapshot.py          the display contract (pure data, no I/O)
+    state.py             ObserverState: the agent's write side, the page's read side
+    server.py            GET-only HTTP surface on loopback
+    bridge.py            LoopPublisher: the one place the agent meets the page
   telemetry/
     recorder.py          RunRecorder: one directory per run
+  web/
+    index.html           the instrumentation page
+    styles.css           the dark theme
+    app.js               vanilla-JS polling client, no build step
 ```
 
 ---
@@ -208,17 +236,121 @@ Touching the game is always explicit.
 | `input-test` | **yes** | Explicit smoke test. Requires `--yes`. Sends one tiny bounded action and then releases everything. |
 | `keys` | no | Lists every supported key name. |
 | `config` | no | Prints the effective configuration and where it came from. |
+| `observer` | no | Serves the local read-only observer page. Never enables control. |
 
 ```powershell
 python -m autocraft status
 python -m autocraft capture
 python -m autocraft observe --seconds 5 --steps 60
+python -m autocraft observe --seconds 30 --steps 300 --observer
 python -m autocraft loop --steps 5 --seconds 10
+python -m autocraft observer --demo
 python -m autocraft keys
 ```
 
 The loop refuses to start unless you give it `--steps` or `--seconds`. There
 is no "run forever" option, by design.
+
+`--observer` is available on `observe` and `loop` and does exactly one thing:
+it starts the page and publishes that run's state to it. It does not change
+what the command does, and it never enables input. If the port is already
+busy, the run continues and the page is simply unavailable.
+
+---
+
+## The observer page
+
+```powershell
+python -m autocraft observer            # http://127.0.0.1:8765
+python -m autocraft observer --demo     # same page, synthetic data
+```
+
+A local, read-only page that shows what AutoCraft is doing internally: the
+latest captured frame, the current mode, goal and intention, the last action
+and its result, confidence, recent events, the current simulated affect, and
+the safety state. It exists so a run can be watched and streamed without
+reading a log.
+
+It is **loopback-only by default**. Binding to a non-loopback address requires
+an explicit `--allow-remote`, and requests carrying a non-loopback `Host`
+header are refused with `403` even then.
+
+**Read-only, structurally.** Three properties hold together, and each is
+pinned by a test:
+
+1. `observer/` does not import `control/`. The display layer has no reachable
+   path to a keyboard or mouse.
+2. Every route is `GET`. Any other verb gets `405` with `Allow: GET`. There is
+   no endpoint that accepts a command, a mode change, or an action.
+3. The safety panel is computed from *published facts* by a pure function
+   (`input_permitted`), not by querying the live guard. Asking the real guard
+   would append a refusal to the safety log every time the page refreshed,
+   which would make the log a record of the dashboard's polling rather than of
+   the agent's behaviour.
+
+**Truthful empty states.** V0 has no perception: no object detector, no tree
+recognition, no privileged state. Beliefs and detected entities are therefore
+displayed as empty, and say so. The page never invents perception to look
+busier than the agent is.
+
+**One-directional by construction.** `LoopPublisher` receives safety as a
+provider function and confidence as a callback, so the bridge never holds a
+reference to the guard and the page never holds a reference to the agent.
+`AgentLoop` gained a single `on_observation` hook; it still knows nothing about
+HTTP, JSON, or JavaScript.
+
+**Demo mode is labelled.** `--demo` fills the page with synthetic goals,
+events, affect and metrics, and every surface of the page says `DEMO`. The
+demo ticker is deterministic — it does not randomise the mood to look alive.
+
+---
+
+## Thoughts
+
+`ThoughtEvent` is an **expression layer**, not a decision layer. The flow is
+one-directional:
+
+```
+experience -> affect -> thought generated -> displayed to a viewer
+```
+
+A `ThoughtEvent` can never cause keyboard or mouse input. `thoughts/` holds no
+reference to an executor, a keyboard, a mouse, or the safety guard, and does not
+import `control/`. The flow that is *wrong* — `thought -> execute game action` —
+is not reachable from the code.
+
+Thoughts are generated, user-facing character expressions. They are **not**
+hidden chain-of-thought: the model's reasoning is never surfaced, and the
+generator is a template composer rather than a model. The `ThoughtGenerator`
+protocol (`generate(context) -> ThoughtEvent | None`) is the seam a future
+model-backed generator would plug into, and nothing else would change.
+
+Each thought carries a tone (`neutral`, `humorous`, `curious`, `hopeful`,
+`excited`, `sad`, `frustrated`, `anxious`, `dramatic`, `absurd`, `reflective`),
+an intensity, a trigger (`discovery`, `success`, `failure`, `danger`, `memory`,
+`idle`, `milestone`, `random_reflection`, `demo`), and the affect snapshot it
+was generated under.
+
+**Bounded, not chatty.** `ThoughtPolicy` enforces a minimum interval, a
+per-minute ceiling, and occasional long quiet periods. Probability rises after
+meaningful events and is damped during rapid action, so thoughts do not appear
+on a metronome or once per action. Nothing is random merely to look alive.
+
+**Affect influences, but does not dictate.** High curiosity biases toward
+speculative tones, high frustration toward irritation, low energy toward
+shorter and rarer thoughts. The mapping is a weighting, not a lookup table.
+
+**Memory is retrieved, never invented.** `ThoughtContext.remembers(needle)`
+returns a stored memory containing that needle, or `None`. A thought that says
+"earlier I…" is composed only from a memory that actually exists in the
+context. If there is nothing to recall, the generator has no clause to reach
+for. This is the honesty seam of the whole feature, and it is pinned by
+property-style tests that assert no memory text is ever fabricated.
+
+**Extreme thoughts stay non-operative.** Intensity and language can be
+dramatic; that changes nothing structural. Thoughts cannot bypass the safety
+layer, modify permissions, damage the host, initiate real-world actions, or
+reach external information.
 
 ---
 
@@ -256,9 +388,16 @@ never consumes the "too many consecutive failures" budget; it waits instead of
 refusing, so pacing cannot masquerade as a safety stop.
 
 **No autonomy by default.** `status`, `capture`, `observe`, `loop`, `keys`,
-and `config` never inject input. Only `input-test` can, and it requires an
-explicit `--yes`, states clearly what it is about to do, verifies the game
-window is foreground, sends exactly one small action, releases it, and exits.
+`config`, and `observer` never inject input. Only `input-test` can, and it
+requires an explicit `--yes`, states clearly what it is about to do, verifies
+the game window is foreground, sends exactly one small action, releases it, and
+exits.
+
+**The observer cannot reach the actuators.** The observer page and the thought
+system are downstream of the agent, not upstream of it. Starting the page
+constructs nothing from `control/`, so it cannot make game control possible,
+and no amount of traffic to it can produce an input event. `--observer` on a
+run only publishes state to the page; it does not enable anything.
 
 **AutoCraft never controls the game process.** It reads pixels and window
 geometry, and it can emit key presses and mouse events. It does not close,
@@ -291,8 +430,19 @@ covered:
 - telemetry serialisation
 - the CLI safety gate: `input-test` refuses before any input object exists
 - the capture-rate warning
+- the display contract: exact snapshot keys, strict-JSON round-trip, frame
+  downscaling and JPEG encoding
+- the HTTP surface: every `GET` route, `405` + `Allow: GET` for every other
+  verb, `403` on a foreign `Host` header, read-only invariance under traffic
+- `input_permitted` cross-checked against `SafetyGuard.authorize`, so the
+  dashboard's safety panel cannot drift from the real refusal rules
+- the thought model, the policy gates, and the engine's cooldown and ceilings
+- the non-operative guarantee: an import-structure check, an attribute scan,
+  and a real 300-step run asserting zero backend events and zero held inputs
+- the memory-honesty property: no thought may reference a memory that is not
+  in its context
 
-The suite is 273 tests and runs in about 1.5 seconds. Everything that talks to
+The suite is 485 tests and runs in about 19 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---

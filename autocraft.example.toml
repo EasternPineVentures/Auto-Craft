@@ -33,3 +33,32 @@ max_consecutive_blocks = 5
 [paths]
 # Root for generated captures and run records.
 data_dir = "data"
+
+[observer]
+# Address the read-only observer page binds to. Loopback only unless you pass
+# --allow-remote on the command line, which also disables the Host check.
+host = "127.0.0.1"
+port = 8765
+# Display frames are downscaled to this width before JPEG encoding. The page
+# refreshes an image, it does not stream video; 960 keeps a refresh cheap.
+frame_max_width = 960
+# Age at which the displayed frame stops being "live" and becomes "recent",
+# then "stale". Both are shown on the page as an explicit age in seconds.
+frame_live_seconds = 1.0
+frame_stale_seconds = 5.0
+# How many recent events the timeline keeps.
+max_events = 200
+# How often the browser polls for a new snapshot, in milliseconds.
+poll_ms = 1000
+
+[thoughts]
+# Master switch for the expression layer. Thoughts are never operative: this
+# only controls whether they are generated and displayed at all.
+enabled = true
+# Shortest gap between two thoughts, in seconds. This is the floor, not the
+# schedule -- probability still decides whether anything is said.
+min_interval_seconds = 25.0
+# Hard ceiling on how many thoughts may be expressed per minute.
+max_per_minute = 3.0
+# How many thoughts the history keeps.
+history_max = 20

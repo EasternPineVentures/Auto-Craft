@@ -26,6 +26,9 @@ data/runs/*
 # Local configuration overrides (autocraft.example.toml is the tracked template)
 autocraft.toml
 
+# Local tooling caches
+.impeccable/
+
 # --- Editors / OS --------------------------------------------------------
 .idea/
 .vscode/
