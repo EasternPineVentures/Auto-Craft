@@ -39,6 +39,7 @@ from __future__ import annotations
 from .metrics import (
     DEFAULT_BLOCK_GRID,
     DEFAULT_CHANGED_THRESHOLD,
+    DEFAULT_MIN_QUALITY,
     MAPPING_NOTE,
     FrameDifference,
     LookError,
@@ -87,6 +88,7 @@ __all__ = [
     "ARTIFACT_FRAME_C",
     "DEFAULT_BLOCK_GRID",
     "DEFAULT_CHANGED_THRESHOLD",
+    "DEFAULT_MIN_QUALITY",
     "EVENT_ERROR",
     "EVENT_INFO",
     "EVENT_OBSERVE",

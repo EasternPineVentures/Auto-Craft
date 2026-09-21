@@ -454,6 +454,19 @@ The quality number that comes back from phase correlation is deliberately **not*
 normalised to `0..1`. It is a relative response: read it as an ordering (this
 match is stronger than that one), never as a score with a meaning of its own.
 
+It is, however, used for one decision. Phase correlation fits a translation and
+only a translation, so a camera that has **turned** leaves it without a peak — and
+it still returns a near-zero vector, which reads as "the camera did not move".
+Below a response of `0.5` the shift is therefore reported as *not available* with
+the reason, and `pixels per delta` is `null` on both axes rather than a ratio
+divided by a number nobody measured. The floor is measured, not chosen: on frames
+this project captures, a real translation of a textured scene responds
+`0.93–1.00`, two unrelated frames respond `0.02`, and a 5° turn responds `0.17`.
+
+That floor answers "does one translation explain this pair". It does **not**
+answer "is there anything worth looking at" — two featureless frames agree
+perfectly on the translation `(0, 0)` and pass it.
+
 #### The first live trial
 
 `look-test` has now been run once against Luanti 5.17.0, recorded as run
@@ -487,9 +500,60 @@ The consequence is the opposite of "the mapping is tiny". A 10-count delta movin
 the picture by less than 0.02 px implies a sensitivity well below anything a game
 ships, which makes it more likely that the camera look was never engaged — Luanti
 applies mouse motion to the camera only while the pointer is captured. A large
-delta settles which it is, which is why the calibration series now ascends to
-`max_mouse_delta`. If a 200-count delta also moves the picture by nothing
-measurable, the cause is engagement, not sensitivity.
+delta settles which it is, which is why the calibration series ascends to
+`max_mouse_delta`.
+
+#### The second live trial
+
+The first trial left one question open: would a 200-count delta also move the
+picture by nothing, which would mean the camera look was never engaged? It would
+not.
+
+`input-test --action mouse-move --dx 200 --dy 0` sent the movement and reported
+`attempted: True`, `executed: True` in 0.001 s, and the camera visibly swung. That
+is the direct delivery confirmation the first trial could not supply: a difference
+that is small says nothing about *why* it is small.
+
+`look-test --dx 200 --dy 0 --steps 1` was then run as `20260921T044151Z-9c47b3d5`
+against a 2102x1061 client area. It changed the picture enormously:
+
+| measurement | trial 1 (`--dx 10`) | trial 2 (`--dx 200`) |
+|---|---|---|
+| A→B mean absolute difference | 4.655 luma levels | **31.335** |
+| A→B changed pixels | 12.98% | **57.12%** |
+| A→C mean absolute difference | 0.033 | **0.222** |
+| reversibility | 0.007 | 0.007 |
+
+Two conclusions follow, and neither depends on the shift estimate. **The actuator
+works**: 200 counts moved the picture far more than 10 counts did. And **the change
+was the mouse's**: A→C returned to within 0.222 luma levels of A, and the clouds
+drifting across that sky do not reverse.
+
+**The mapping still was not measured, and now we know why.** The same trial
+reported `estimated shift (-0.10, +0.05) px` at quality `0.196`, and a
+`pixels per delta x` of `-0.0005`. A 57% pixel change cannot be a
+`-0.0005 px per count` camera. Phase correlation fits a translation and only a
+translation; the response of `0.196` is the estimator saying it found no such
+translation, and the vector printed next to that response meant nothing. So the
+trial's own numbers contradicted each other — a large change, a fully reversible
+one, and a displacement of approximately zero — and the displacement was printed
+anyway.
+
+It is not printed any more. A response below `0.5` is reported as an unavailable
+shift with the reason, and `pixels per delta` is `null` rather than a ratio
+computed from a number the estimator had already declined to stand behind.
+
+The best-supported reading of what the camera actually did is that it **turned**.
+The picture changed by a large amount, came back exactly, and no single
+translation explains the pair — which is what a camera turning looks like, and is
+precisely the motion a translation estimator cannot fit. How many degrees a count
+turns it is not yet measured, because nothing here estimates rotation yet.
+
+Two limits on these numbers. `--dx 200` is far above LOOK-001's design point: it
+demonstrates that input reaches the camera, not what the mapping is. And the run
+was at 2102x1061 — about 2.2 million pixels, well above the ~1 million the
+experiment is designed around — so the frame is larger than it should be and the
+estimate is correspondingly less precise.
 
 #### Calibration
 
@@ -2074,7 +2138,7 @@ covered:
   than once per capture; the shipped default is non-zero; and the runner threads
   the configured value from `Config` into the loop
 
-The suite is 886 tests and runs in about 40 seconds. Everything that talks to
+The suite is 894 tests and runs in about 40 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---

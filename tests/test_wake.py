@@ -52,6 +52,7 @@ from autocraft.wake import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
+    STREAM_SUMMARY,
     CenteringController,
     MotionCalibration,
     ProgressModel,
@@ -74,6 +75,7 @@ from autocraft.wake import (
     relocate,
     select_candidate,
     status_for_state,
+    stream_summary,
 )
 
 # ---------------------------------------------------------------------------
@@ -327,7 +329,8 @@ def test_a_sky_only_scene_selects_no_target_at_all() -> None:
     while the measured distance stayed at 216.4 px, and drifted the camera down
     because every "right" correction was equally downward. None of that should
     happen on a scene with nothing in it: the run should scan, find nothing, and
-    say so.
+    say so. That line has since been corrected - see the stream-narration tests -
+    but the defect it described is what this test still guards.
     """
     policy = WakeDecisionPolicy(max_moves=45)
     sky = gradient_sky(height=240, width=320)
@@ -1030,6 +1033,40 @@ def test_relocating_an_absent_target_is_refused_by_default() -> None:
     candidate = find_candidates(image, grid=8)[0]
     elsewhere = with_blob(scene(seed=99), y0=90, y1=115, x0=10, x1=40)
     assert relocate(candidate, elsewhere, search_radius=24, grid=8) is None
+
+
+# ---------------------------------------------------------------------------
+# STREAM NARRATION
+#
+# The one-line summaries are display-only, and the rule that matters is that a
+# line may not claim an outcome the event does not carry. ``CENTERING_PROGRESS``
+# is emitted before the movement is sent, so it carries an attempt - and the line
+# used to assert the result anyway.
+# ---------------------------------------------------------------------------
+
+
+def test_every_event_kind_has_a_line() -> None:
+    missing = [kind for kind in WakeEventKind if kind not in STREAM_SUMMARY]
+    assert missing == [], f"no summary line for {missing}"
+
+
+def test_a_centring_line_does_not_claim_the_correction_worked() -> None:
+    """The line was wrong on 9 of the first run's 20 corrections.
+
+    ``_emit_move`` emits ``CENTERING_PROGRESS`` immediately before the movement
+    goes out, so the distance it moved the target is not known when the line is
+    written - and in the first live run the distance grew rather than shrank on 9
+    of 20 attempts, while the line read "Target moved closer to centre." every
+    time. A summary may describe the attempt; it may not describe the result.
+    """
+    line = stream_summary(WakeEventKind.CENTERING_PROGRESS)
+    assert "closer" not in line
+    assert "moved" not in line
+    assert "attempt" in line.lower()
+
+
+def test_a_summary_line_is_returned_for_a_kind_named_as_a_string() -> None:
+    assert stream_summary("WAKE_STARTED") == stream_summary(WakeEventKind.WAKE_STARTED)
 
 
 # ---------------------------------------------------------------------------
@@ -1959,7 +1996,7 @@ def test_a_wake_report_round_trips_through_the_observer(tmp_path: Path) -> None:
         progress=(400.0, 180.0, 40.0),
         confidence=0.8,
         strategy="centre_left_medium",
-        recent_event="Target moved closer to centre.",
+        recent_event="Attempting a centring correction.",
         mapping_source="self-measured",
         pixels_per_delta_x=0.5,
     )

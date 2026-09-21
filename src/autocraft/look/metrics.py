@@ -7,7 +7,8 @@ reversed? Answering it needs three measurements, and all three live here:
 * :func:`difference_metrics` - how far apart two frames are, per pixel, as three
   scalars plus a coarse block map for the debug overlay.
 * :func:`estimate_shift` - how far the picture appears to have moved, by phase
-  correlation on luminance, with a confidence response.
+  correlation on luminance, with a confidence response and an explicit refusal
+  when the response says nothing was locked onto.
 * :func:`reversibility_ratio` - the ratio that says whether the picture returned.
 
 Three deliberate omissions:
@@ -21,6 +22,13 @@ Three deliberate omissions:
   purpose. It reports numbers and lets the operator judge them.
 * Nothing here imports the control layer. The measurement code cannot inject
   input, and a test asserts it.
+
+A fourth rule applies to every function above, and it is the one that took a live
+run to learn: **a quantity that was not measured is reported as absent, never as
+zero.** :func:`estimate_shift` refuses to report a displacement it could not lock
+onto, so :func:`pixels_per_delta` returns ``None`` rather than dividing a
+meaningless vector, and the failure is explained in words instead of being
+rounded into a number that looks like a measurement.
 
 There is no trained model anywhere in this module, and there will not be one:
 the estimate is a closed-form phase correlation over two grayscale arrays.
@@ -37,6 +45,7 @@ import numpy as np
 __all__ = [
     "DEFAULT_BLOCK_GRID",
     "DEFAULT_CHANGED_THRESHOLD",
+    "DEFAULT_MIN_QUALITY",
     "MAPPING_NOTE",
     "FrameDifference",
     "LookError",
@@ -81,6 +90,26 @@ MAPPING_NOTE = (
 #: Below this many pixels on either axis the phase-correlation estimate is
 #: numerically meaningless, so the module says so instead of returning noise.
 MIN_ESTIMATE_EDGE = 8
+
+#: Phase-correlation response below which there is no estimate to report.
+#:
+#: Measured, not guessed. On frames this project actually captures: a genuine
+#: translation of a textured scene responds ``0.93-1.00``; two genuinely
+#: unrelated frames respond ``0.02``; and a camera that has *rotated* responds
+#: ``0.17``. The last number is the reason this floor exists. Phase correlation
+#: fits a translation and only a translation, so a rotation leaves it without a
+#: peak - and it still returns a near-zero vector, which reads as "the camera did
+#: not move" when the camera in fact moved a great deal. A live run reported
+#: exactly that: ``A to B 31.335 luma levels`` and ``57.12%`` of pixels changed,
+#: alongside an ``estimated shift`` of ``(-0.10, +0.05) px`` and a
+#: ``pixels per delta x`` of ``-0.0005``.
+#:
+#: The floor sits in the gap between "locked onto one translation" and "did not
+#: lock at all", so a non-locking pair is reported as unmeasurable instead of as a
+#: near-zero displacement. It is not a quality bar for a measurement that did
+#: lock, and it is not a pass/fail threshold on the experiment: it decides only
+#: whether a number may be printed at all.
+DEFAULT_MIN_QUALITY = 0.5
 
 
 def _image_of(frame: Any) -> np.ndarray:
@@ -235,6 +264,17 @@ class ShiftEstimate:
     can come back slightly above ``1.0``. Read it as an ordering, not a score.
     A camera with no flat texture ahead produces a low response and a
     meaningless vector.
+
+    ``available`` is False whenever there is no displacement to report, and then
+    ``x`` and ``y`` are ``0.0`` rather than a number nobody should use. There are
+    two ways that happens, and ``reason`` distinguishes them: the frames are too
+    small to align, or phase correlation did not lock onto one translation. The
+    second is the important one. Phase correlation fits a translation and only a
+    translation, so a camera that *rotated* leaves it with no peak and it returns
+    a near-zero vector. Reporting that vector as a displacement is how a live run
+    came to print ``(-0.10, +0.05) px`` next to a ``31.3`` luma frame difference
+    and a ``57%`` pixel change. A displacement that was not measured is not
+    reported as zero.
     """
 
     x: float = 0.0
@@ -262,7 +302,13 @@ class ShiftEstimate:
         }
 
 
-def estimate_shift(mine: Any, theirs: Any, *, window: bool = True) -> ShiftEstimate:
+def estimate_shift(
+    mine: Any,
+    theirs: Any,
+    *,
+    window: bool = True,
+    min_quality: float = DEFAULT_MIN_QUALITY,
+) -> ShiftEstimate:
     """Estimate how far the picture moved between two frames.
 
     Uses OpenCV's phase correlation on luminance - a closed-form frequency-domain
@@ -271,15 +317,24 @@ def estimate_shift(mine: Any, theirs: Any, *, window: bool = True) -> ShiftEstim
     game view does not; without the window the discontinuity at the border
     dominates the result.
 
+    This measures a *translation*. It cannot measure a rotation, because a
+    rotation is not a translation: the estimator has no term for one, so a
+    rotated pair leaves it without a peak. That failure is reported, not hidden -
+    see ``min_quality``.
+
     Args:
         mine: The reference frame.
         theirs: The frame to compare against it. Must have the same shape.
         window: Apply the Hann window. Only turn this off for synthetic input
             that genuinely wraps.
+        min_quality: Response below which the estimate is refused. The default is
+            :data:`DEFAULT_MIN_QUALITY`; pass ``0.0`` to accept any response, which
+            is only useful for inspecting what a non-locking pair produced.
 
     Returns:
         A :class:`ShiftEstimate`. ``available`` is False when the frames are too
-        small to align, in which case ``reason`` explains why.
+        small to align or when the response is below ``min_quality``, in which
+        case ``reason`` explains why and ``x`` and ``y`` are ``0.0``.
 
     Raises:
         LookError: If the shapes differ or OpenCV is unavailable.
@@ -307,7 +362,19 @@ def estimate_shift(mine: Any, theirs: Any, *, window: bool = True) -> ShiftEstim
             (dx, dy), quality = cv2.phaseCorrelate(first, second)
     except cv2.error as exc:  # pragma: no cover - depends on the OpenCV build
         raise LookError(f"phase correlation failed: {exc}") from exc
-    return ShiftEstimate(x=float(dx), y=float(dy), quality=float(quality), available=True)
+    response = float(quality)
+    floor = float(min_quality)
+    if response < floor:
+        return ShiftEstimate(
+            quality=response,
+            available=False,
+            reason=(
+                "phase correlation found no consistent translation: response "
+                f"{response:.3f} is below the {floor:.2f} floor"
+            ),
+        )
+    return ShiftEstimate(x=float(dx), y=float(dy), quality=response, available=True)
+
 
 
 def pixels_per_delta(

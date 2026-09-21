@@ -49,6 +49,7 @@ from autocraft.look import (
     EVENT_SAFETY,
     EXPERIMENT_NAME,
     LIMITATION_NOTES,
+    DEFAULT_MIN_QUALITY,
     TRIAL_COMPLETED,
     TRIAL_FAILED,
     TRIAL_INTERRUPTED,
@@ -119,6 +120,26 @@ def flat_frame(value: int = 40, *, width: int = 96, height: int = 96, timestamp:
     """A frame with no structure at all, for the degenerate-input tests."""
     image = np.full((height, width, 3), value, dtype=np.uint8)
     return Frame(image=image, timestamp=timestamp, region=ScreenRegion(0, 0, width, height))
+
+
+def _turned(frame: Frame, degrees: float) -> Frame:
+    """``frame`` rotated about its centre, resampled - the case phase correlation cannot fit.
+
+    This stands in for what a camera yaw does to a captured view. It is a
+    rotation of the *picture*, not a pan, so there is no single translation that
+    maps one frame onto the other.
+    """
+    cv2 = pytest.importorskip("cv2")
+    height, width = frame.image.shape[:2]
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), degrees, 1.0)
+    rotated = cv2.warpAffine(
+        frame.image,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return Frame(image=rotated, timestamp=frame.timestamp, region=frame.region)
 
 
 def _collect_events() -> tuple[list[tuple[str, str]], object]:
@@ -484,6 +505,61 @@ class TestShiftEstimate:
         assert not estimate.available
         assert estimate.reason
         assert estimate.x == 0.0 and estimate.y == 0.0
+
+    def test_a_pair_that_does_not_lock_is_reported_not_guessed(self) -> None:
+        """No lock means no displacement, not a displacement of zero."""
+        estimate = estimate_shift(texture_frame(), texture_frame(seed=99))
+        assert not estimate.available
+        assert estimate.reason
+        assert estimate.quality < DEFAULT_MIN_QUALITY
+        assert estimate.x == 0.0 and estimate.y == 0.0
+
+    def test_a_turned_view_is_not_reported_as_a_translation(self) -> None:
+        """The defect a live run exposed, pinned.
+
+        Phase correlation fits a translation and only a translation, so a camera
+        that turned leaves it with no peak - and it still hands back a near-zero
+        vector. That vector was printed as a displacement, which is how a live run
+        came to report ``estimated shift (-0.10, +0.05) px`` and
+        ``pixels per delta x -0.0005`` beside an ``A to B`` difference of
+        ``31.3`` luma levels and ``57%`` of pixels changed. The camera had turned a
+        long way; the number said it had not moved at all.
+        """
+        base = texture_frame(width=256, height=256)
+        estimate = estimate_shift(base, _turned(base, 5.0))
+        assert not estimate.available
+        assert "no consistent translation" in estimate.reason
+        assert estimate.quality < DEFAULT_MIN_QUALITY
+        assert estimate.x == 0.0 and estimate.y == 0.0
+
+    def test_the_floor_refuses_a_number_rather_than_removing_it(self) -> None:
+        """The vector is still there and still measurable - it is simply not reported.
+
+        This is the difference between an honest absence and a hidden one: an
+        operator can ask what was refused, and the answer is a real number with a
+        real response behind it.
+        """
+        base = texture_frame(width=256, height=256)
+        turned = _turned(base, 5.0)
+        refused = estimate_shift(base, turned)
+        inspected = estimate_shift(base, turned, min_quality=0.0)
+        assert not refused.available
+        assert inspected.available
+        assert refused.quality == pytest.approx(inspected.quality)
+        assert abs(refused.x) < 1.0 and abs(refused.y) < 1.0
+
+    def test_the_floor_does_not_detect_a_blank_scene(self) -> None:
+        """A documented limit, pinned so it is not mistaken for coverage.
+
+        The floor answers "does one translation explain this pair", not "is there
+        anything worth looking at". Two featureless frames agree perfectly on the
+        translation ``(0, 0)``, so a blank view passes it. Refusing to look at a
+        featureless scene is a separate problem and needs a separate check.
+        """
+        estimate = estimate_shift(flat_frame(40), flat_frame(40))
+        assert estimate.available
+        assert estimate.quality > DEFAULT_MIN_QUALITY
+        assert estimate.x == pytest.approx(0.0, abs=0.5)
 
     def test_a_mismatched_pair_is_refused(self) -> None:
         with pytest.raises(LookError, match="same shape"):
@@ -969,6 +1045,35 @@ class TestLookRunnerAborts:
         assert trial.shift is not None and not trial.shift.available
         assert trial.shift.reason
         assert trial.a_to_b is not None
+        assert trial.pixels_per_delta_x is None and trial.pixels_per_delta_y is None
+
+    def test_a_turned_view_records_no_mapping_ratio_at_all(self, recorder: LookRecorder) -> None:
+        """The live-run chain, end to end: no lock means no ratio ever reaches anyone.
+
+        This is the link that mattered. ``runner._measure`` computes the ratio only
+        when the estimate is available, so refusing a non-locking estimate keeps a
+        meaningless ``pixels per delta`` out of the calibration that consumes it -
+        and a calibration fed ``0.005 px per count`` computes a correction three
+        orders of magnitude too large, clamps it to the hardware ceiling, and can
+        then never converge. The picture is still described honestly: the frame
+        difference and the reversibility are recorded as usual.
+        """
+        base = texture_frame(width=256, height=256)
+        runner = _runner(
+            recorder,
+            frames=[base, _turned(base, 5.0), base],
+            moves_log=[],
+            window_size=(256, 256),
+        )
+
+        result = runner.run((TrialSpec(index=0, dx=200, dy=0, settle_seconds=0.0),))
+
+        assert result.status == TRIAL_COMPLETED
+        trial = result.trials[0]
+        assert trial.a_to_b is not None and trial.a_to_b.mean_absolute_difference > 0.0
+        assert trial.a_to_c is not None
+        assert trial.shift is not None and not trial.shift.available
+        assert trial.shift.reason
         assert trial.pixels_per_delta_x is None and trial.pixels_per_delta_y is None
 
     def test_the_experiment_stops_at_the_first_abort_and_does_not_continue(

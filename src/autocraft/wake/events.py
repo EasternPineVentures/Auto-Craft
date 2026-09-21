@@ -65,6 +65,13 @@ class WakeEventKind(str, Enum):
 #: requires thoughts to stay display-only, and a summary line that only restates
 #: an already-recorded event keeps that promise. Nothing here is ever fed back
 #: into a decision.
+#:
+#: A line must not claim an outcome the event does not carry. ``CENTERING_PROGRESS``
+#: is emitted by :meth:`~autocraft.wake.policy.WakeDecisionPolicy._emit_move`
+#: immediately *before* the movement is sent, so it records an attempt and nothing
+#: else - the distance it moved the target is not known yet, and in the first live
+#: run it grew rather than shrank on 9 of 20 corrections. The line used to read
+#: "Target moved closer to centre." on every one of them.
 STREAM_SUMMARY: Mapping[WakeEventKind, str] = {
     WakeEventKind.WAKE_STARTED: "Waking up and taking a first look.",
     WakeEventKind.VIEW_CAPTURED: "Looking around.",
@@ -73,7 +80,7 @@ STREAM_SUMMARY: Mapping[WakeEventKind, str] = {
     WakeEventKind.SCAN_MOVE: "Turning to inspect another direction.",
     WakeEventKind.CANDIDATE_FOUND: "Something over there stands out.",
     WakeEventKind.TARGET_SELECTED: "Candidate selected.",
-    WakeEventKind.CENTERING_PROGRESS: "Target moved closer to centre.",
+    WakeEventKind.CENTERING_PROGRESS: "Attempting a centring correction.",
     WakeEventKind.OVERSHOOT_DETECTED: "That went past the centre.",
     WakeEventKind.TARGET_LOST: "Target lost.",
     WakeEventKind.TARGET_REACQUIRED: "Target found again.",
