@@ -16,7 +16,7 @@ from autocraft.agent.action import Action, ActionExecutor, ActionKind
 from autocraft.agent.decision import DecisionPolicy, NoOpDecisionPolicy
 from autocraft.agent.loop import AgentLoop
 from autocraft.agent.observation import Observation, Observer, WindowStatus
-from autocraft.config import Config, load_config
+from autocraft.config import DEFAULT_WAKE_VERIFY_SETTLE_SECONDS, Config, load_config
 from autocraft.control.keyboard import Keyboard
 from autocraft.control.mouse import Mouse
 from autocraft.control.safety import SafetyGuard
@@ -24,6 +24,8 @@ from autocraft.telemetry.recorder import RunRecorder
 from autocraft.vision.capture import ScreenCapturer
 from autocraft.vision.frame import Frame, ScreenRegion
 from autocraft.vision.window import TargetStatus, WindowLocator
+
+from conftest import FakeCaptureBackend, FakeInputBackend
 
 
 class ScriptedPolicy:
@@ -384,6 +386,107 @@ class TestVerifyStage:
         sensitive = run(0.001)
         assert sensitive["frame_difference"] == measured["frame_difference"]
         assert sensitive["frame_changed"] is True
+
+
+class RedrawAwareInputBackend(FakeInputBackend):
+    """An input backend that also says when the game will have redrawn.
+
+    The game draws an injected movement asynchronously. The moment the move is
+    sent is therefore the moment the next frame becomes *due*, not the moment it
+    becomes *available* - which is the whole reason the loop has to wait before
+    it captures the frame it judges the move by.
+    """
+
+    def __init__(self, clock, redraw_after: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._redraw_after = redraw_after
+        self.redraw_at: float | None = None
+
+    def move_relative(self, dx: int, dy: int) -> None:
+        super().move_relative(dx, dy)
+        self.redraw_at = self._clock() + self._redraw_after
+
+
+class RedrawAwareCaptureBackend(FakeCaptureBackend):
+    """A capture backend whose picture only shows a movement once it is drawn.
+
+    Before the first movement, and until the redraw deadline passes, it returns
+    a flat dark frame. After the deadline it returns a flat bright one. That is
+    enough for :meth:`Frame.difference` to have something real to measure.
+    """
+
+    def __init__(self, clock, inputs: RedrawAwareInputBackend, *, drawn_value: int = 200) -> None:
+        super().__init__(value=0)
+        self._clock = clock
+        self._inputs = inputs
+        self._drawn_value = drawn_value
+
+    def grab(self, region: ScreenRegion) -> np.ndarray:
+        drawn = self._inputs.redraw_at is not None and self._clock() >= self._inputs.redraw_at
+        self.value = self._drawn_value if drawn else 0
+        return super().grab(region)
+
+
+class TestVerifySettle:
+    """VERIFY must never judge a movement by the picture from before it.
+
+    The live defect this pins: a capture issued immediately after injecting a
+    movement samples the desktop before the game has drawn that movement, so it
+    returns the pre-movement picture, the difference measures as zero, and every
+    movement looks like it did nothing. Measured on the reference machine, the
+    first capture after a movement reads 0.00000 and the second, ~115 ms later,
+    reads about 0.104.
+    """
+
+    def _step(self, config, fake_windows, clock, tmp_path, *, settle: float) -> dict:
+        """Run one mouse-move step against a game that redraws after 50 ms."""
+        inputs = RedrawAwareInputBackend(clock, redraw_after=0.05)
+        capture = RedrawAwareCaptureBackend(clock, inputs)
+        recorder = RunRecorder(tmp_path, clock=clock)
+        loop, _ = build_loop(
+            config,
+            fake_windows,
+            capture,
+            inputs,
+            clock,
+            policy=ScriptedPolicy([Action.mouse_move(20, 0)]),
+            recorder=recorder,
+            verify_settle_seconds=settle,
+        )
+        return loop.run(max_steps=1).steps[0]
+
+    def test_a_movement_is_judged_after_the_game_redraws(self, config, fake_windows, clock, tmp_path) -> None:
+        step = self._step(config, fake_windows, clock, tmp_path, settle=0.15)
+        assert step["verification_measured"] is True
+        assert step["frame_difference"] > 0.5
+        assert step["frame_changed"] is True
+
+    def test_without_the_wait_the_movement_looks_like_it_did_nothing(self, config, fake_windows, clock, tmp_path) -> None:
+        step = self._step(config, fake_windows, clock, tmp_path, settle=0.0)
+        assert step["verification_measured"] is True
+        assert step["frame_difference"] == 0.0
+        assert step["frame_changed"] is False
+
+    def test_the_wait_is_reported_in_the_step_timings(self, config, fake_windows, clock, tmp_path) -> None:
+        step = self._step(config, fake_windows, clock, tmp_path, settle=0.15)
+        assert step["timings"]["verify_settle"] == pytest.approx(150.0, abs=1.0)
+        assert step["timings"]["verify"] >= step["timings"]["verify_settle"]
+        assert step["timings"]["total"] >= step["timings"]["verify"]
+
+    def test_no_wait_is_reported_when_none_is_configured(self, config, fake_windows, clock, tmp_path) -> None:
+        """A skipped phase is omitted, not reported as a misleading zero."""
+        step = self._step(config, fake_windows, clock, tmp_path, settle=0.0)
+        assert "verify_settle" not in step["timings"]
+
+    def test_the_wait_only_precedes_the_verification_capture(self, config, fake_windows, clock, tmp_path) -> None:
+        """One wait per movement, not one per capture."""
+        self._step(config, fake_windows, clock, tmp_path, settle=0.15)
+        assert clock.sleeps == [0.15]
+
+    def test_the_shipped_configuration_waits(self, config) -> None:
+        assert DEFAULT_WAKE_VERIFY_SETTLE_SECONDS > 0
+        assert config.wake_verify_settle_seconds == DEFAULT_WAKE_VERIFY_SETTLE_SECONDS
 
 
 class TestFramePersistence:

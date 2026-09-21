@@ -1622,6 +1622,7 @@ def _build_runner(
     policy: WakeDecisionPolicy | None = None,
     max_seconds: float | None = None,
     clock=None,
+    sleeper=None,
     name: str = "run",
 ):
     world = world if world is not None else FakeWorld()
@@ -1646,7 +1647,7 @@ def _build_runner(
         executor=FakeExecutor(world),
         max_seconds=max_seconds,
         clock=clock,
-        sleeper=lambda _: None,
+        sleeper=sleeper if sleeper is not None else (lambda _: None),
         on_event=events.append,
         on_status=statuses.append,
         run_recorder=RunRecorder.new_run(config.runs_dir, clock=clock),
@@ -1882,6 +1883,44 @@ def test_every_step_records_a_phase_breakdown_without_pixels(tmp_path: Path) -> 
         assert all(value >= 0.0 for value in timings.values())
         assert timings["total"] >= timings["decide"]
     assert any("act" in row["timings"] for row in rows), "no step timed a movement"
+
+
+def test_the_runner_threads_the_configured_verify_settle_into_the_loop(tmp_path: Path) -> None:
+    """The settle only fixes anything if the run actually configures it.
+
+    The loop has its own default, but WAKE-001 is the experiment that needs the
+    wait, so a runner that failed to pass its configured value through would
+    silently go back to judging every movement by the picture from before it.
+    """
+    slept: list[float] = []
+    # Deliberately not a multiple of the step interval: the loop paces itself to
+    # the configured step rate through the same sleeper, so the settle has to be
+    # a value that pacing cannot produce for the count below to mean anything.
+    config = Config(data_dir=tmp_path / "data", wake_verify_settle_seconds=0.35)
+    runner, _, _, _, _ = _build_runner(
+        tmp_path, config=config, sleeper=slept.append, name="settle"
+    )
+    result = runner.run()
+
+    waited = [
+        row for row in runner.run_recorder.steps if "verify_settle" in row.get("timings", {})
+    ]
+    assert result.moves_sent > 0
+    assert len(waited) == result.moves_sent
+    assert slept.count(0.35) == result.moves_sent
+
+
+def test_no_verify_settle_is_recorded_when_the_wait_is_disabled(tmp_path: Path) -> None:
+    slept: list[float] = []
+    config = Config(data_dir=tmp_path / "data", wake_verify_settle_seconds=0.0)
+    runner, _, _, _, _ = _build_runner(
+        tmp_path, config=config, sleeper=slept.append, name="no-settle"
+    )
+    result = runner.run()
+
+    assert result.moves_sent > 0
+    assert 0.35 not in slept
+    assert not any("verify_settle" in row.get("timings", {}) for row in runner.run_recorder.steps)
 
 
 # ---------------------------------------------------------------------------

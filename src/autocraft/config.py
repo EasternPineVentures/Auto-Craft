@@ -33,6 +33,7 @@ __all__ = [
     "DEFAULT_LOOK_LARGE_WINDOW_PIXELS",
     "DEFAULT_LOOK_MAX_STEPS",
     "DEFAULT_LOOK_SETTLE_SECONDS",
+    "DEFAULT_VERIFY_SETTLE_SECONDS",
     "DEFAULT_MAX_CONSECUTIVE_BLOCKS",
     "DEFAULT_MAX_KEY_HOLD_SECONDS",
     "DEFAULT_MAX_MOUSE_DELTA",
@@ -52,6 +53,7 @@ __all__ = [
     "DEFAULT_WAKE_MAX_SECONDS",
     "DEFAULT_WAKE_MAX_TARGET_CANDIDATES",
     "DEFAULT_WAKE_MIN_TARGET_CONFIDENCE",
+    "DEFAULT_WAKE_VERIFY_SETTLE_SECONDS",
     "DEFAULT_WAKE_SALIENCE_GRID",
     "DEFAULT_WAKE_SCAN_COUNTS",
     "DEFAULT_WAKE_VIEW_GRID",
@@ -114,6 +116,19 @@ LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
 #: lands mid-motion; too long and unrelated animation has time to change the
 #: scene instead.
 DEFAULT_LOOK_SETTLE_SECONDS: float = 0.15
+
+#: Seconds to wait after an injected movement before capturing the frame the
+#: agent will compare with the pre-movement frame. This is the same physical
+#: quantity LOOK-001 calls its settle and it defaults to the same value, because
+#: the reason is the same in both experiments: a capture issued immediately
+#: after a movement samples the desktop before the game has drawn the movement,
+#: so it returns the *pre*-movement picture and the movement measures as having
+#: changed nothing. Measured live on the reference machine: the first capture
+#: after a movement reads 0.00000 up to about 50 ms, the second reads about
+#: 0.104, and the change first crosses the loop's 0.01 threshold at 112-128 ms.
+#: 150 ms is a three-times margin over that. Zero disables the wait and
+#: reintroduces the stale-capture defect, so it is only for tests.
+DEFAULT_VERIFY_SETTLE_SECONDS: float = 0.15
 
 #: Coarse partition for the difference map. 8x8 keeps the whole map to 64
 #: numbers, small enough to ride along in the observer's JSON payload.
@@ -233,6 +248,14 @@ DEFAULT_WAKE_DEAD_ZONE_PX: float = 12.0
 #: gone, and this is what stops that answer being believed.
 DEFAULT_WAKE_MIN_TARGET_CONFIDENCE: float = 0.35
 
+#: Seconds to wait after an injected movement before capturing the frame the
+#: policy is allowed to judge the movement by. WAKE-001 moves the view far more
+#: often than LOOK-001 does - up to 45 movements in a run - and until this
+#: existed the loop captured the verification frame with no wait at all, so
+#: every movement was judged by the picture from *before* it happened. See
+#: ``DEFAULT_VERIFY_SETTLE_SECONDS`` for the measurement behind the number.
+DEFAULT_WAKE_VERIFY_SETTLE_SECONDS: float = DEFAULT_VERIFY_SETTLE_SECONDS
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are missing, malformed or unsafe."""
@@ -311,6 +334,10 @@ class Config:
             centred.
         wake_min_target_confidence: Below this match confidence the selected
             region is treated as lost rather than believed.
+        wake_verify_settle_seconds: Seconds to wait after an injected movement
+            before capturing the frame the policy judges that movement by. Zero
+            disables the wait, which makes every movement look like it changed
+            nothing because the capture returns the pre-movement picture.
     """
 
     target_title_patterns: tuple[str, ...] = DEFAULT_TARGET_TITLE_PATTERNS
@@ -354,6 +381,7 @@ class Config:
     wake_max_seconds: float = DEFAULT_WAKE_MAX_SECONDS
     wake_dead_zone_px: float = DEFAULT_WAKE_DEAD_ZONE_PX
     wake_min_target_confidence: float = DEFAULT_WAKE_MIN_TARGET_CONFIDENCE
+    wake_verify_settle_seconds: float = DEFAULT_WAKE_VERIFY_SETTLE_SECONDS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_title_patterns", tuple(str(p) for p in self.target_title_patterns))
@@ -401,6 +429,7 @@ class Config:
         object.__setattr__(self, "wake_max_seconds", float(self.wake_max_seconds))
         object.__setattr__(self, "wake_dead_zone_px", float(self.wake_dead_zone_px))
         object.__setattr__(self, "wake_min_target_confidence", float(self.wake_min_target_confidence))
+        object.__setattr__(self, "wake_verify_settle_seconds", float(self.wake_verify_settle_seconds))
         self._validate()
 
     # -- derived paths ----------------------------------------------------
@@ -483,6 +512,7 @@ class Config:
             "wake_max_seconds": self.wake_max_seconds,
             "wake_dead_zone_px": self.wake_dead_zone_px,
             "wake_min_target_confidence": self.wake_min_target_confidence,
+            "wake_verify_settle_seconds": self.wake_verify_settle_seconds,
         }
 
     # -- validation -------------------------------------------------------
@@ -672,6 +702,17 @@ class Config:
                 f"either lose every target or believe every match, got "
                 f"{self.wake_min_target_confidence}"
             )
+        if self.wake_verify_settle_seconds < 0:
+            raise ConfigError(
+                "wake_verify_settle_seconds must not be negative, got "
+                f"{self.wake_verify_settle_seconds}"
+            )
+        if self.wake_verify_settle_seconds > 10:
+            raise ConfigError(
+                "wake_verify_settle_seconds must be at most 10; a longer settle lets "
+                "the scene change for reasons other than the injected movement, got "
+                f"{self.wake_verify_settle_seconds}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +843,7 @@ _TOML_SECTIONS: dict[str, dict[str, tuple[str, Callable[..., Any]]]] = {
         "max_seconds": ("wake_max_seconds", _as_float),
         "dead_zone_px": ("wake_dead_zone_px", _as_float),
         "min_target_confidence": ("wake_min_target_confidence", _as_float),
+        "verify_settle_seconds": ("wake_verify_settle_seconds", _as_float),
     },
 }
 
@@ -847,6 +889,7 @@ _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
     "WAKE_MAX_SECONDS": ("wake_max_seconds", _as_float),
     "WAKE_DEAD_ZONE_PX": ("wake_dead_zone_px", _as_float),
     "WAKE_MIN_TARGET_CONFIDENCE": ("wake_min_target_confidence", _as_float),
+    "WAKE_VERIFY_SETTLE_SECONDS": ("wake_verify_settle_seconds", _as_float),
 }
 
 

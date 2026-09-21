@@ -183,6 +183,7 @@ class WakeRunner:
             recorder=self.run_recorder,
             clock=self.clock,
             sleeper=self.sleeper,
+            verify_settle_seconds=self.config.wake_verify_settle_seconds,
             progress=self._after_step,
             on_observation=self._after_observation,
         )

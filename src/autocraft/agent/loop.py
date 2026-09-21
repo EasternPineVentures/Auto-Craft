@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from ..config import Config
+from ..config import Config, DEFAULT_VERIFY_SETTLE_SECONDS
 from ..control.safety import SafetyGuard
 from ..telemetry.recorder import RunRecord, RunRecorder
 from .action import Action, ActionExecutor, ActionKind, ActionResult
@@ -44,10 +44,11 @@ class StepRecord:
     finished_at: float = 0.0
     #: Where the step's wall clock actually went, in milliseconds. Keys are
     #: ``capture``, ``decide``, ``act``, ``verify`` and ``total``, plus
-    #: ``since_previous_move`` when this step injected input. Kept as a mapping
-    #: rather than five more fields so a reader can see the decomposition without
-    #: knowing the loop's internals, and so a step that skipped a phase simply
-    #: omits it instead of reporting a misleading zero.
+    #: ``since_previous_move`` when this step injected input and
+    #: ``verify_settle`` when the step waited for the game to redraw. Kept as a
+    #: mapping rather than five more fields so a reader can see the decomposition
+    #: without knowing the loop's internals, and so a step that skipped a phase
+    #: simply omits it instead of reporting a misleading zero.
     timings: Mapping[str, float] = field(default_factory=dict)
 
     @property
@@ -91,6 +92,7 @@ class AgentLoop:
         progress: Callable[[StepRecord], None] | None = None,
         on_observation: Callable[[Any], None] | None = None,
         change_threshold: float = 0.01,
+        verify_settle_seconds: float = DEFAULT_VERIFY_SETTLE_SECONDS,
         save_frames_every: int = 0,
     ) -> None:
         """
@@ -117,6 +119,14 @@ class AgentLoop:
                 counted as "the image changed" during VERIFY. The default of
                 ``0.01`` corresponds to about 2.5 levels out of 255, which is
                 above typical rendering noise but far below a camera turn.
+            verify_settle_seconds: Seconds to wait after an injected movement
+                before capturing the frame that movement is judged by. Without
+                it the verification capture lands before the game has drawn the
+                movement, so it returns the pre-movement picture and the
+                movement is measured as having changed nothing - which is
+                exactly what happened on every live WAKE-001 run. See
+                ``DEFAULT_VERIFY_SETTLE_SECONDS`` for the measurement. Zero
+                disables the wait and is only for tests.
             save_frames_every: Persist a frame every N steps; 0 disables frame
                 persistence entirely, which is the default.
         """
@@ -131,6 +141,7 @@ class AgentLoop:
         self._progress = progress
         self._on_observation = on_observation
         self._change_threshold = float(change_threshold)
+        self._verify_settle_seconds = float(verify_settle_seconds)
         self._save_frames_every = int(save_frames_every)
         #: Clock reading of the last injected movement, for the inter-movement
         #: cadence. ``None`` until the first input of the run.
@@ -355,6 +366,13 @@ class AgentLoop:
         frame_changed: bool | None = None
         difference: float | None = None
         if result.ok and action.is_input and observation.frame is not None:
+            # The game draws the movement asynchronously. A capture taken
+            # immediately after injecting it samples the desktop before that
+            # draw, so it returns the *pre*-movement picture and the movement
+            # measures as having changed nothing. Wait first, then capture.
+            if self._verify_settle_seconds > 0:
+                self._sleep(self._verify_settle_seconds)
+                timings["verify_settle"] = self._elapsed_ms(acted_at)
             follow_up = self._observer.observe(index, capture=True)
             if follow_up.frame is not None:
                 difference = observation.frame.difference(follow_up.frame)

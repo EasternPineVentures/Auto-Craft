@@ -771,6 +771,12 @@ will ever call it. Nothing here knows what a tree is.
    below the floor, or on a budget running out, or on a safety abort. All four
    paths terminate the run and are recorded with the reason that ended it.
 
+Every verification capture — the one after a scan movement and the one after a
+centring movement alike — waits `wake_verify_settle_seconds` before it looks,
+because the game draws a movement asynchronously and a capture taken immediately
+samples the frame from *before* it. See
+[the third round](#the-third-round-correct-geometry-and-a-sensor-that-looked-too-early).
+
 #### The mapping is measured, not assumed
 
 The centring controller never assumes `1 mouse count = 1 pixel`. It starts with
@@ -836,6 +842,7 @@ max_moves = 45
 max_seconds = 120.0
 dead_zone_px = 12.0          # "centred enough" radius
 min_target_confidence = 0.35 # below this, do not pretend to know where it is
+verify_settle_seconds = 0.15 # wait for the game to redraw before VERIFY looks
 ```
 
 Every field has a matching `AUTOCRAFT_WAKE_*` environment override, and all of
@@ -1150,12 +1157,16 @@ Measured over the 15 mouse moves, decomposing each step at
 The run took 20.249 s of behaviour (the record's 40.27 s `duration` includes the
 operator's own `--focus-delay 20` countdown). The step rate was therefore about
 **0.78 moves per second**, and the mouse itself accounts for 0.026% of the time
-between moves. **There is no deliberate settle delay**: `_pace` is a no-op
-unless a step interval is configured, the inter-step gap is 2 ms, and the only
-gap between injecting a move and looking at the result is the VERIFY capture
-itself (~0.09 s of grab). So the choppiness is not a pacing choice and not a
-slow input path — it is capture and decision latency on a 3222x1928 frame, and
-the frame size is the reason.
+between moves. **There was no deliberate settle delay in that run**: `_pace` is
+a no-op unless a step interval is configured, the inter-step gap is 2 ms, and the
+only gap between injecting a move and looking at the result was the VERIFY
+capture itself (~0.09 s of grab). So the choppiness is not a pacing choice and
+not a slow input path — it is capture and decision latency on a 3222x1928 frame,
+and the frame size is the reason.
+
+The absence of a settle is no longer true, and the paragraph below is why. WAKE
+now waits `wake_verify_settle_seconds` (0.15 s) before the VERIFY capture; see
+[the third round](#the-third-round-correct-geometry-and-a-sensor-that-looked-too-early).
 
 An offline reproduction of the same degenerate case on this machine attributes
 the cost directly:
@@ -1188,6 +1199,10 @@ below by ~0.1 s and above by ~0.65 s by this record, and is not pinned more
 precisely. VERIFY is currently paying ~0.12 s per step for information that
 arrives too early to be true. That is a measurement, not a defect in the
 sensor — and it is worth fixing, but not in this pass.
+
+It was pinned in a later pass and fixed: the window is 112-128 ms, and VERIFY now
+waits 0.15 s before looking. See
+[the third round](#the-third-round-correct-geometry-and-a-sensor-that-looked-too-early).
 
 ##### The crash, and the rule it produced
 
@@ -1543,12 +1558,95 @@ stop reason. A smaller window made it faster; it did not make it see anything.
 (As the DPI finding above shows, that 2246x1159 was itself an inflated reading;
 the real client area was under 1 Mpx the whole time.)
 
+##### The third round: correct geometry, and a sensor that looked too early
+
+Three live runs followed the DPI fix — `20260921T031753Z-7ccf8a25`,
+`20260921T032850Z-e77e7581` and `20260921T033013Z-2ec9ec4b`. They are the first
+runs whose geometry is real, and the things the earlier passes fixed stayed
+fixed: `safety_events` is recorded (Finding 2), the startup
+`WINDOW_GEOMETRY_CHANGED` is the benign first-capture `0x0 -> real` population,
+salience reaches `TARGET_SELECTED`, and no run invented a frame-sized target.
+
+They also all failed, and in a way that pointed at the sensor rather than the
+policy. `frame_changed` was `True` on **0 of 29** moves in the first,
+**2 of 30** in the second and **0 of 6** in the third, which drove
+`dead_repetition 1.000` and `productive_repetition 0.000`: the agent believed
+every movement it made had changed nothing, and abandoned every candidate it had
+found. Two explanations were tested and both were wrong.
+
+- **"The mouse input never reaches the game."** Falsified. `move_relative` is a
+  correct `SendInput` relative move, and on a verified-static scene the same move
+  produced a `0.104` frame difference.
+- **"The window lost focus mid-run."** Falsified. `is_foreground` is `True` on
+  every real step of every run; only the synthetic header row is `False`.
+- **"The pointer needs recentring."** Not applicable. The cursor is captured by
+  the game (an SDL pointer grab) and pinned to the window centre — `GetCursorPos`
+  returns exactly `(2880, 1661)`, and `SetCursorPos` returns `1` with a
+  `last_error` of `0` while changing nothing. There is no drifting pointer to
+  recentre.
+
+What the runs were actually seeing is a **capture race**, and it is deterministic.
+With a verified-static baseline — no hands on the keyboard or mouse, which is a
+prerequisite for any probe here, because a probe run while the operator is playing
+measures the operator — the same movement was captured twice, immediately and
+then ~115 ms later, four times over:
+
+| round | capture #1, ~50 ms after the move | capture #2, ~115 ms after the move |
+|---|---|---|
+| 1 | `0.00000` | `0.10356` |
+| 2 | `0.00000` | `0.10359` |
+| 3 | `0.00000` | `0.10471` |
+| 4 | `0.00000` | `0.10475` |
+
+The earliest capture that crossed the loop's `0.01` threshold was 112, 128, 112
+and 121 ms. The immediate capture is not merely early — it is deterministically
+**one redraw behind**: a `(+200, 0)` move read `0.00000` while the immediately
+following `(-200, 0)` move read exactly `0.08997`, byte-identical to the settled
+value from the move before it. So `VERIFY` was comparing the frame before the
+move with the frame before the move, and correctly reporting that nothing had
+changed.
+
+**LOOK-001 already had this solved and WAKE had not inherited it.**
+`look/runner.py` settles before both of its captures, driven by
+`look_settle_seconds` (0.15 s), because the LOOK-001 measurement cannot work
+without it. `AgentLoop._step` — the path WAKE-001 uses — had no settle at all.
+
+WAKE now waits before the verification capture:
+
+| setting | default | what it is |
+|---|---|---|
+| `wake_verify_settle_seconds` | `0.15` | wait after injecting a move, before the VERIFY capture |
+
+It applies **only** to the post-move verification capture, not to the pre-move
+observation, and it reuses the loop's injectable sleeper, so tests never really
+sleep. 0.15 s is a three-times margin over the measured 112-128 ms crossing, and
+it is the same value and the same physics as LOOK-001's established settle, so
+there is one precedent rather than two. The loop records the wait as a
+`verify_settle` timing, and `wake_result.json` carries a `verify_settle_mean`
+row beside the other cadence means.
+
+Two consequences worth stating plainly. The cadence will be about 150 ms slower
+per movement step, and that cost is deliberate — it buys a measurement that is
+true rather than one that is merely prompt. And the earlier runs' `frame_changed`
+and repetition figures are now known to be **unusable as evidence about the
+policy**: they were measuring the capture race. Comparing run to run across this
+change means comparing `verify_settle_mean` alongside the other cadence means
+rather than against them.
+
+The third run's records also disagree with the first two on repetition
+(`dead_repetition 0.0`, `productive 1.0` where the others have `1.0` and `0.0`).
+That difference is not explained yet, and with a settle in place it is finally
+worth asking, because the flag now measures the movement instead of the race.
+
 #### Before the next live run
 
 Both of the runs above were recorded by a DPI-unaware process, and step time
 tracks frame area almost exactly, so the numbers they produced describe the
-inflation as much as they describe the agent. With awareness fixed, the next run
-is the first one whose resolution, cadence and geometry are all real.
+inflation as much as they describe the agent. The runs after the DPI fix are the
+first whose resolution, cadence and geometry are all real, and they are the ones
+described in
+[the third round](#the-third-round-correct-geometry-and-a-sensor-that-looked-too-early)
+above.
 
 **AutoCraft will not resize the window for you** — the window is the thing being
 measured — so the size is a manual step, but the first thing to check is not the
@@ -1583,12 +1681,14 @@ salience threshold until a candidate appears would destroy the measurement the
 whole milestone rests on. Note also that the absolute resolutions and cadence
 figures from the earlier runs are inflated, so compare *shapes* — does time track
 area, do views repeat, does anything survive selection — not the raw
-milliseconds.
+milliseconds. Read `verify_settle_mean` alongside the other cadence means rather
+than against them: it is a deliberate 0.15 s per movement step, and without
+subtracting it the new run will look slower than the old ones for a reason that is
+not the agent's.
 
-The next run is also the first one that will record a per-phase `timings`
-breakdown and a per-observation `WINDOW_GEOMETRY_CHANGED` comparison, so it is the
-first one whose numbers can say where the time went and whether the geometry
-moved.
+The runs after the DPI fix are the first that record a per-phase `timings`
+breakdown and a per-observation `WINDOW_GEOMETRY_CHANGED` comparison, so their
+numbers can say where the time went and whether the geometry moved.
 
 #### What it does not do
 
@@ -1966,8 +2066,15 @@ covered:
   means and their sample counts reach `wake_result.json`, an unreadable timing
   is dropped rather than failing the record, a run that timed nothing reports an
   empty cadence rather than zeros, and a successful cleanup prints no warning
+- the WAKE-001 verify settle: a movement is judged only after the game has
+  redrawn, so a redraw-aware fake reports the change and the same fake with the
+  wait disabled reproduces the live defect exactly (difference `0.0`,
+  `frame_changed` false); the wait appears in the step timings and is absent when
+  it is disabled; it precedes the verification capture once per movement rather
+  than once per capture; the shipped default is non-zero; and the runner threads
+  the configured value from `Config` into the loop
 
-The suite is 878 tests and runs in about 31 seconds. Everything that talks to
+The suite is 886 tests and runs in about 40 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---

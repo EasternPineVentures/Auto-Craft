@@ -2152,6 +2152,7 @@ def _wake_cadence_rows(cadence: Mapping[str, float]) -> list[tuple[str, str]]:
         ("decide_mean", "mean decision"),
         ("act_mean", "mean movement"),
         ("verify_mean", "mean verify"),
+        ("verify_settle_mean", "mean of that spent waiting to redraw"),
         ("since_previous_move_mean", "mean gap between movements"),
         ("total_mean", "mean step time"),
     )
