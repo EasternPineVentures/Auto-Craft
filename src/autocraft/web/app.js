@@ -39,6 +39,43 @@
     frameLuma: document.getElementById("frame-luma"),
     frameSignature: document.getElementById("frame-signature"),
 
+    lookStatus: document.getElementById("look-status"),
+    lookTrial: document.getElementById("look-trial"),
+    lookEmpty: document.getElementById("look-empty"),
+    lookBody: document.getElementById("look-body"),
+    lookDelta: document.getElementById("look-delta"),
+    lookMoves: document.getElementById("look-moves"),
+    lookWindow: document.getElementById("look-window"),
+    lookSettle: document.getElementById("look-settle"),
+    lookCapture: document.getElementById("look-capture"),
+    lookMad: document.getElementById("look-mad"),
+    lookRmse: document.getElementById("look-rmse"),
+    lookChanged: document.getElementById("look-changed"),
+    lookShiftX: document.getElementById("look-shift-x"),
+    lookShiftY: document.getElementById("look-shift-y"),
+    lookQuality: document.getElementById("look-quality"),
+    lookReversibility: document.getElementById("look-reversibility"),
+    lookGridSize: document.getElementById("look-grid-size"),
+    lookGrid: document.getElementById("look-grid"),
+    lookNote: document.getElementById("look-note"),
+
+    wakeStatus: document.getElementById("wake-status"),
+    wakeMoves: document.getElementById("wake-moves"),
+    wakeEmpty: document.getElementById("wake-empty"),
+    wakeBody: document.getElementById("wake-body"),
+    wakeState: document.getElementById("wake-state"),
+    wakeStrategy: document.getElementById("wake-strategy"),
+    wakeTarget: document.getElementById("wake-target"),
+    wakeOffset: document.getElementById("wake-offset"),
+    wakeConfidence: document.getElementById("wake-confidence"),
+    wakeViews: document.getElementById("wake-views"),
+    wakeGuard: document.getElementById("wake-guard"),
+    wakeEvent: document.getElementById("wake-event"),
+    wakeProgress: document.getElementById("wake-progress"),
+    wakeProgressScale: document.getElementById("wake-progress-scale"),
+    wakeProgressNote: document.getElementById("wake-progress-note"),
+    wakeNote: document.getElementById("wake-note"),
+
     safetyPanel: document.querySelector(".panel-safety"),
     safetyVerdict: document.getElementById("safety-verdict"),
     sWindow: document.getElementById("s-window"),
@@ -208,6 +245,251 @@
     setText(nodes.frameLuma, frame.mean_luma === null || frame.mean_luma === undefined ? "-" : frame.mean_luma);
     setText(nodes.frameSignature, frame.signature);
     renderFrameAge();
+  }
+
+  // -- visual motion (LOOK-001) -------------------------------------------
+
+  function renderLookGrid(report) {
+    const grid = report.block_map || [];
+    const size = report.block_grid || 0;
+    nodes.lookGrid.replaceChildren();
+    if (!grid.length) {
+      setText(nodes.lookGridSize, "-");
+      nodes.lookGrid.style.setProperty("--cols", "1");
+      return;
+    }
+    setText(nodes.lookGridSize, size + " x " + grid.length);
+    nodes.lookGrid.style.setProperty("--cols", String(grid[0].length));
+    // One cell per block, filled by that block's mean absolute difference on a
+    // fixed 0-255 scale. This is a readout of the stored measurement, not a
+    // recomputation, so the grid can never disagree with the numbers beside it.
+    grid.forEach(function (row) {
+      row.forEach(function (value) {
+        const cell = document.createElement("span");
+        const level = Math.max(0, Math.min(1, Number(value) / 255));
+        cell.className = "look-cell";
+        cell.style.setProperty("--v", level.toFixed(4));
+        cell.title = Number(value).toFixed(1);
+        nodes.lookGrid.append(cell);
+      });
+    });
+  }
+
+  function renderLook(snapshot) {
+    const look = snapshot.look || {};
+    const available = Boolean(look.available);
+    nodes.lookEmpty.hidden = available;
+    nodes.lookBody.hidden = !available;
+
+    setText(nodes.lookStatus, look.status || "not run");
+    setClass(
+      nodes.lookStatus,
+      available
+        ? look.status === "completed"
+          ? "badge badge-ok"
+          : "badge badge-warn"
+        : "badge badge-muted"
+    );
+
+    if (!available) {
+      setText(nodes.lookTrial, "-");
+      nodes.lookGrid.replaceChildren();
+      return;
+    }
+
+    setText(
+      nodes.lookTrial,
+      "trial " + (look.trial_index === null || look.trial_index === undefined ? "?" : look.trial_index + 1) +
+        " of " + (look.trial_count || 0)
+    );
+    const dx = look.dx === null || look.dx === undefined ? "-" : look.dx;
+    const dy = look.dy === null || look.dy === undefined ? "-" : look.dy;
+    setText(nodes.lookDelta, "(" + dx + ", " + dy + ")");
+    setText(nodes.lookMoves, look.movements_sent);
+    const window = look.window || {};
+    setText(nodes.lookWindow, window.width && window.height ? window.width + " x " + window.height : "-");
+    setText(nodes.lookSettle, look.settle_seconds === null || look.settle_seconds === undefined ? "-" : look.settle_seconds + " s");
+    setText(nodes.lookCapture, look.capture_seconds === null || look.capture_seconds === undefined ? "-" : look.capture_seconds + " s");
+    setText(nodes.lookMad, look.mean_absolute_difference);
+    setText(nodes.lookRmse, look.rmse);
+    setText(
+      nodes.lookChanged,
+      look.changed_fraction === null || look.changed_fraction === undefined
+        ? "-"
+        : (Number(look.changed_fraction) * 100).toFixed(2) + "%"
+    );
+
+    const shift = look.shift || {};
+    setText(nodes.lookShiftX, shift.available ? shift.x + " px" : "not estimated");
+    setText(nodes.lookShiftY, shift.available ? shift.y + " px" : "not estimated");
+    setText(nodes.lookQuality, shift.available ? shift.quality : "-");
+
+    const ratio = look.reversibility_ratio;
+    setText(
+      nodes.lookReversibility,
+      ratio === null || ratio === undefined
+        ? "not measurable"
+        : Number(ratio).toFixed(3)
+    );
+
+    const perDelta = look.pixels_per_delta || {};
+    if (perDelta.x === null || perDelta.x === undefined) {
+      setText(nodes.lookNote, look.reversibility_note || "-");
+    } else {
+      setText(
+        nodes.lookNote,
+        Number(perDelta.x).toFixed(4) + " px per unit of injected delta. " +
+          (look.reversibility_note || "")
+      );
+    }
+
+    renderLookGrid(look);
+  }
+
+  // -- waking behaviour (WAKE-001) ----------------------------------------
+
+  // The centring history as a small column chart: one bar per measured
+  // distance, oldest on the left, scaled against the first and largest sample.
+  // A falling staircase is the whole point of the panel, so the bar heights are
+  // the raw measurement and nothing is smoothed or rescaled to look better.
+  function renderWakeProgress(wake) {
+    const progress = wake.progress || [];
+    nodes.wakeProgress.replaceChildren();
+    if (!progress.length) {
+      setText(nodes.wakeProgressScale, "-");
+      setText(nodes.wakeProgressNote, "no centring move has been measured yet");
+      nodes.wakeProgress.style.setProperty("--cols", "1");
+      return;
+    }
+    const peak = Math.max.apply(null, progress.map(Number));
+    nodes.wakeProgress.style.setProperty("--cols", String(progress.length));
+    setText(nodes.wakeProgressScale, peak.toFixed(1) + " px -> 0");
+    progress.forEach(function (value) {
+      const bar = document.createElement("span");
+      const level = peak > 0 ? Math.max(0, Math.min(1, Number(value) / peak)) : 0;
+      bar.className = "wake-bar";
+      bar.style.setProperty("--v", level.toFixed(4));
+      bar.title = Number(value).toFixed(1) + " px";
+      nodes.wakeProgress.append(bar);
+    });
+    const first = Number(progress[0]);
+    const last = Number(progress[progress.length - 1]);
+    setText(
+      nodes.wakeProgressNote,
+      progress.length +
+        " move(s): " +
+        first.toFixed(1) +
+        " px -> " +
+        last.toFixed(1) +
+        " px" +
+        (last < first ? " (closer)" : " (not closer)")
+    );
+  }
+
+  function renderWake(snapshot) {
+    const wake = snapshot.wake || {};
+    const available = Boolean(wake.available);
+    nodes.wakeEmpty.hidden = available;
+    nodes.wakeBody.hidden = !available;
+
+    setText(nodes.wakeStatus, wake.status || "not run");
+    setClass(
+      nodes.wakeStatus,
+      available
+        ? wake.status === "completed"
+          ? "badge badge-ok"
+          : wake.status === "failed"
+            ? "badge badge-warn"
+            : "badge badge-muted"
+        : "badge badge-muted"
+    );
+
+    if (!available) {
+      setText(nodes.wakeMoves, "-");
+      setText(nodes.wakeState, "STARTING");
+      setText(nodes.wakeStrategy, "-");
+      setText(nodes.wakeTarget, "none");
+      setText(nodes.wakeOffset, "-");
+      setText(nodes.wakeConfidence, "-");
+      setText(nodes.wakeViews, "-");
+      setText(nodes.wakeGuard, "clear");
+      setText(nodes.wakeEvent, "-");
+      nodes.wakeProgress.replaceChildren();
+      return;
+    }
+
+    setText(
+      nodes.wakeMoves,
+      (wake.moves_sent || 0) + " / " + (wake.max_moves || 0) + " moves"
+    );
+    setText(nodes.wakeState, wake.state || "-");
+    setText(nodes.wakeStrategy, wake.strategy || "no strategy chosen yet");
+
+    const target = wake.target || {};
+    const centre = target.centre;
+    if (centre && centre.length === 2) {
+      setText(nodes.wakeTarget, "(" + centre[0].toFixed(0) + ", " + centre[1].toFixed(0) + ") px");
+    } else {
+      setText(nodes.wakeTarget, "none selected");
+    }
+
+    const offset = wake.target_offset;
+    if (offset && offset.length === 2) {
+      const distance = wake.target_distance;
+      setText(
+        nodes.wakeOffset,
+        "(" + Number(offset[0]).toFixed(1) + ", " + Number(offset[1]).toFixed(1) + ") px" +
+          (distance === null || distance === undefined ? "" : "  |  " + Number(distance).toFixed(1) + " px out")
+      );
+    } else {
+      setText(nodes.wakeOffset, "-");
+    }
+
+    const confidence = wake.confidence;
+    setText(
+      nodes.wakeConfidence,
+      confidence === null || confidence === undefined ? "not measured" : Number(confidence).toFixed(3)
+    );
+    setText(
+      nodes.wakeViews,
+      (wake.unique_views || 0) + " (" + (wake.revisited_views || 0) + " revisits)"
+    );
+
+    const guard = wake.repeat_guard || {};
+    if (guard.stuck) {
+      setText(nodes.wakeGuard, "STUCK x" + (guard.repeats || 0) + " - changing strategy");
+      setClass(nodes.wakeGuard, "mono wake-guard-stuck");
+    } else {
+      setText(
+        nodes.wakeGuard,
+        guard.cooldowns_active
+          ? "clear (" + guard.cooldowns_active + " strategy on cooldown)"
+          : "clear"
+      );
+      setClass(nodes.wakeGuard, "mono");
+    }
+
+    setText(nodes.wakeEvent, wake.recent_event || "-");
+
+    // The mapping line is the one place the panel states a limitation rather
+    // than a number, because "unmeasured" is the honest and interesting case.
+    const mapping = wake.mapping || {};
+    if (mapping.source === "unmeasured") {
+      setText(
+        nodes.wakeNote,
+        "Mouse mapping unmeasured: corrections were sized by a fixed band count, " +
+          "so the agent did not know how far a count would move the view."
+      );
+    } else {
+      setText(
+        nodes.wakeNote,
+        "Mouse mapping " + mapping.source + ": " +
+          Number(mapping.pixels_per_delta_x).toFixed(4) + " px/count x, " +
+          Number(mapping.pixels_per_delta_y).toFixed(4) + " px/count y."
+      );
+    }
+
+    renderWakeProgress(wake);
   }
 
   // -- safety -------------------------------------------------------------
@@ -472,6 +754,8 @@
     nodes.demoBadge.hidden = !snapshot.demo;
     nodes.demoNotice.hidden = !snapshot.demo;
     renderFrame(snapshot);
+    renderLook(snapshot);
+  renderWake(snapshot);
     renderSafety(snapshot);
     renderState(snapshot);
     renderAffect(snapshot);

@@ -22,6 +22,10 @@ data/captures/*
 !data/captures/.gitkeep
 data/runs/*
 !data/runs/.gitkeep
+# Learned scene models are fitted from live frames of the owner's screen, so
+# they carry the same privacy weight as the captures they were fitted from.
+data/models/*
+!data/models/.gitkeep
 
 # Local configuration overrides (autocraft.example.toml is the tracked template)
 autocraft.toml

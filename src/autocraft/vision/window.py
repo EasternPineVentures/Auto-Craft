@@ -27,6 +27,7 @@ __all__ = [
     "WindowInfo",
     "WindowLocator",
     "Win32WindowBackend",
+    "coordinate_scaling_note",
     "ensure_dpi_awareness",
     "title_matches",
 ]
@@ -155,9 +156,16 @@ class WindowBackend:
 
 _WIN32: dict[str, Any] | None = None
 
-#: Virtual key for a window handle comparison is unnecessary; these constants
-#: only drive DPI awareness so capture coordinates match physical pixels.
+#: ``DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2``. These contexts are *handles*,
+#: not integers, even though the SDK spells them as small negative numbers, so
+#: the call must be declared with a pointer argument type. Without that
+#: declaration ctypes marshals the value as a 32-bit C ``int``, the high half of
+#: the handle is lost, and the call fails with ``ERROR_INVALID_PARAMETER`` (87) -
+#: which looks exactly like success to any caller that does not check.
 _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+
+#: ``GetProcessDpiAwareness`` results, spelled the way the CLI reports them.
+_DPI_AWARENESS_NAMES = {0: "unaware", 1: "system", 2: "per-monitor"}
 
 
 def _win32() -> dict[str, Any]:
@@ -194,16 +202,59 @@ def _win32() -> dict[str, Any]:
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
+    # Optional entry points. They are declared defensively because they only
+    # exist on newer Windows, and a missing symbol is not a reason to refuse to
+    # run - it is a reason to say honestly what could not be arranged.
+    for name, argtypes, restype in (
+        ("SetProcessDpiAwarenessContext", [ctypes.c_void_p], wintypes.BOOL),
+        ("GetDpiForWindow", [wintypes.HWND], ctypes.c_uint),
+        ("GetDpiForSystem", [], ctypes.c_uint),
+    ):
+        try:
+            function = getattr(user32, name)
+        except AttributeError:  # pragma: no cover - pre-1703 Windows
+            continue
+        function.argtypes = argtypes
+        function.restype = restype
+
     _WIN32 = {"user32": user32, "kernel32": kernel32, "wintypes": wintypes}
     return _WIN32
+
+
+def _measured_dpi_awareness() -> str | None:
+    """Read back the process's effective DPI awareness.
+
+    Returns:
+        ``"unaware"``, ``"system"`` or ``"per-monitor"``, or ``None`` when the
+        platform will not say.
+    """
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        value = ctypes.c_int(-1)
+        if shcore.GetProcessDpiAwareness(None, ctypes.byref(value)) != 0:
+            return None
+    except (AttributeError, OSError):  # pragma: no cover - platform guard
+        return None
+    return _DPI_AWARENESS_NAMES.get(value.value)
 
 
 def ensure_dpi_awareness() -> str:
     """Opt the process into physical-pixel coordinates and report what happened.
 
-    Without this, Windows silently virtualises coordinates on scaled displays
-    and captured regions land in the wrong place. Best effort: the return value
-    records which API succeeded so the CLI can report it honestly.
+    Without this, Windows silently virtualises coordinates on scaled displays and
+    captured regions land in the wrong place.
+
+    The value returned is the awareness *measured after* the attempt, not the one
+    that was asked for, because these calls fail in a way that is very hard to
+    notice: a virtualised client rectangle is still a perfectly plausible
+    rectangle, the capture backend still returns exactly the number of pixels it
+    was asked for, and the only symptom is that the image is of somewhere else.
+    Reporting the measurement makes that visible at the one moment it can still
+    be acted on - before anything is captured.
+
+    Returns:
+        ``"per-monitor"``, ``"system"``, ``"unaware"``, ``"unchanged"`` or
+        ``"not-applicable"``.
     """
     if sys.platform != "win32":
         return "not-applicable"
@@ -212,22 +263,90 @@ def ensure_dpi_awareness() -> str:
     except UnsupportedPlatformError:  # pragma: no cover - platform guard
         return "not-applicable"
 
-    for name, call in (
-        ("per-monitor-v2", lambda: user32.SetProcessDpiAwarenessContext(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)),
-        ("system", lambda: user32.SetProcessDPIAware()),
-    ):
+    def _per_monitor_v2() -> Any:
+        return user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+
+    def _per_monitor() -> Any:
+        return ctypes.WinDLL("shcore", use_last_error=True).SetProcessDpiAwareness(2) == 0
+
+    def _system() -> Any:
+        return user32.SetProcessDPIAware()
+
+    # Per-monitor v2 is the only mode that keeps window rectangles in physical
+    # pixels on *every* display, so it is worth trying first; the coarser modes
+    # are strictly worse but better than nothing on older Windows.
+    attempts: tuple[tuple[str, Callable[[], Any]], ...] = (
+        ("per-monitor-v2", _per_monitor_v2),
+        ("per-monitor", _per_monitor),
+        ("system", _system),
+    )
+    fallback = "unchanged"
+    for name, call in attempts:
         try:
-            if call():
-                return name
+            call()
         except (AttributeError, OSError):
             continue
+        fallback = name
+        measured = _measured_dpi_awareness()
+        if measured is None:
+            # Cannot verify, so do not claim more than was attempted.
+            return name
+        if measured != "unaware":
+            return measured
+    measured = _measured_dpi_awareness()
+    return measured if measured is not None else fallback
+
+
+def _scaling_note(mode: str, window_dpi: int, system_dpi: int) -> str | None:
+    """Decide whether Windows is scaling one window's coordinates.
+
+    Split out from :func:`coordinate_scaling_note` so the decision can be tested
+    without a desktop to read DPI from.
+
+    Args:
+        mode: The measured process DPI awareness.
+        window_dpi: ``GetDpiForWindow`` for the target window.
+        system_dpi: ``GetDpiForSystem`` for the process's own display.
+
+    Returns:
+        A one-line explanation, or ``None`` when coordinates can be trusted.
+    """
+    if mode == "per-monitor":
+        return None
+    if window_dpi <= 0 or system_dpi <= 0 or window_dpi == system_dpi:
+        return None
+    return (
+        f"the process is only {mode} DPI aware, but this window is on a display scaled "
+        f"differently from the system's ({window_dpi} dpi against a system {system_dpi} dpi); "
+        "Windows is virtualising its coordinates, so the captured region may not be the "
+        "pixels AutoCraft asked for"
+    )
+
+
+def coordinate_scaling_note(handle: int | None) -> str | None:
+    """Explain when Windows is scaling a window's coordinates out from under us.
+
+    A window rectangle is only in physical pixels when the process is
+    per-monitor DPI aware. Anything less, and a window on a display whose scale
+    differs from the system's has its coordinates virtualised - and nothing
+    downstream can tell, because the rectangle still looks reasonable and the
+    capture still returns the size that was requested.
+
+    Args:
+        handle: The target window's handle, or ``None`` if there is no target.
+
+    Returns:
+        A one-line explanation, or ``None`` when coordinates are trustworthy.
+    """
+    if sys.platform != "win32" or not handle:
+        return None
     try:
-        shcore = ctypes.WinDLL("shcore", use_last_error=True)
-        if shcore.SetProcessDpiAwareness(2) == 0:
-            return "per-monitor"
-    except (AttributeError, OSError):
-        pass
-    return "unchanged"
+        user32 = _win32()["user32"]
+        window_dpi = int(user32.GetDpiForWindow(int(handle)))
+        system_dpi = int(user32.GetDpiForSystem())
+    except (AttributeError, OSError, UnsupportedPlatformError):
+        return None
+    return _scaling_note(_measured_dpi_awareness() or "unaware", window_dpi, system_dpi)
 
 
 class Win32WindowBackend(WindowBackend):

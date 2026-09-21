@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from ..config import Config
+from ..config import Config, DEFAULT_VERIFY_SETTLE_SECONDS
 from ..control.safety import SafetyGuard
 from ..telemetry.recorder import RunRecord, RunRecorder
 from .action import Action, ActionExecutor, ActionKind, ActionResult
@@ -42,6 +42,14 @@ class StepRecord:
     notes: str = ""
     started_at: float = 0.0
     finished_at: float = 0.0
+    #: Where the step's wall clock actually went, in milliseconds. Keys are
+    #: ``capture``, ``decide``, ``act``, ``verify`` and ``total``, plus
+    #: ``since_previous_move`` when this step injected input and
+    #: ``verify_settle`` when the step waited for the game to redraw. Kept as a
+    #: mapping rather than five more fields so a reader can see the decomposition
+    #: without knowing the loop's internals, and so a step that skipped a phase
+    #: simply omits it instead of reporting a misleading zero.
+    timings: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def duration(self) -> float:
@@ -63,6 +71,7 @@ class StepRecord:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration": self.duration,
+            "timings": {key: float(value) for key, value in self.timings.items()},
         }
 
 
@@ -83,6 +92,7 @@ class AgentLoop:
         progress: Callable[[StepRecord], None] | None = None,
         on_observation: Callable[[Any], None] | None = None,
         change_threshold: float = 0.01,
+        verify_settle_seconds: float = DEFAULT_VERIFY_SETTLE_SECONDS,
         save_frames_every: int = 0,
     ) -> None:
         """
@@ -109,6 +119,14 @@ class AgentLoop:
                 counted as "the image changed" during VERIFY. The default of
                 ``0.01`` corresponds to about 2.5 levels out of 255, which is
                 above typical rendering noise but far below a camera turn.
+            verify_settle_seconds: Seconds to wait after an injected movement
+                before capturing the frame that movement is judged by. Without
+                it the verification capture lands before the game has drawn the
+                movement, so it returns the pre-movement picture and the
+                movement is measured as having changed nothing - which is
+                exactly what happened on every live WAKE-001 run. See
+                ``DEFAULT_VERIFY_SETTLE_SECONDS`` for the measurement. Zero
+                disables the wait and is only for tests.
             save_frames_every: Persist a frame every N steps; 0 disables frame
                 persistence entirely, which is the default.
         """
@@ -123,7 +141,11 @@ class AgentLoop:
         self._progress = progress
         self._on_observation = on_observation
         self._change_threshold = float(change_threshold)
+        self._verify_settle_seconds = float(verify_settle_seconds)
         self._save_frames_every = int(save_frames_every)
+        #: Clock reading of the last injected movement, for the inter-movement
+        #: cadence. ``None`` until the first input of the run.
+        self._last_move_at: float | None = None
 
     @property
     def policy_name(self) -> str:
@@ -241,14 +263,21 @@ class AgentLoop:
             stop_reason = f"{type(exc).__name__}: {exc}"
             recorder.record_error(f"{type(exc).__name__}: {exc}", context="agent loop")
         finally:
+            # The order here is the contract, and it is the same contract the
+            # wake-test command follows: release held input, then record every
+            # safety event that release produced, then finalize and close the
+            # telemetry. ``shutdown`` sits in the second step rather than after
+            # the close because it records a lifecycle event of its own - running
+            # it last meant that event was written to a recorder that had already
+            # finished, and was silently lost from every run.
             self._guard.release_all("run end")
+            self._guard.shutdown("run finished")
             recorder.record_safety_events(self._guard.events[event_cursor:])
             record = recorder.finish(
                 status=status,
                 stop_reason=stop_reason,
                 finished_at=self._clock(),
             )
-            self._guard.shutdown("run finished")
         return record
 
     # -- internals --------------------------------------------------------
@@ -263,6 +292,7 @@ class AgentLoop:
         started_at = self._clock()
         observation = self._observer.observe(index)
         observation_payload = observation.to_dict()
+        timings: dict[str, float] = {"capture": self._elapsed_ms(started_at)}
 
         if self._on_observation is not None:
             self._on_observation(observation)
@@ -274,6 +304,8 @@ class AgentLoop:
                 observation_payload["capture_path"] = str(path)
 
         action = self._policy.decide(observation)
+        decided_at = self._clock()
+        timings["decide"] = self._elapsed_ms(started_at, decided_at)
         if action.kind is ActionKind.STOP:
             record = StepRecord(
                 index=index,
@@ -292,6 +324,7 @@ class AgentLoop:
                 notes=str(action.parameters.get("reason", "policy requested stop")),
                 started_at=started_at,
                 finished_at=self._clock(),
+                timings=self._close_timings(timings, started_at),
             )
             return record, index + 1, f"policy stop ({action.parameters.get('reason', '')})"
 
@@ -326,16 +359,29 @@ class AgentLoop:
                     self._guard.record_success()
         else:
             result = self._executor.execute(action)
+        acted_at = self._clock()
+        timings["act"] = self._elapsed_ms(decided_at, acted_at)
 
         measured = False
         frame_changed: bool | None = None
         difference: float | None = None
         if result.ok and action.is_input and observation.frame is not None:
+            # The game draws the movement asynchronously. A capture taken
+            # immediately after injecting it samples the desktop before that
+            # draw, so it returns the *pre*-movement picture and the movement
+            # measures as having changed nothing. Wait first, then capture.
+            if self._verify_settle_seconds > 0:
+                self._sleep(self._verify_settle_seconds)
+                timings["verify_settle"] = self._elapsed_ms(acted_at)
             follow_up = self._observer.observe(index, capture=True)
             if follow_up.frame is not None:
                 difference = observation.frame.difference(follow_up.frame)
                 frame_changed = difference >= self._change_threshold
                 measured = True
+            timings["verify"] = self._elapsed_ms(acted_at)
+
+        if action.is_input and result.ok:
+            timings["since_previous_move"] = self._move_interval_ms(started_at)
 
         record = StepRecord(
             index=index,
@@ -348,8 +394,34 @@ class AgentLoop:
             safety_events=tuple(event.to_dict() for event in self._guard.events[event_cursor:]),
             started_at=started_at,
             finished_at=self._clock(),
+            timings=self._close_timings(timings, started_at),
         )
         return record, index + 1, None
+
+    def _elapsed_ms(self, since: float, until: float | None = None) -> float:
+        """Milliseconds from ``since`` to ``until`` (defaulting to now)."""
+        end = self._clock() if until is None else until
+        return round(max(0.0, end - since) * 1000.0, 3)
+
+    def _close_timings(self, timings: dict[str, float], started_at: float) -> dict[str, float]:
+        """Add the step total to a partially built timing breakdown."""
+        timings["total"] = self._elapsed_ms(started_at)
+        return timings
+
+    def _move_interval_ms(self, now: float) -> float:
+        """Milliseconds since the previous injected movement, or 0 for the first.
+
+        This is the number the operator actually feels: not how long one step
+        took, but how long the game sat still between two inputs. A step that
+        spends 300 ms deciding and 20 ms acting has a very different cadence from
+        one that spends 20 ms deciding and 300 ms capturing, and only this
+        interval shows it.
+        """
+        previous = self._last_move_at
+        self._last_move_at = now
+        if previous is None:
+            return 0.0
+        return round(max(0.0, now - previous) * 1000.0, 3)
 
     def _pace(self, started_at: float, steps_done: int) -> None:
         """Sleep so the loop does not spin faster than the configured step rate."""

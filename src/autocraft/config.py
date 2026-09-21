@@ -28,13 +28,35 @@ __all__ = [
     "DEFAULT_CAPTURE_FPS",
     "DEFAULT_CONFIG_FILENAME",
     "DEFAULT_EMERGENCY_STOP_KEY",
+    "DEFAULT_LOOK_BLOCK_GRID",
+    "DEFAULT_LOOK_CALIBRATION_DELTAS",
+    "DEFAULT_LOOK_LARGE_WINDOW_PIXELS",
+    "DEFAULT_LOOK_MAX_STEPS",
+    "DEFAULT_LOOK_SETTLE_SECONDS",
+    "DEFAULT_VERIFY_SETTLE_SECONDS",
     "DEFAULT_MAX_CONSECUTIVE_BLOCKS",
     "DEFAULT_MAX_KEY_HOLD_SECONDS",
     "DEFAULT_MAX_MOUSE_DELTA",
     "DEFAULT_MIN_ACTION_INTERVAL",
     "DEFAULT_OBSERVER_HOST",
     "DEFAULT_OBSERVER_PORT",
+    "DEFAULT_PERCEPTION_ADAPT_RATE",
+    "DEFAULT_PERCEPTION_FIT_FRAMES",
+    "DEFAULT_PERCEPTION_FLOOR",
+    "DEFAULT_PERCEPTION_GRID",
+    "DEFAULT_PERCEPTION_SIGMA",
     "DEFAULT_TARGET_TITLE_PATTERNS",
+    "DEFAULT_WAKE_DEAD_ZONE_PX",
+    "DEFAULT_WAKE_MAX_CENTER_MOVES",
+    "DEFAULT_WAKE_MAX_MOVES",
+    "DEFAULT_WAKE_MAX_SCAN_MOVES",
+    "DEFAULT_WAKE_MAX_SECONDS",
+    "DEFAULT_WAKE_MAX_TARGET_CANDIDATES",
+    "DEFAULT_WAKE_MIN_TARGET_CONFIDENCE",
+    "DEFAULT_WAKE_VERIFY_SETTLE_SECONDS",
+    "DEFAULT_WAKE_SALIENCE_GRID",
+    "DEFAULT_WAKE_SCAN_COUNTS",
+    "DEFAULT_WAKE_VIEW_GRID",
     "ENV_PREFIX",
     "SUPPORTED_IMAGE_FORMATS",
     "load_config",
@@ -86,6 +108,154 @@ DEFAULT_OBSERVER_PORT: int = 8765
 #: by accident.
 LOOPBACK_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
 
+#: LOOK-001 settings. The milestone injects a known mouse movement and measures
+#: the picture's response, so every bound on that experiment lives here too.
+
+#: Seconds to wait after a movement before capturing the next frame, giving the
+#: game time to finish its own camera interpolation. Too short and the capture
+#: lands mid-motion; too long and unrelated animation has time to change the
+#: scene instead.
+DEFAULT_LOOK_SETTLE_SECONDS: float = 0.15
+
+#: Seconds to wait after an injected movement before capturing the frame the
+#: agent will compare with the pre-movement frame. This is the same physical
+#: quantity LOOK-001 calls its settle and it defaults to the same value, because
+#: the reason is the same in both experiments: a capture issued immediately
+#: after a movement samples the desktop before the game has drawn the movement,
+#: so it returns the *pre*-movement picture and the movement measures as having
+#: changed nothing. Measured live on the reference machine: the first capture
+#: after a movement reads 0.00000 up to about 50 ms, the second reads about
+#: 0.104, and the change first crosses the loop's 0.01 threshold at 112-128 ms.
+#: 150 ms is a three-times margin over that. Zero disables the wait and
+#: reintroduces the stale-capture defect, so it is only for tests.
+DEFAULT_VERIFY_SETTLE_SECONDS: float = 0.15
+
+#: Coarse partition for the difference map. 8x8 keeps the whole map to 64
+#: numbers, small enough to ride along in the observer's JSON payload.
+DEFAULT_LOOK_BLOCK_GRID: int = 8
+
+#: Hard ceiling on planned trials in one ``look-test`` invocation. LOOK-001 has
+#: no unbounded mode, and this is the number that enforces that.
+DEFAULT_LOOK_MAX_STEPS: int = 10
+
+#: Window area above which ``look-test`` warns. 1280x720 is the size the
+#: milestone recommends; a larger window is not refused, only flagged, because
+#: AutoCraft must never resize the game window to suit itself.
+DEFAULT_LOOK_LARGE_WINDOW_PIXELS: int = 1280 * 720
+
+#: The calibration series: injected deltas, in mouse counts, each tried in both
+#: directions. Bounded on purpose - calibration is a probe, not a sweep.
+#:
+#: A series has to bracket the answer, so this one ascends to
+#: :data:`DEFAULT_MAX_MOUSE_DELTA`, the largest delta the actuator will accept in
+#: one command. It used to stop at 20. The first live trial then showed that a
+#: delta of 10 in a 3222x1928 window moved the picture by less than the method
+#: can resolve, so a series topping out at 20 would spend every trial below the
+#: resolution of the instrument and report near-zero estimates for all of them.
+DEFAULT_LOOK_CALIBRATION_DELTAS: tuple[int, ...] = (5, 10, 25, 50, 100, 200)
+
+#: VISION-001 settings. The perception layer learns what each part of the scene
+#: normally does, so these bound that learning rather than any game input. The
+#: whole ``autocraft.perception`` package is read-only: it can look at the game
+#: and has no code path that reaches :mod:`autocraft.control`.
+
+#: Partition the frame is read through. 16x16 gives 256 cells, coarse enough that
+#: a cell holds real texture rather than a single noisy pixel, and fine enough
+#: that a small on-screen change still lands in its own cell.
+DEFAULT_PERCEPTION_GRID: int = 16
+
+#: How many robust standard deviations above a cell's typical frame-to-frame
+#: movement count as "this cell changed". The bound itself is learned per cell
+#: from real frames; this is only the multiplier applied to the learned spread.
+DEFAULT_PERCEPTION_SIGMA: float = 4.0
+
+#: Luma levels. No learned bound is allowed below this. Without a floor, a cell
+#: that happened to sit perfectly still while the model was fitted would get a
+#: bound of zero and then flag every subsequent frame as changed.
+DEFAULT_PERCEPTION_FLOOR: float = 2.0
+
+#: Frames the perception layer learns "normal" from before it starts reporting.
+#: A run shorter than this never gets past the learning phase, and says so rather
+#: than reporting numbers it cannot support.
+DEFAULT_PERCEPTION_FIT_FRAMES: int = 20
+
+#: Per frame, how far an *unchanged* cell's learned baseline drifts toward the
+#: current frame, in ``0.0 .. 1.0``. Zero disables adaptation entirely.
+#:
+#: Adaptation exists because of a measured failure. In the first real run, the
+#: scene's ambient lighting shifted at about frame 28 and stayed shifted. A model
+#: fitted on frames 0-19 and then frozen reported that shift as a change on every
+#: remaining frame forever - precisely the failure this layer exists to prevent.
+#: Letting quiet cells drift absorbs a persistent scene change; cells currently
+#: flagged as changed are held back, so a transient change still stands out until
+#: it either goes away or proves it is the new normal.
+DEFAULT_PERCEPTION_ADAPT_RATE: float = 0.05
+
+#: WAKE-001 settings. The behaviour layer decides where to look and how far to
+#: turn; these are its budgets and its thresholds. They are the *only* things
+#: that bound the run: every one of them is a ceiling, and the milestone requires
+#: that a run always terminates, so none of them may be disabled.
+
+#: Cells per axis for the salience map. Eight is deliberately coarse. This is
+#: attention, not measurement: it has to say *roughly where* something stands out,
+#: and the pixel-accurate part is done afterwards by template matching.
+DEFAULT_WAKE_SALIENCE_GRID: int = 8
+
+#: Cells per axis for the view fingerprint, which decides whether two looks are
+#: the same view. Same grid as the salience map for the same reason.
+DEFAULT_WAKE_VIEW_GRID: int = 8
+
+#: One scan step, in mouse counts. This is how far the camera is turned when
+#: deliberately looking around. It is a *count*, not a distance, because LOOK-001
+#: never measured how far a count moves the view; the policy re-measures after
+#: every scan step rather than assuming this reached anywhere in particular.
+DEFAULT_WAKE_SCAN_COUNTS: int = 60
+
+#: SCANNING's movement budget. Twelve deliberate looks is enough to visit the
+#: eight compass directions plus the starting view twice over.
+DEFAULT_WAKE_MAX_SCAN_MOVES: int = 12
+
+#: How many candidate regions may be attempted before the run gives up and says
+#: so. Three, because the point is to stop rather than to keep trying: one failed
+#: target must not be allowed to consume the whole run.
+DEFAULT_WAKE_MAX_TARGET_CANDIDATES: int = 3
+
+#: CENTERING's movement budget *per candidate*. Eight closed-loop corrections is
+#: enough to converge from anywhere on screen at any mapping the LOOK-001 floor
+#: admits, with room to spare for an overshoot and its correction.
+DEFAULT_WAKE_MAX_CENTER_MOVES: int = 8
+
+#: Total movement budget for the run, across scanning and every candidate.
+#: This is the outermost bound and the one the safety story rests on.
+DEFAULT_WAKE_MAX_MOVES: int = 45
+
+#: Wall-clock ceiling, in seconds, for a whole wake run. A movement budget alone
+#: does not bound time: a window that takes a second to capture would let 45
+#: movements take three quarters of a minute. Two minutes is comfortably more
+#: than a healthy run needs and short enough that a wedged one gives the operator
+#: their screen back.
+DEFAULT_WAKE_MAX_SECONDS: float = 120.0
+
+#: How close to the frame centre, in pixels, counts as centred. Twelve pixels is
+#: about one mouse count at the finest mapping LOOK-001 could not rule out, so it
+#: is a tolerance the motor layer can actually hit rather than a target it would
+#: dither around forever.
+DEFAULT_WAKE_DEAD_ZONE_PX: float = 12.0
+
+#: Below this match confidence the selected region is treated as lost and the
+#: run reacquires or abandons it. The value is a floor against inventing a target
+#: location: a matcher that always answers finds something even when the region is
+#: gone, and this is what stops that answer being believed.
+DEFAULT_WAKE_MIN_TARGET_CONFIDENCE: float = 0.35
+
+#: Seconds to wait after an injected movement before capturing the frame the
+#: policy is allowed to judge the movement by. WAKE-001 moves the view far more
+#: often than LOOK-001 does - up to 45 movements in a run - and until this
+#: existed the loop captured the verification frame with no wait at all, so
+#: every movement was judged by the picture from *before* it happened. See
+#: ``DEFAULT_VERIFY_SETTLE_SECONDS`` for the measurement behind the number.
+DEFAULT_WAKE_VERIFY_SETTLE_SECONDS: float = DEFAULT_VERIFY_SETTLE_SECONDS
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are missing, malformed or unsafe."""
@@ -126,6 +296,48 @@ class Config:
         thought_min_interval_seconds: Hard cooldown between expressed thoughts.
         thought_max_per_minute: Ceiling on thoughts in any trailing minute.
         thought_history_max: How many recent thoughts the observer retains.
+        look_settle_seconds: Seconds to wait after a LOOK-001 movement before
+            capturing the next frame.
+        look_block_grid: Coarse partition size for the LOOK-001 difference map.
+        look_max_steps: Ceiling on planned trials in one ``look-test`` run. There
+            is no unbounded mode.
+        look_large_window_pixels: Window area above which ``look-test`` warns that
+            the target is larger than the recommended 1280x720.
+        look_calibration_deltas: Injected mouse deltas, in counts, tried in both
+            directions by ``--calibrate-horizontal`` and
+            ``--calibrate-vertical``.
+        perception_grid: Coarse partition the perception layer reads a frame
+            through.
+        perception_sigma: Robust standard deviations above a cell's learned
+            typical frame-to-frame movement that count as a change.
+        perception_floor: Lower bound, in luma levels, on any learned change
+            bound.
+        perception_fit_frames: Frames the perception layer learns "normal" from
+            before it reports anything.
+        perception_adapt_rate: Per frame, how far an unchanged cell's learned
+            baseline drifts toward the current frame. Zero freezes the model at
+            the end of its learning phase.
+        wake_salience_grid: Cells per axis for the salience map the attention
+            layer reads a frame through.
+        wake_view_grid: Cells per axis for the view fingerprint that decides
+            whether two looks are the same view.
+        wake_scan_counts: One deliberate look-around step, in mouse counts.
+        wake_max_scan_moves: SCANNING's movement budget.
+        wake_max_target_candidates: How many candidate regions may be attempted
+            before the run reports failure. One failed target may not consume the
+            whole run.
+        wake_max_center_moves: CENTERING's movement budget per candidate.
+        wake_max_moves: Total movement budget for the run.
+        wake_max_seconds: Wall-clock ceiling for the run. A movement budget alone
+            does not bound time.
+        wake_dead_zone_px: How close to the frame centre, in pixels, counts as
+            centred.
+        wake_min_target_confidence: Below this match confidence the selected
+            region is treated as lost rather than believed.
+        wake_verify_settle_seconds: Seconds to wait after an injected movement
+            before capturing the frame the policy judges that movement by. Zero
+            disables the wait, which makes every movement look like it changed
+            nothing because the capture returns the pre-movement picture.
     """
 
     target_title_patterns: tuple[str, ...] = DEFAULT_TARGET_TITLE_PATTERNS
@@ -149,6 +361,27 @@ class Config:
     thought_min_interval_seconds: float = 25.0
     thought_max_per_minute: float = 3.0
     thought_history_max: int = 20
+    look_settle_seconds: float = DEFAULT_LOOK_SETTLE_SECONDS
+    look_block_grid: int = DEFAULT_LOOK_BLOCK_GRID
+    look_max_steps: int = DEFAULT_LOOK_MAX_STEPS
+    look_large_window_pixels: int = DEFAULT_LOOK_LARGE_WINDOW_PIXELS
+    look_calibration_deltas: tuple[int, ...] = DEFAULT_LOOK_CALIBRATION_DELTAS
+    perception_grid: int = DEFAULT_PERCEPTION_GRID
+    perception_sigma: float = DEFAULT_PERCEPTION_SIGMA
+    perception_floor: float = DEFAULT_PERCEPTION_FLOOR
+    perception_fit_frames: int = DEFAULT_PERCEPTION_FIT_FRAMES
+    perception_adapt_rate: float = DEFAULT_PERCEPTION_ADAPT_RATE
+    wake_salience_grid: int = DEFAULT_WAKE_SALIENCE_GRID
+    wake_view_grid: int = DEFAULT_WAKE_VIEW_GRID
+    wake_scan_counts: int = DEFAULT_WAKE_SCAN_COUNTS
+    wake_max_scan_moves: int = DEFAULT_WAKE_MAX_SCAN_MOVES
+    wake_max_target_candidates: int = DEFAULT_WAKE_MAX_TARGET_CANDIDATES
+    wake_max_center_moves: int = DEFAULT_WAKE_MAX_CENTER_MOVES
+    wake_max_moves: int = DEFAULT_WAKE_MAX_MOVES
+    wake_max_seconds: float = DEFAULT_WAKE_MAX_SECONDS
+    wake_dead_zone_px: float = DEFAULT_WAKE_DEAD_ZONE_PX
+    wake_min_target_confidence: float = DEFAULT_WAKE_MIN_TARGET_CONFIDENCE
+    wake_verify_settle_seconds: float = DEFAULT_WAKE_VERIFY_SETTLE_SECONDS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target_title_patterns", tuple(str(p) for p in self.target_title_patterns))
@@ -172,6 +405,31 @@ class Config:
         object.__setattr__(self, "thought_min_interval_seconds", float(self.thought_min_interval_seconds))
         object.__setattr__(self, "thought_max_per_minute", float(self.thought_max_per_minute))
         object.__setattr__(self, "thought_history_max", int(self.thought_history_max))
+        object.__setattr__(self, "look_settle_seconds", float(self.look_settle_seconds))
+        object.__setattr__(self, "look_block_grid", int(self.look_block_grid))
+        object.__setattr__(self, "look_max_steps", int(self.look_max_steps))
+        object.__setattr__(self, "look_large_window_pixels", int(self.look_large_window_pixels))
+        object.__setattr__(
+            self,
+            "look_calibration_deltas",
+            tuple(int(delta) for delta in self.look_calibration_deltas),
+        )
+        object.__setattr__(self, "perception_grid", int(self.perception_grid))
+        object.__setattr__(self, "perception_sigma", float(self.perception_sigma))
+        object.__setattr__(self, "perception_floor", float(self.perception_floor))
+        object.__setattr__(self, "perception_fit_frames", int(self.perception_fit_frames))
+        object.__setattr__(self, "perception_adapt_rate", float(self.perception_adapt_rate))
+        object.__setattr__(self, "wake_salience_grid", int(self.wake_salience_grid))
+        object.__setattr__(self, "wake_view_grid", int(self.wake_view_grid))
+        object.__setattr__(self, "wake_scan_counts", int(self.wake_scan_counts))
+        object.__setattr__(self, "wake_max_scan_moves", int(self.wake_max_scan_moves))
+        object.__setattr__(self, "wake_max_target_candidates", int(self.wake_max_target_candidates))
+        object.__setattr__(self, "wake_max_center_moves", int(self.wake_max_center_moves))
+        object.__setattr__(self, "wake_max_moves", int(self.wake_max_moves))
+        object.__setattr__(self, "wake_max_seconds", float(self.wake_max_seconds))
+        object.__setattr__(self, "wake_dead_zone_px", float(self.wake_dead_zone_px))
+        object.__setattr__(self, "wake_min_target_confidence", float(self.wake_min_target_confidence))
+        object.__setattr__(self, "wake_verify_settle_seconds", float(self.wake_verify_settle_seconds))
         self._validate()
 
     # -- derived paths ----------------------------------------------------
@@ -185,6 +443,15 @@ class Config:
     def runs_dir(self) -> Path:
         """Where per-run telemetry directories are written."""
         return self.data_dir / "runs"
+
+    @property
+    def models_dir(self) -> Path:
+        """Where fitted perception models are written.
+
+        Models are artifacts of a run, not of a checkout, so they live under
+        ``data/`` alongside captures and runs and are never committed.
+        """
+        return self.data_dir / "models"
 
     @property
     def step_interval(self) -> float:
@@ -225,6 +492,27 @@ class Config:
             "thought_min_interval_seconds": self.thought_min_interval_seconds,
             "thought_max_per_minute": self.thought_max_per_minute,
             "thought_history_max": self.thought_history_max,
+            "look_settle_seconds": self.look_settle_seconds,
+            "look_block_grid": self.look_block_grid,
+            "look_max_steps": self.look_max_steps,
+            "look_large_window_pixels": self.look_large_window_pixels,
+            "look_calibration_deltas": list(self.look_calibration_deltas),
+            "perception_grid": self.perception_grid,
+            "perception_sigma": self.perception_sigma,
+            "perception_floor": self.perception_floor,
+            "perception_fit_frames": self.perception_fit_frames,
+            "perception_adapt_rate": self.perception_adapt_rate,
+            "wake_salience_grid": self.wake_salience_grid,
+            "wake_view_grid": self.wake_view_grid,
+            "wake_scan_counts": self.wake_scan_counts,
+            "wake_max_scan_moves": self.wake_max_scan_moves,
+            "wake_max_target_candidates": self.wake_max_target_candidates,
+            "wake_max_center_moves": self.wake_max_center_moves,
+            "wake_max_moves": self.wake_max_moves,
+            "wake_max_seconds": self.wake_max_seconds,
+            "wake_dead_zone_px": self.wake_dead_zone_px,
+            "wake_min_target_confidence": self.wake_min_target_confidence,
+            "wake_verify_settle_seconds": self.wake_verify_settle_seconds,
         }
 
     # -- validation -------------------------------------------------------
@@ -299,6 +587,132 @@ class Config:
             raise ConfigError(
                 f"thought_history_max must be at least 1, got {self.thought_history_max}"
             )
+        if self.look_settle_seconds <= 0:
+            raise ConfigError(
+                f"look_settle_seconds must be greater than 0, got {self.look_settle_seconds}"
+            )
+        if self.look_settle_seconds > 10:
+            raise ConfigError(
+                "look_settle_seconds must be at most 10; a longer settle lets the scene "
+                f"change for reasons other than the injected movement, got {self.look_settle_seconds}"
+            )
+        if self.look_block_grid < 1:
+            raise ConfigError(f"look_block_grid must be at least 1, got {self.look_block_grid}")
+        if self.look_max_steps < 1:
+            raise ConfigError(f"look_max_steps must be at least 1, got {self.look_max_steps}")
+        if self.look_large_window_pixels < 1:
+            raise ConfigError(
+                f"look_large_window_pixels must be at least 1, got {self.look_large_window_pixels}"
+            )
+        if not self.look_calibration_deltas:
+            raise ConfigError("look_calibration_deltas must contain at least one delta")
+        if any(delta < 1 for delta in self.look_calibration_deltas):
+            raise ConfigError(
+                "look_calibration_deltas must all be at least 1, "
+                f"got {list(self.look_calibration_deltas)}"
+            )
+        if self.perception_grid < 1:
+            raise ConfigError(f"perception_grid must be at least 1, got {self.perception_grid}")
+        if self.perception_grid > 128:
+            raise ConfigError(
+                "perception_grid must be at most 128; a finer grid gives cells too small "
+                f"to hold any texture, got {self.perception_grid}"
+            )
+        if self.perception_sigma <= 0:
+            raise ConfigError(
+                f"perception_sigma must be greater than 0, got {self.perception_sigma}"
+            )
+        if self.perception_floor < 0:
+            raise ConfigError(
+                f"perception_floor must not be negative, got {self.perception_floor}"
+            )
+        if self.perception_fit_frames < 2:
+            raise ConfigError(
+                "perception_fit_frames must be at least 2; a spread needs at least one "
+                f"frame-to-frame difference, got {self.perception_fit_frames}"
+            )
+        if not 0.0 <= self.perception_adapt_rate <= 1.0:
+            raise ConfigError(
+                "perception_adapt_rate must be between 0 and 1; it is the fraction "
+                "of the gap a quiet cell closes each frame, so a value above 1 would "
+                f"overshoot the current frame, got {self.perception_adapt_rate}"
+            )
+        if self.wake_salience_grid < 1:
+            raise ConfigError(
+                f"wake_salience_grid must be at least 1, got {self.wake_salience_grid}"
+            )
+        if self.wake_salience_grid > 64:
+            raise ConfigError(
+                "wake_salience_grid must be at most 64; the salience map is attention, "
+                "not measurement, and a grid finer than the frame's own texture turns "
+                f"noise into candidates, got {self.wake_salience_grid}"
+            )
+        if self.wake_view_grid < 1:
+            raise ConfigError(f"wake_view_grid must be at least 1, got {self.wake_view_grid}")
+        if self.wake_view_grid > 64:
+            raise ConfigError(
+                "wake_view_grid must be at most 64; the view fingerprint compares how a "
+                "scene looks in coarse blocks, and a finer grid makes two looks of the "
+                f"same place look different, got {self.wake_view_grid}"
+            )
+        if self.wake_scan_counts < 1:
+            raise ConfigError(
+                f"wake_scan_counts must be at least 1, got {self.wake_scan_counts}"
+            )
+        if self.wake_scan_counts > self.max_mouse_delta:
+            raise ConfigError(
+                "wake_scan_counts must not exceed max_mouse_delta; the safety guard "
+                "refuses a larger movement, so a larger scan step would be a request "
+                f"that is always denied, got {self.wake_scan_counts} against "
+                f"{self.max_mouse_delta}"
+            )
+        if self.wake_max_scan_moves < 1:
+            raise ConfigError(
+                f"wake_max_scan_moves must be at least 1, got {self.wake_max_scan_moves}"
+            )
+        if self.wake_max_target_candidates < 1:
+            raise ConfigError(
+                "wake_max_target_candidates must be at least 1; a run that may not "
+                f"attempt a single target cannot succeed, got {self.wake_max_target_candidates}"
+            )
+        if self.wake_max_center_moves < 1:
+            raise ConfigError(
+                f"wake_max_center_moves must be at least 1, got {self.wake_max_center_moves}"
+            )
+        if self.wake_max_moves < self.wake_max_scan_moves + self.wake_max_center_moves:
+            raise ConfigError(
+                "wake_max_moves must leave room for at least one candidate: it must be "
+                f"at least wake_max_scan_moves + wake_max_center_moves "
+                f"({self.wake_max_scan_moves} + {self.wake_max_center_moves}), "
+                f"got {self.wake_max_moves}"
+            )
+        if self.wake_max_seconds <= 0:
+            raise ConfigError(
+                "wake_max_seconds must be greater than 0; a wake run has to be bounded "
+                f"in time as well as in movements, got {self.wake_max_seconds}"
+            )
+        if self.wake_dead_zone_px < 0:
+            raise ConfigError(
+                f"wake_dead_zone_px must not be negative, got {self.wake_dead_zone_px}"
+            )
+        if not 0.0 <= self.wake_min_target_confidence <= 1.0:
+            raise ConfigError(
+                "wake_min_target_confidence must be between 0 and 1; it is compared "
+                "against a matcher's own score, so a value outside that range would "
+                f"either lose every target or believe every match, got "
+                f"{self.wake_min_target_confidence}"
+            )
+        if self.wake_verify_settle_seconds < 0:
+            raise ConfigError(
+                "wake_verify_settle_seconds must not be negative, got "
+                f"{self.wake_verify_settle_seconds}"
+            )
+        if self.wake_verify_settle_seconds > 10:
+            raise ConfigError(
+                "wake_verify_settle_seconds must be at most 10; a longer settle lets "
+                "the scene change for reasons other than the injected movement, got "
+                f"{self.wake_verify_settle_seconds}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +761,25 @@ def _as_str_list(value: Any, *, source: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _as_int_list(value: Any, *, source: str) -> tuple[int, ...]:
+    """Parse a list of positive integers from a comma-separated string or list."""
+    if isinstance(value, str):
+        items: list[Any] = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ConfigError(f"{source}: expected an integer or list of integers, got {value!r}")
+    if not items:
+        raise ConfigError(f"{source}: at least one value is required")
+    parsed: list[int] = []
+    for item in items:
+        try:
+            parsed.append(int(item))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{source}: expected an integer, got {item!r}") from exc
+    return tuple(parsed)
+
+
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
@@ -385,6 +818,33 @@ _TOML_SECTIONS: dict[str, dict[str, tuple[str, Callable[..., Any]]]] = {
         "max_per_minute": ("thought_max_per_minute", _as_float),
         "history_max": ("thought_history_max", _as_int),
     },
+    "look": {
+        "settle_seconds": ("look_settle_seconds", _as_float),
+        "block_grid": ("look_block_grid", _as_int),
+        "max_steps": ("look_max_steps", _as_int),
+        "large_window_pixels": ("look_large_window_pixels", _as_int),
+        "calibration_deltas": ("look_calibration_deltas", _as_int_list),
+    },
+    "perception": {
+        "grid": ("perception_grid", _as_int),
+        "sigma": ("perception_sigma", _as_float),
+        "floor": ("perception_floor", _as_float),
+        "fit_frames": ("perception_fit_frames", _as_int),
+        "adapt_rate": ("perception_adapt_rate", _as_float),
+    },
+    "wake": {
+        "salience_grid": ("wake_salience_grid", _as_int),
+        "view_grid": ("wake_view_grid", _as_int),
+        "scan_counts": ("wake_scan_counts", _as_int),
+        "max_scan_moves": ("wake_max_scan_moves", _as_int),
+        "max_target_candidates": ("wake_max_target_candidates", _as_int),
+        "max_center_moves": ("wake_max_center_moves", _as_int),
+        "max_moves": ("wake_max_moves", _as_int),
+        "max_seconds": ("wake_max_seconds", _as_float),
+        "dead_zone_px": ("wake_dead_zone_px", _as_float),
+        "min_target_confidence": ("wake_min_target_confidence", _as_float),
+        "verify_settle_seconds": ("wake_verify_settle_seconds", _as_float),
+    },
 }
 
 _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
@@ -409,6 +869,27 @@ _ENV_KEYS: dict[str, tuple[str, Callable[..., Any]]] = {
     "THOUGHT_MIN_INTERVAL_SECONDS": ("thought_min_interval_seconds", _as_float),
     "THOUGHT_MAX_PER_MINUTE": ("thought_max_per_minute", _as_float),
     "THOUGHT_HISTORY_MAX": ("thought_history_max", _as_int),
+    "LOOK_SETTLE_SECONDS": ("look_settle_seconds", _as_float),
+    "LOOK_BLOCK_GRID": ("look_block_grid", _as_int),
+    "LOOK_MAX_STEPS": ("look_max_steps", _as_int),
+    "LOOK_LARGE_WINDOW_PIXELS": ("look_large_window_pixels", _as_int),
+    "LOOK_CALIBRATION_DELTAS": ("look_calibration_deltas", _as_int_list),
+    "PERCEPTION_GRID": ("perception_grid", _as_int),
+    "PERCEPTION_SIGMA": ("perception_sigma", _as_float),
+    "PERCEPTION_FLOOR": ("perception_floor", _as_float),
+    "PERCEPTION_FIT_FRAMES": ("perception_fit_frames", _as_int),
+    "PERCEPTION_ADAPT_RATE": ("perception_adapt_rate", _as_float),
+    "WAKE_SALIENCE_GRID": ("wake_salience_grid", _as_int),
+    "WAKE_VIEW_GRID": ("wake_view_grid", _as_int),
+    "WAKE_SCAN_COUNTS": ("wake_scan_counts", _as_int),
+    "WAKE_MAX_SCAN_MOVES": ("wake_max_scan_moves", _as_int),
+    "WAKE_MAX_TARGET_CANDIDATES": ("wake_max_target_candidates", _as_int),
+    "WAKE_MAX_CENTER_MOVES": ("wake_max_center_moves", _as_int),
+    "WAKE_MAX_MOVES": ("wake_max_moves", _as_int),
+    "WAKE_MAX_SECONDS": ("wake_max_seconds", _as_float),
+    "WAKE_DEAD_ZONE_PX": ("wake_dead_zone_px", _as_float),
+    "WAKE_MIN_TARGET_CONFIDENCE": ("wake_min_target_confidence", _as_float),
+    "WAKE_VERIFY_SETTLE_SECONDS": ("wake_verify_settle_seconds", _as_float),
 }
 
 

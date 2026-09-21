@@ -2,35 +2,57 @@
 
 Design rule for every command here: **looking is always safe, touching is always
 explicit.** ``status``, ``capture`` and ``observe`` read pixels and print facts -
-they never inject input, so they can be run freely. ``input-test`` is the only
-command that can move the mouse or press a key, it says so before it does
-anything, and it refuses to run without ``--yes``.
+they never inject input, so they can be run freely. ``input-test``, ``look-test``
+and ``wake-test`` are the only commands that can move the mouse or press a key,
+they say so before they do anything, and they refuse to run without ``--yes``.
 
-Nothing here starts autonomous play. The only shipped decision policy is the
-no-op policy, and the loop refuses to run without an explicit bound.
+``wake-test`` is the first command that decides its own movements rather than
+executing a plan handed to it, so it also prints its whole movement budget before
+asking for confirmation. Every one of those movements is bounded by the config and
+every one of them passes through the same safety guard the simpler commands use.
+
+Nothing here starts autonomous play. ``wake-test`` is one bounded behaviour that
+ends by itself, and the loop refuses to run without an explicit bound.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import itertools
 import json
 import math
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .agent.action import Action, ActionExecutor
 from .agent.decision import NoOpDecisionPolicy
 from .agent.loop import AgentLoop
-from .agent.observation import Observer
+from .agent.observation import Observer, WindowGeometry
 from .config import Config, ConfigError, DEFAULT_CONFIG_FILENAME, load_config
+from .control.errors import ControlError, InputBlocked
 from .control.keyboard import Keyboard
 from .control.keymap import known_key_names
 from .control.mouse import Mouse
 from .control.safety import SafetyGuard
+from .look import (
+    EVENT_ERROR,
+    EVENT_INFO,
+    EVENT_OBSERVE,
+    EVENT_SAFETY,
+    EXPERIMENT_NAME,
+    TRIAL_COMPLETED,
+    FocusCheck,
+    LookRecorder,
+    LookRunner,
+    LookTrialResult,
+    MoveOutcome,
+    TrialSpec,
+)
 from .observer import (
     LoopPublisher,
     ObserverError,
@@ -40,8 +62,10 @@ from .observer import (
     publish_safety_from,
     resolve_bind_host,
 )
-from .observer.snapshot import AgentMode
-from .telemetry.recorder import RunRecorder
+from .observer.snapshot import AgentMode, EventKind, WakeReport
+from .perception import PerceptionReport, PerceptionSession, StabilityModel
+from .telemetry.recorder import RunRecord, RunRecorder
+from .thoughts.model import ThoughtEvent, ThoughtTone, ThoughtTrigger
 from .vision.capture import CaptureError, MssCaptureBackend, ScreenCapturer
 from .vision.window import (
     TargetStatus,
@@ -49,7 +73,18 @@ from .vision.window import (
     WindowError,
     WindowLocator,
     Win32WindowBackend,
+    coordinate_scaling_note,
     ensure_dpi_awareness,
+)
+from .wake import (
+    EXPERIMENT_NAME as WAKE_EXPERIMENT_NAME,
+    STATUS_ABORTED as WAKE_STATUS_ABORTED,
+    STATUS_COMPLETED as WAKE_STATUS_COMPLETED,
+    WakeDecisionPolicy,
+    WakeEvent,
+    WakeRecorder,
+    WakeResult,
+    WakeRunner,
 )
 
 __all__ = ["build_parser", "main"]
@@ -231,6 +266,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print()
         print("Target window")
         _print_table(_status_lines(status))
+        caution = coordinate_scaling_note(None if status.window is None else status.window.handle)
+        if caution:
+            print()
+            print(f"  caution - {caution}.")
         print()
         print("Subsystems")
         _print_table(
@@ -365,6 +404,7 @@ def _start_observer(
     intention: str | None = None,
     safety: Any = None,
     express_thoughts: bool = True,
+    state: ObserverState | None = None,
 ) -> tuple[ObserverServer | None, LoopPublisher | None]:
     """Start the read-only observer page for a run.
 
@@ -376,8 +416,14 @@ def _start_observer(
     A page that cannot bind its port is reported and skipped, and the pair
     ``(None, None)`` is returned. The run is the important thing and the page is
     an accessory, so a port already in use must not end an observation.
+
+    ``state`` lets a caller that needs to publish beyond the two loop callbacks -
+    ``look-test`` publishing a measurement, for instance - keep the
+    :class:`ObserverState` it will write through. The page is still built and
+    owned entirely here.
     """
-    state = ObserverState(config)
+    if state is None:
+        state = ObserverState(config)
     try:
         server = ObserverServer(
             state, host=config.observer_host, port=config.observer_port
@@ -585,6 +631,268 @@ def cmd_observe(args: argparse.Namespace) -> int:
         if observer_server is not None:
             observer_server.stop()
         runtime.close()
+
+
+def cmd_perceive_test(args: argparse.Namespace) -> int:
+    """VISION-001: learn the scene, then report every frame that surprises it.
+
+    Observation only. This command has no mouse, no keyboard, and no executor: it
+    cannot send input even if it wanted to, because nothing that injects is
+    constructed here.
+
+    The model it uses is fitted online from the run's own warm-up frames. Nothing
+    is downloaded, nothing is pretrained, and no model API is called - the whole
+    layer is a per-cell statistic computed with numpy. That is a deliberate
+    reading of the project's rules, and it is stated here so the owner can
+    disagree with it.
+    """
+    config, source = _load(args)
+    config.ensure_directories()
+    runtime = _build_runtime(config, config_source=source)
+    recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+    try:
+        status = runtime.locator.status(force=True)
+        if not status.found or status.window is None:
+            print(
+                f"no target window matched {config.target_title_patterns!r}; nothing observed",
+                file=sys.stderr,
+            )
+            return 1
+        if status.window.minimized:
+            print("the target window is minimized; nothing observed", file=sys.stderr)
+            return 1
+
+        region = status.window.region
+        warning = _large_window_warning(region.width, region.height, config)
+        if warning is not None:
+            print(warning)
+            print()
+
+        model = StabilityModel(
+            grid=config.perception_grid,
+            fit_frames=config.perception_fit_frames,
+            sigma=config.perception_sigma,
+            floor=config.perception_floor,
+            adapt_rate=config.perception_adapt_rate,
+        )
+        counter = itertools.count()
+
+        def next_frame():
+            observation = runtime.observer.observe(next(counter))
+            return observation.frame
+
+        session = PerceptionSession(model, next_frame)
+
+        print("VISION-001: LEARNED SCENE MODEL")
+        print()
+        print("  OBSERVATION ONLY: no mouse movement, no key press, no click")
+        print("  the model is fitted from this run's own frames; nothing is pretrained")
+        print()
+        bound = f"{args.seconds:g}s" if args.seconds is not None else ""
+        if args.steps is not None:
+            bound = f"{bound} or {args.steps} frame(s)" if bound else f"{args.steps} frame(s)"
+        _print_table(
+            [
+                ("target", repr(status.window.title)),
+                ("handle", f"0x{status.window.handle:X}"),
+                ("client area", f"{region.width}x{region.height}"),
+                ("grid", f"{config.perception_grid} x {config.perception_grid} cells"),
+                ("warm-up", f"{config.perception_fit_frames} frames"),
+                ("sigma", f"{config.perception_sigma:g}"),
+                ("floor", f"{config.perception_floor:g} luma levels"),
+                ("adapt rate", f"{config.perception_adapt_rate:g}"),
+                ("bound", bound),
+            ]
+        )
+        print()
+        print("Watching. Nothing will be sent at any point.")
+        print()
+
+        report = session.run(seconds=args.seconds, steps=args.steps)
+        _report_perceive(
+            report,
+            model,
+            recorder,
+            config,
+            target_title=status.window.title,
+            width=region.width,
+            height=region.height,
+        )
+        return 0
+    except KeyboardInterrupt:
+        recorder.record_error("KeyboardInterrupt", context="perceive-test")
+        recorder.finish(status="interrupted", stop_reason="Ctrl+C")
+        print("\ninterrupted by Ctrl+C; no input was sent")
+        return 130
+    finally:
+        runtime.close()
+
+
+def _report_perceive(
+    report: PerceptionReport,
+    model: StabilityModel,
+    recorder: RunRecorder,
+    config: Config,
+    *,
+    target_title: str,
+    width: int,
+    height: int,
+) -> None:
+    """Print and persist what the scene model measured."""
+    summary = report.summary()
+    print("Perception summary")
+    rows: list[tuple[str, Any]] = [
+        ("run id", recorder.run_id),
+        ("stop reason", report.stop_reason),
+        ("duration", f"{report.duration_seconds:.2f}s"),
+        ("frames", f"{len(report.rows)} ({report.warmup_frames} warm-up, "
+                   f"{report.steady_frames} scored)"),
+        ("capture failures", report.capture_failures),
+        ("grid", f"{report.grid} x {report.grid} = {report.grid * report.grid} cells"),
+    ]
+    if not report.is_complete:
+        rows.append(("result", "warm-up never completed, so no frame was scored"))
+    else:
+        rows.extend(
+            [
+                ("changed cells, mean", f"{summary['changed_cells_mean']:.2f}"),
+                ("changed cells, range", f"{summary['changed_cells_min']}"
+                                          f"..{summary['changed_cells_max']}"),
+                ("changed fraction, mean", f"{summary['changed_fraction_mean']:.4%}"),
+                ("total excess, mean", f"{summary['total_excess_mean']:.4f}"),
+                ("total excess, max", f"{summary['total_excess_max']:.4f}"),
+            ]
+        )
+    rows.append(("telemetry", recorder.directory))
+    _print_table(rows)
+
+    # Persist the measurement before printing anything else. The capture is the
+    # expensive, unrepeatable part of this command, and a formatting error in the
+    # reporting path below has already cost one live run its result file: the
+    # numbers must reach disk even if a later print statement raises. An
+    # incomplete run is persisted too - "the warm-up never finished" is itself a
+    # measurement, and `summary.complete` records which case this was.
+    payload = report.to_dict()
+    payload["run_id"] = recorder.run_id
+    payload["target"] = {"title": target_title, "client_area": [width, height]}
+    payload["config"] = {
+        "grid": config.perception_grid,
+        "sigma": config.perception_sigma,
+        "floor": config.perception_floor,
+        "fit_frames": config.perception_fit_frames,
+        "adapt_rate": config.perception_adapt_rate,
+    }
+    result_path = Path(recorder.directory) / "perceive_result.json"
+    result_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    for row in report.rows:
+        recorder.record_step(
+            {
+                "index": row.index,
+                "phase": row.phase,
+                "seconds": round(row.seconds, 4),
+                "score": None if row.score is None else row.score.to_dict(),
+            }
+        )
+
+    if not report.is_complete:
+        print()
+        print("The run ended before the model had a warm-up window, so nothing was")
+        print("scored. Raise --seconds or lower perception_fit_frames and try again.")
+        print("No input was sent.")
+        recorder.finish(status="observed", stop_reason=report.stop_reason)
+        return
+
+    print()
+    print("Where the scene moved (accumulated overshoot, one character per cell)")
+    accumulated = report.accumulated_excess()
+    for line in _render_map(accumulated):
+        print(f"  {line}")
+    print("  '.' is nothing unexpected; heavier characters are more overshoot.")
+
+    print()
+    print("Last scored frame")
+    last = report.scores[-1]
+    _print_table(
+        [
+            ("changed cells", f"{last.changed_cells} of {last.cell_count}"),
+            ("total excess", f"{last.total_excess:.4f}"),
+            ("largest overshoot", f"{last.max_excess:.4f} luma levels"),
+            ("mean deviation", f"{last.mean_deviation:.4f} luma levels"),
+            ("mean allowance", f"{last.mean_allowance:.4f} luma levels"),
+        ]
+    )
+    for line in last.excess_ascii():
+        print(f"  {line}")
+
+    print()
+    print("What the model learned")
+    _print_table(_perceive_model_rows(model))
+
+    share = model.floor_share()
+    print()
+    print(f"  {share:.1%} of the learned allowance came from the floor rather than")
+    print("  from the measured wobble of the scene. On a scene that is genuinely")
+    print("  still this is expected and correct: the floor is what stops a perfectly")
+    print("  static picture from being reported as noisy. It is printed because it")
+    print("  is also the number that would reveal a model that had learned nothing.")
+
+    record = recorder.finish(status="observed", stop_reason=report.stop_reason)
+
+    print()
+    print("No threshold was applied and no verdict was reached: read the numbers")
+    print("above and decide what they mean.")
+    print(f"Per-frame detail: {result_path}")
+    print(f"Run status: {record.status}")
+    print("No input was sent. AutoCraft is idle.")
+
+
+def _perceive_model_rows(model: StabilityModel) -> list[tuple[str, Any]]:
+    """The learned parameters, as printable rows."""
+    summary = model.summary()
+    rows: list[tuple[str, Any]] = [
+        ("grid", summary["grid"]),
+        ("fit frames", summary["fit_frames"]),
+        ("frames seen", summary["frames_seen"]),
+        ("sigma", f"{summary['sigma']:g}"),
+        ("floor", f"{summary['floor']:g} luma levels"),
+        ("adapt rate", f"{summary['adapt_rate']:g}"),
+    ]
+    fit = summary.get("fit")
+    if isinstance(fit, dict):
+        for key, value in fit.items():
+            label = key.replace("_", " ")
+            if isinstance(value, bool):
+                rows.append((label, value))
+            elif isinstance(value, int):
+                rows.append((label, value))
+            elif isinstance(value, float):
+                rows.append((label, f"{value:.6f}"))
+            elif isinstance(value, list) and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+            ):
+                rows.append((label, "[" + ", ".join(f"{item:.2e}" for item in value) + "]"))
+            elif isinstance(value, list):
+                rows.append((label, ", ".join(str(item) for item in value)))
+            else:
+                rows.append((label, value))
+    if "floor_share" in summary:
+        rows.append(("floor share", f"{summary['floor_share']:.6f}"))
+    return rows
+
+
+def _render_map(block: list[list[float]], levels: str = " .:-=+*#%@") -> list[str]:
+    """Render a grid of numbers as ASCII, scaled to its own peak."""
+    if not block or not block[0]:
+        return []
+    peak = max((abs(value) for row in block for value in row), default=0.0)
+    if peak <= 0.0:
+        return ["." * len(block[0]) for _ in block]
+    lines = []
+    for row in block:
+        lines.append(
+            "".join(levels[int(min(abs(value) / peak, 1.0) * (len(levels) - 1))] for value in row)
+        )
+    return lines
 
 
 #: Seconds the operator gets to bring the game window forward in ``input-test``.
@@ -798,6 +1106,1172 @@ def _smoke_action(args: argparse.Namespace) -> Action | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# LOOK-001
+# ---------------------------------------------------------------------------
+
+#: Client-area size above which LOOK-001 warns that the window is large.
+#: The specification's recommendation is roughly 1280x650 to 1280x720. This is a
+#: warning only: nothing here resizes, moves or reconfigures the game window,
+#: because a command that reconfigures the thing it is measuring would change the
+#: measurement.
+LOOK_RECOMMENDED_MAX_WIDTH = 1280
+LOOK_RECOMMENDED_MAX_HEIGHT = 720
+
+
+def _look_plan(args: argparse.Namespace, config: Config) -> tuple[tuple[TrialSpec, ...], str]:
+    """Build the bounded trial plan, or raise ``ValueError`` with the reason.
+
+    Every plan is finite. There is no unbounded mode, no "keep going until it
+    works", and no calibration that runs as long as it likes: the series length
+    comes from ``look_calibration_deltas`` and is capped by ``look_max_steps``.
+    """
+    settle = config.look_settle_seconds if args.settle is None else args.settle
+    if not math.isfinite(settle) or settle < 0:
+        raise ValueError(f"invalid --settle {args.settle!r}: expected a non-negative number of seconds")
+    if settle > 10:
+        raise ValueError(f"invalid --settle {settle:g}: a settle above 10s is not a bounded wait")
+
+    steps = int(args.steps)
+    if steps < 1:
+        raise ValueError(f"invalid --steps {args.steps}: at least one trial is required")
+    if steps > config.look_max_steps:
+        raise ValueError(
+            f"invalid --steps {args.steps}: the configured bound is "
+            f"look_max_steps={config.look_max_steps}"
+        )
+
+    limit = int(config.max_mouse_delta)
+
+    if args.calibrate_horizontal or args.calibrate_vertical:
+        deltas = tuple(int(value) for value in config.look_calibration_deltas)
+        if len(deltas) > config.look_max_steps:
+            raise ValueError(
+                f"look_calibration_deltas has {len(deltas)} entries, above the "
+                f"look_max_steps bound of {config.look_max_steps}"
+            )
+        # The series goes through the same per-axis bound as a single delta. The
+        # actuator refuses an oversized one anyway, but that refusal lands
+        # mid-trial, after a frame has already been captured, and it would turn
+        # the series into a row of failures with nothing to say why.
+        oversized = [delta for delta in deltas if delta > limit]
+        if oversized:
+            raise ValueError(
+                f"look_calibration_deltas contains {max(oversized)}, above "
+                f"max_mouse_delta={limit} per axis; AutoCraft refuses an "
+                "oversized movement rather than clamping it"
+            )
+        if args.calibrate_horizontal:
+            specs = tuple(
+                TrialSpec(index=index, dx=delta, dy=0, settle_seconds=settle)
+                for index, delta in enumerate(deltas)
+            )
+            return specs, f"horizontal calibration series at x deltas {list(deltas)}"
+        specs = tuple(
+            TrialSpec(index=index, dx=0, dy=delta, settle_seconds=settle)
+            for index, delta in enumerate(deltas)
+        )
+        return specs, f"vertical calibration series at y deltas {list(deltas)}"
+
+    if abs(int(args.dx)) > limit or abs(int(args.dy)) > limit:
+        raise ValueError(
+            f"delta ({args.dx}, {args.dy}) exceeds max_mouse_delta={limit} per axis; "
+            "AutoCraft refuses an oversized movement rather than clamping it"
+        )
+    if args.dx == 0 and args.dy == 0:
+        raise ValueError("delta (0, 0) would not move anything, so nothing could be measured")
+    specs = tuple(
+        TrialSpec(index=index, dx=int(args.dx), dy=int(args.dy), settle_seconds=settle)
+        for index in range(steps)
+    )
+    return specs, f"{steps} x ({args.dx:+d}, {args.dy:+d}) then the exact reverse"
+
+
+def _look_rerun_hint(args: argparse.Namespace) -> str:
+    """The exact ``look-test`` invocation that repeats this run for real.
+
+    Echoing the operator's own flags back means the suggested command is
+    copy-pasteable and cannot drift from what they actually asked for.
+    """
+    parts = ["autocraft", "look-test"]
+    if args.calibrate_horizontal:
+        parts.append("--calibrate-horizontal")
+    elif args.calibrate_vertical:
+        parts.append("--calibrate-vertical")
+    else:
+        parts += ["--dx", str(args.dx), "--dy", str(args.dy), "--steps", str(args.steps)]
+    if args.settle is not None:
+        parts += ["--settle", f"{args.settle:g}"]
+    if args.focus_delay is not None:
+        parts += ["--focus-delay", f"{args.focus_delay:g}"]
+    if args.output:
+        parts += ["--output", args.output]
+    parts.append("--yes")
+    return " ".join(parts)
+
+
+def _large_window_warning(width: int, height: int, config: Config) -> str | None:
+    """Explain an oversized client area, without doing anything about it.
+
+    A big window is not an error - the operator may want one - but a large frame
+    costs proportionally more to capture and analyse, and the extra pixels add no
+    information that a smaller window would not have carried. This reports that
+    and stops.
+    """
+    pixels = int(width) * int(height)
+    if pixels <= config.look_large_window_pixels:
+        return None
+    return (
+        f"WARNING: the client area is {width}x{height} ({pixels} pixels), above the\n"
+        f"  configured look_large_window_pixels={config.look_large_window_pixels}.\n"
+        f"  AutoCraft is recommended at about "
+        f"{LOOK_RECOMMENDED_MAX_WIDTH}x{LOOK_RECOMMENDED_MAX_HEIGHT} or smaller.\n"
+        "  AutoCraft will not resize your window - that would change the thing being\n"
+        "  measured. Resize it yourself, or raise look_large_window_pixels if you mean it."
+    )
+
+
+def _look_move(mouse: Mouse, direction: str) -> Any:
+    """Wrap :meth:`Mouse.move_relative` as a :class:`MoveOutcome` factory.
+
+    This is the only place LOOK-001 reaches the actuator, and it reaches it
+    through the existing V0 :class:`~autocraft.control.mouse.Mouse`, so the guard,
+    the rate limit, the per-axis bound and the release bookkeeping are all exactly
+    the ones the rest of AutoCraft uses. There is no second input path.
+    """
+
+    def move(dx: int, dy: int) -> MoveOutcome:
+        try:
+            mouse.move_relative(dx, dy)
+        except InputBlocked as exc:
+            return MoveOutcome(sent=False, detail=f"{direction} ({dx}, {dy}): {exc}", refused=True)
+        except (ControlError, ValueError) as exc:
+            return MoveOutcome(sent=False, detail=f"{direction} ({dx}, {dy}): {exc}")
+        except Exception as exc:  # noqa: BLE001 - a broken backend must not escape
+            return MoveOutcome(sent=False, detail=f"{direction} ({dx}, {dy}): {type(exc).__name__}: {exc}")
+        return MoveOutcome(sent=True, detail=f"{direction} ({dx}, {dy})")
+
+    return move
+
+
+def _look_event_printer(state: Any, quiet: bool):
+    """Timeline printer for the LOOK sequence, and optional observer mirror."""
+
+    def emit(message: str, kind: str) -> None:
+        if state is not None:
+            try:
+                state.publish_event(message, kind=kind)
+            except Exception:  # noqa: BLE001 - display must never break the experiment
+                pass
+        if quiet:
+            return
+        marker = {EVENT_ERROR: "!", EVENT_SAFETY: "~", EVENT_OBSERVE: ".", EVENT_INFO: "-"}.get(kind, "-")
+        print(f"  {marker} {message}", flush=True)
+
+    return emit
+
+
+def cmd_look_test(args: argparse.Namespace) -> int:
+    """LOOK-001: measure the picture's response to one known mouse movement.
+
+    The same ordering rule as ``input-test`` applies. ``look-test`` is normally
+    launched from a shell, so at the first check the *shell* is the foreground
+    window, and refusing on that would make the documented trial impossible to
+    run. So: locate and vet the target, validate the whole bounded plan, print
+    exactly what will be sent, demand ``--yes`` before any injection machinery
+    exists, and only then give the operator a window to focus the game. Focus is
+    re-checked before every single movement, and the guard re-checks it again
+    inside the actuator call.
+
+    What this command does not do: it does not resize the window, it does not
+    decide whether the result is good, and it does not claim to have learned
+    anything. It injects a known delta, measures the frames, and writes the
+    numbers down.
+    """
+    handoff = FOCUS_HANDOFF_SECONDS if args.focus_delay is None else args.focus_delay
+    if not math.isfinite(handoff) or handoff < 0:
+        print(
+            f"invalid --focus-delay {args.focus_delay!r}: expected a non-negative number of seconds",
+            file=sys.stderr,
+        )
+        return 2
+
+    config, source = _load(args)
+    config.ensure_directories()
+
+    try:
+        plan, plan_note = _look_plan(args, config)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    movements_planned = 2 * len(plan)
+
+    runtime = _build_runtime(config, config_source=source)
+    try:
+        status = runtime.locator.status(force=True)
+        if not status.found or status.window is None:
+            print(
+                f"no target window matched {config.target_title_patterns!r}; nothing sent",
+                file=sys.stderr,
+            )
+            return 1
+        if status.window.minimized:
+            print("the target window is minimized; nothing sent", file=sys.stderr)
+            return 1
+
+        target_title = status.window.title
+        target_handle = status.window.handle
+        region = status.window.region
+        window_width, window_height = region.width, region.height
+        look_dir = Path(args.output) if args.output else Path(runtime.config.runs_dir) / "look"
+
+        print("LOOK-001: MEASURED SENSORIMOTOR MAPPING")
+        print()
+        print("  LIVE INPUT WILL OCCUR: this command moves the mouse pointer")
+        print(f"  press {config.emergency_stop_key.upper()} at any time to abort and release everything")
+        print()
+        _print_table(
+            [
+                (
+                    "mode",
+                    f"LIVE - {movements_planned} mouse movement(s) will be sent"
+                    if args.yes
+                    else f"DRY RUN - {movements_planned} movement(s) planned, nothing will be sent",
+                ),
+                ("target", repr(target_title)),
+                ("handle", f"0x{target_handle:X}"),
+                ("client area", f"{window_width}x{window_height}"),
+                ("sequence", plan_note),
+                ("per trial", plan[0].describe()),
+                ("trials", f"{len(plan)} (bounded; there is no unbounded mode)"),
+                ("settle", f"{plan[0].settle_seconds:g}s between movement and capture"),
+                ("calibration", "no" if not (args.calibrate_horizontal or args.calibrate_vertical) else "yes"),
+                ("output", str(look_dir)),
+                ("observer", "shown at the end" if args.observer else "off (pass --observer to watch live)"),
+                ("config", source),
+            ]
+        )
+
+        warning = _large_window_warning(window_width, window_height, config)
+        if warning is not None:
+            print()
+            print(warning)
+
+        if not args.yes:
+            print()
+            print("refusing to send input without --yes; nothing was sent")
+            print("to run the measurement for real, re-run with --yes:")
+            print()
+            print(f"    {_look_rerun_hint(args)}")
+            return 3
+
+        guard = _build_guard(config, runtime.locator)
+        guard.install_atexit()
+        mouse = Mouse(guard, guard.backend, config)
+        recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+
+        state = ObserverState(config)
+        observer_server = None
+        publisher = None
+        if args.observer:
+            observer_server, publisher = _start_observer(
+                config,
+                run_id=recorder.run_id,
+                goal="Measure how the picture responds to one known mouse movement.",
+                intention="Inject a known delta, capture A/B/C, and record what changed.",
+                safety=lambda: publish_safety_from(guard),
+                express_thoughts=False,
+                state=state,
+            )
+        look_state = state if publisher is not None else None
+
+        emit = _look_event_printer(look_state, args.quiet)
+        look_recorder = LookRecorder(
+            look_dir,
+            run_id=recorder.run_id,
+            plan=plan,
+            target={
+                "title": target_title,
+                "handle": target_handle,
+                "width": window_width,
+                "height": window_height,
+            },
+            settings={
+                "block_grid": config.look_block_grid,
+                "max_steps": config.look_max_steps,
+                "large_window_pixels": config.look_large_window_pixels,
+                "calibration_deltas": list(config.look_calibration_deltas),
+                "max_mouse_delta": config.max_mouse_delta,
+            },
+            clock=time.time,
+        )
+
+        def verify() -> FocusCheck:
+            ready, reason = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
+            return FocusCheck(ready=ready, reason=reason)
+
+        def on_frame(frame: Any) -> None:
+            if look_state is None:
+                return
+            try:
+                look_state.publish_frame(frame, source="look-test")
+            except Exception:  # noqa: BLE001 - display must never break the experiment
+                pass
+
+        def on_trial(trial: LookTrialResult) -> None:
+            if look_state is None:
+                return
+            try:
+                look_state.publish_look(
+                    available=True,
+                    status=trial.status,
+                    experiment=EXPERIMENT_NAME,
+                    trial_count=len(plan),
+                    **trial.report_fields(),
+                )
+            except Exception:  # noqa: BLE001 - display must never break the experiment
+                pass
+
+        runner = LookRunner(
+            recorder=look_recorder,
+            capture=lambda: runtime.capturer.capture_window(status.window),
+            move=_look_move(mouse, "look-test"),
+            verify=verify,
+            stop_requested=lambda: bool(guard.stop_requested),
+            release=guard.release_all,
+            window_size=(window_width, window_height),
+            block_grid=config.look_block_grid,
+            clock=time.time,
+            sleeper=time.sleep,
+            on_event=emit,
+            on_frame=on_frame,
+            on_trial=on_trial,
+        )
+
+        result = None
+        interrupted = False
+        try:
+            guard.release_all("look-test start")
+
+            print()
+            _print_table([("run id", recorder.run_id), ("experiment", EXPERIMENT_NAME)])
+            print()
+            print("  Focus the game window now.")
+            print("  It is checked again before every movement, not just once.")
+            _focus_countdown(handoff, stream=sys.stdout)
+
+            ready, refusal = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
+            if not ready:
+                print()
+                sys.stdout.flush()
+                print(f"  refused: {refusal}", file=sys.stderr)
+                print("  nothing was sent", file=sys.stderr)
+                print(f"  hint: click into {target_title!r} during the countdown,", file=sys.stderr)
+                print("        or allow more time with --focus-delay 20", file=sys.stderr)
+                result = look_recorder.finish(status="interrupted", stop_reason=refusal)
+                exit_code = 1
+            else:
+                result = runner.run(plan)
+                exit_code = 0 if result.status == TRIAL_COMPLETED else 1
+        except KeyboardInterrupt:
+            interrupted = True
+            result = look_recorder.finish(status="interrupted", stop_reason="Ctrl+C")
+            print("\ninterrupted by Ctrl+C; releasing everything")
+            exit_code = 130
+        finally:
+            released = guard.release_all("look-test end")
+            guard.shutdown("look-test finished")
+            if result is None:
+                result = look_recorder.finish(status="interrupted", stop_reason="stopped before the sequence began")
+            recorder.record_step(
+                {
+                    "index": 0,
+                    "observation": {"window": status.to_dict()},
+                    "action": {"kind": "look-test", "plan": [spec.to_dict() for spec in plan]},
+                    "result": result.to_dict(),
+                }
+            )
+            recorder.record_safety_events(guard.events)
+            run_record = recorder.finish(
+                status="look-test",
+                stop_reason=result.stop_reason or "look-test finished",
+            )
+            if publisher is not None:
+                publisher.finish(run_record)
+            if observer_server is not None:
+                observer_server.stop()
+
+            _print_look_summary(result, released=released, telemetry=run_record.directory)
+            if interrupted:
+                print()
+                print("Nothing else will be sent. AutoCraft is idle.")
+        return exit_code
+    finally:
+        runtime.close()
+
+
+def _print_look_summary(result: Any, *, released: Sequence[str], telemetry: str) -> None:
+    """Print the measured numbers, and only the measured numbers."""
+    print()
+    print("LOOK-001 summary")
+    trials = tuple(result.trials)
+    rows: list[tuple[str, Any]] = [
+        ("experiment", result.experiment),
+        ("status", result.status),
+        ("stop reason", result.stop_reason),
+        ("trials recorded", f"{len(trials)} of {len(result.plan)}"),
+        ("movements sent", result.movements_sent),
+    ]
+    if result.duration is not None:
+        rows.append(("duration", f"{result.duration:.2f}s"))
+    rows.append(("result file", str(Path(result.directory) / "look_result.json")))
+    rows.append(("released inputs", ", ".join(released) or "none"))
+    rows.append(("telemetry", telemetry))
+    _print_table(rows)
+
+    for trial in trials:
+        print()
+        print(f"  trial {trial.spec.index + 1}: {trial.spec.describe()}")
+        _print_table(_look_trial_rows(trial))
+    print()
+    print("No pass/fail threshold was applied. Read the numbers above, and see")
+    print("look_result.json for the per-block difference map.")
+    print("Nothing else will be sent. AutoCraft is idle.")
+
+
+def _look_trial_rows(trial: Any) -> list[tuple[str, Any]]:
+    """One trial's measured primitives, formatted for the terminal."""
+    rows: list[tuple[str, Any]] = [("status", trial.status)]
+    if trial.stop_reason:
+        rows.append(("stopped because", trial.stop_reason))
+    if trial.frame_a is not None:
+        rows.append(("frame size", f"{trial.window_width}x{trial.window_height}"))
+    rows.append(("movements sent", trial.movements_sent))
+    rows.append(("capture time", f"{trial.capture_seconds * 1000:.0f} ms"))
+    if trial.a_to_b is not None:
+        rows += [
+            ("A to B mean abs diff", f"{trial.a_to_b.mean_absolute_difference:.3f} luma levels"),
+            ("A to B rmse", f"{trial.a_to_b.rmse:.3f}"),
+            ("A to B changed pixels", f"{trial.a_to_b.changed_fraction * 100:.2f}%"),
+            ("difference grid", f"{trial.a_to_b.block_grid} x {trial.a_to_b.block_grid} blocks"),
+        ]
+    if trial.a_to_c is not None:
+        rows.append(("A to C mean abs diff", f"{trial.a_to_c.mean_absolute_difference:.3f} luma levels"))
+    if trial.shift is not None:
+        if trial.shift.available:
+            rows.append(
+                ("estimated shift", f"({trial.shift.x:+.2f}, {trial.shift.y:+.2f}) px, quality {trial.shift.quality:.3f}")
+            )
+        else:
+            rows.append(("estimated shift", f"not available ({trial.shift.reason})"))
+    if trial.pixels_per_delta_x is not None:
+        rows.append(("pixels per delta x", f"{trial.pixels_per_delta_x:.4f}"))
+    if trial.pixels_per_delta_y is not None:
+        rows.append(("pixels per delta y", f"{trial.pixels_per_delta_y:.4f}"))
+    rows.append(
+        (
+            "reversibility",
+            "not defined (A and B were indistinguishable)"
+            if trial.reversibility_ratio is None
+            else f"{trial.reversibility_ratio:.3f}",
+        )
+    )
+    if trial.reversibility_note:
+        rows.append(("note", trial.reversibility_note))
+    for name, path in trial.artifacts.items():
+        rows.append((f"file {name}", path))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# WAKE-001: wake up, look around, notice something, turn toward it, stop
+# ---------------------------------------------------------------------------
+
+#: The panel fields a :class:`WakeReport` will accept, read off the dataclass
+#: itself. The policy's report carries more than the panel needs (run timing,
+#: the verdict) and less than it needs (the window size, the run id), so the
+#: mapping is done by name and filtered here rather than by hand-written list
+#: that could drift the moment either side gains a field.
+_WAKE_PANEL_FIELDS: frozenset[str] = frozenset(
+    field.name for field in dataclasses.fields(WakeReport)
+) - {
+    # Passed explicitly by the publisher, so they must not also arrive through
+    # the filtered report: a duplicate keyword would raise inside the display
+    # path, where the failure is deliberately swallowed, and the panel would
+    # then silently never update.
+    "available",
+    "status",
+    "experiment",
+    "run_id",
+    "window_width",
+    "window_height",
+    "state",
+    "stop_reason",
+}
+
+
+def _wake_panel_fields(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the policy's flat report onto the fields the panel understands."""
+    return {key: value for key, value in report.items() if key in _WAKE_PANEL_FIELDS}
+
+
+def _wake_rerun_hint(args: argparse.Namespace) -> str:
+    """The exact ``wake-test`` invocation that repeats this run for real."""
+    parts = ["autocraft", "wake-test"]
+    if args.observer:
+        parts.append("--observer")
+    if args.quiet:
+        parts.append("--quiet")
+    if args.focus_delay is not None:
+        parts += ["--focus-delay", f"{args.focus_delay:g}"]
+    parts.append("--yes")
+    return " ".join(parts)
+
+
+def _wake_event_printer(state: ObserverState | None, quiet: bool) -> Any:
+    """Print WAKE events as they happen, and mirror them to the page when live.
+
+    The panel write is wrapped because the page is an accessory: a broken display
+    must not be able to stop a run that is otherwise doing what it was asked.
+    """
+
+    def emit(event: WakeEvent) -> None:
+        if not quiet:
+            print(f"  . {event.message or event.describe()}")
+            sys.stdout.flush()
+        if state is None:
+            return
+        try:
+            state.publish_event(event.message or event.describe(), kind=EventKind.ACTION)
+        except Exception:  # noqa: BLE001 - display must never break the run
+            pass
+
+    return emit
+
+
+def _wake_publisher(state: ObserverState | None, *, run_id: str, window: tuple[int, int]) -> Any:
+    """Build the ``on_status`` callback that refreshes the WAKE panel per step."""
+    if state is None:
+        return None
+
+    def publish(report: Mapping[str, Any]) -> None:
+        try:
+            state.publish_wake(
+                available=True,
+                status="running",
+                state=str(report.get("state", "")),
+                run_id=run_id,
+                window_width=window[0],
+                window_height=window[1],
+                stop_reason=str(report.get("stop_reason", "")),
+                **_wake_panel_fields(report),
+            )
+        except Exception:  # noqa: BLE001 - display must never break the run
+            pass
+
+    return publish
+
+
+def _wake_plan(config: Config) -> list[tuple[str, Any]]:
+    """What ``wake-test`` will and will not do, in the order it will do it."""
+    return [
+        (
+            "behaviour",
+            f"look around (max {config.wake_max_scan_moves} scans of "
+            f"{config.wake_scan_counts} counts), pick 1 of up to "
+            f"{config.wake_max_target_candidates} salient regions, centre it",
+        ),
+        (
+            "movement budget",
+            f"{config.wake_max_moves} mouse movement(s) maximum - there is no unbounded mode",
+        ),
+        (
+            "centring budget",
+            f"{config.wake_max_center_moves} correction(s) per candidate, "
+            f"dead zone {config.wake_dead_zone_px:g} px",
+        ),
+        ("time limit", f"{config.wake_max_seconds:g}s"),
+        ("confidence floor", f"{config.wake_min_target_confidence:g} (below this the target is dropped, not guessed)"),
+        ("keyboard", "none - this command never presses a key"),
+        ("game state read", "none - pixels in, mouse movements out"),
+    ]
+
+
+def _wake_plan_payload(config: Config) -> list[dict[str, str]]:
+    """The plan in the shape the run telemetry stores it.
+
+    ``_wake_plan`` yields ``(label, text)`` pairs, which is what the printed
+    table wants. The record wants one object per step: a list of single-key
+    objects is unreadable, and a list of bare pairs loses the labels.
+
+    This is a separate function rather than a comprehension at the call site
+    because the two shapes are easy to confuse, and confusing them fails in a
+    way that names neither. ``dict(row)`` on a ``(label, text)`` pair does not
+    build ``{label: text}`` - it treats the pair as a sequence of key/value
+    pairs and tries to unpack the label itself. That is how a nine-character
+    label produced ``dictionary update sequence element #0 has length 9; 2 is
+    required`` during the first live wake-test run, after the behaviour had
+    already finished and stopped.
+    """
+    return [{"step": str(label), "detail": str(text)} for label, text in _wake_plan(config)]
+
+
+def _note_reporting_failure(what: str, exc: BaseException) -> None:
+    """Say that reporting failed without letting it stop anything else.
+
+    Reporting is not the run. A finished measurement must still be handed to
+    the operator, the input must still be released, and the observer must still
+    be stopped - so a failure here is printed and stepped over.
+    """
+    print(f"warning: {what} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def _finish_wake_run_recorder(
+    recorder: RunRecorder, result: WakeResult, guard: Any, *, owned: bool
+) -> RunRecord | None:
+    """Sweep any unrecorded safety events, then close out the run telemetry.
+
+    The order is release, sweep, finalize, close - and nothing may append after
+    the close. The agent loop performs all of it from its own ``finally`` block
+    when it runs, so on the normal path there is nothing left to sweep and the
+    ``finish`` below is the idempotent second call that hands back the same
+    record.
+
+    ``owned`` says whether this command owns the shutdown. It does when the
+    behaviour never ran - a refusal, or an error on the way in - and then the
+    safety events in ``guard`` have never been written and must be. When the loop
+    did run, it already recorded the tail it produced, and appending here would
+    both duplicate what it wrote and, since it also closed the recorder, raise
+    ``run ... is already closed``. That warning was the whole of the second live
+    run's cleanup defect: the sweep was unconditional, so the successful path
+    always tried to write to a closed recorder.
+
+    The sweep is also passed the whole event list rather than a slice, because it
+    only runs on the path where the loop never got to record anything.
+    """
+    run_record: RunRecord | None = None
+    if owned and not recorder.closed:
+        try:
+            recorder.record_safety_events(guard.events)
+        except Exception as exc:  # noqa: BLE001 - telemetry must not break the run
+            _note_reporting_failure("the final safety sweep", exc)
+    try:
+        run_record = recorder.finish(
+            status="wake-test",
+            stop_reason=result.stop_reason or "wake-test finished",
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break the run
+        _note_reporting_failure("the run telemetry summary", exc)
+    return run_record
+
+
+def _present_wake_outcome(
+    result: WakeResult,
+    *,
+    run_record: RunRecord | None,
+    wake_state: Any,
+    publisher: Any,
+    observer_server: Any,
+    policy: WakeDecisionPolicy,
+    window: tuple[int, int],
+    released: bool,
+    interrupted: bool,
+) -> None:
+    """Publish, stop, and print - each attempted on its own.
+
+    Every piece here is presentation or cleanup, and none of them is allowed to
+    skip the others. On the first live wake-test run a single presentational
+    exception inside the finalisation block skipped the observer shutdown and
+    the whole printed summary, so the operator saw a traceback instead of the
+    numbers the run had already measured and saved.
+    """
+    if wake_state is not None:
+        try:
+            wake_state.publish_wake(
+                available=True,
+                status=result.status,
+                state=result.state,
+                run_id=run_record.run_id if run_record is not None else "",
+                window_width=window[0],
+                window_height=window[1],
+                stop_reason=result.stop_reason,
+                **_wake_panel_fields(policy.report()),
+            )
+        except Exception as exc:  # noqa: BLE001 - display must never break the run
+            _note_reporting_failure("the live panel update", exc)
+    if publisher is not None:
+        try:
+            if run_record is not None:
+                publisher.finish(run_record)
+        except Exception as exc:  # noqa: BLE001 - display must never break the run
+            _note_reporting_failure("the observer publisher", exc)
+    if observer_server is not None:
+        try:
+            observer_server.stop()
+        except Exception as exc:  # noqa: BLE001 - cleanup must never break the run
+            _note_reporting_failure("stopping the observer server", exc)
+    try:
+        _print_wake_summary(
+            result,
+            released=released,
+            telemetry=run_record.directory if run_record is not None else "",
+        )
+    except Exception as exc:  # noqa: BLE001 - the summary is reporting, not the run
+        _note_reporting_failure("the summary", exc)
+    if interrupted:
+        print()
+        print("Nothing else will be sent. AutoCraft is idle.")
+
+
+def cmd_wake_test(args: argparse.Namespace) -> int:
+    """WAKE-001: wake up, look around, turn toward something that stands out.
+
+    The same ordering rule as ``look-test`` applies, and it matters more here
+    because this is the first command that decides its own movements. ``wake-test``
+    is launched from a shell, so at the first check the *shell* is the foreground
+    window and refusing on that would make the demo impossible to run. So: locate
+    and vet the target, print the entire bounded plan, demand ``--yes`` before any
+    injection machinery exists, and only then give the operator a window to focus
+    the game. Focus is re-checked before every movement.
+
+    What this command does not do: it does not resize the window, it does not know
+    what anything on screen *is*, and it does not claim the region it picks is
+    meaningful. It picks a region that differs from its neighbours, turns toward
+    it, and writes down what happened.
+    """
+    handoff = FOCUS_HANDOFF_SECONDS if args.focus_delay is None else args.focus_delay
+    if not math.isfinite(handoff) or handoff < 0:
+        print(
+            f"invalid --focus-delay {args.focus_delay!r}: expected a non-negative number of seconds",
+            file=sys.stderr,
+        )
+        return 2
+
+    config, source = _load(args)
+    config.ensure_directories()
+
+    runtime = _build_runtime(config, config_source=source)
+    try:
+        status = runtime.locator.status(force=True)
+        if not status.found or status.window is None:
+            print(
+                f"no target window matched {config.target_title_patterns!r}; nothing sent",
+                file=sys.stderr,
+            )
+            return 1
+        if status.window.minimized:
+            print("the target window is minimized; nothing sent", file=sys.stderr)
+            return 1
+
+        target_title = status.window.title
+        target_handle = status.window.handle
+        region = status.window.region
+        window_width, window_height = region.width, region.height
+        wake_dir = Path(runtime.config.runs_dir) / "wake"
+
+        # The geometry printed above and written into the plan was sampled now,
+        # before the focus countdown. The run's own observations are sampled after
+        # it, by a different component. Priming the observer with this answer is
+        # what makes the first observation able to say whether the two agree, and
+        # a live run has already been recorded where they did not.
+        runtime.observer.seed_geometry(
+            WindowGeometry.of(handle=target_handle, region=region)
+        )
+
+        print("WAKE-001: WAKE UP, LOOK AROUND, TURN TOWARD SOMETHING")
+        print()
+        print("  LIVE INPUT WILL OCCUR: this command moves the mouse pointer on its own")
+        print(f"  press {config.emergency_stop_key.upper()} at any time to abort and release everything")
+        print()
+        _print_table(
+            [
+                (
+                    "mode",
+                    f"LIVE - up to {config.wake_max_moves} mouse movement(s) will be sent"
+                    if args.yes
+                    else f"DRY RUN - up to {config.wake_max_moves} movement(s) planned, nothing will be sent",
+                ),
+                ("target", repr(target_title)),
+                ("handle", f"0x{target_handle:X}"),
+                ("client area", f"{window_width}x{window_height}"),
+            ]
+            + _wake_plan(config)
+            + [
+                ("output", str(wake_dir)),
+                ("observer", "live" if args.observer else "off (pass --observer to watch live)"),
+                ("config", source),
+            ]
+        )
+
+        warning = _large_window_warning(window_width, window_height, config)
+        if warning is not None:
+            print()
+            print(warning)
+
+        if not args.yes:
+            print()
+            print("refusing to send input without --yes; nothing was sent")
+            print("to run the behaviour for real, re-run with --yes:")
+            print()
+            print(f"    {_wake_rerun_hint(args)}")
+            return 3
+
+        guard = _build_guard(config, runtime.locator)
+        guard.install_atexit()
+        mouse = Mouse(guard, guard.backend, config)
+        keyboard = Keyboard(guard, guard.backend, config)
+        executor = ActionExecutor(keyboard, mouse)
+        recorder = RunRecorder.new_run(config.runs_dir, config=config.to_dict())
+        # Record what this command intends *before* anything moves. The agent
+        # loop writes run.json and closes the recorder when the behaviour ends,
+        # so a step appended afterwards is rejected - and a rejected append must
+        # never be what stops the run from being finalized. Writing it here is
+        # also the honest order: this row describes the plan, not the outcome.
+        # The outcome is the steps the loop appends below it, plus the
+        # measurement in wake_result.json. Index -1 keeps this row ahead of the
+        # loop's step 0 instead of colliding with it.
+        recorder.record_step(
+            {
+                "index": -1,
+                "observation": {"window": status.to_dict()},
+                "action": {"kind": "wake-test", "plan": _wake_plan_payload(config)},
+            }
+        )
+
+        state = ObserverState(config)
+        observer_server = None
+        publisher = None
+        if args.observer:
+            observer_server, publisher = _start_observer(
+                config,
+                run_id=recorder.run_id,
+                goal="Wake up, look around, and turn toward something that stands out.",
+                intention="Scan a few views, pick a salient region, centre it, and stop.",
+                safety=lambda: publish_safety_from(guard),
+                express_thoughts=False,
+                state=state,
+            )
+        wake_state = state if publisher is not None else None
+
+        policy = WakeDecisionPolicy(
+            salience_grid=config.wake_salience_grid,
+            view_grid=config.wake_view_grid,
+            scan_counts=config.wake_scan_counts,
+            max_scan_moves=config.wake_max_scan_moves,
+            max_target_candidates=config.wake_max_target_candidates,
+            max_center_moves=config.wake_max_center_moves,
+            max_moves=config.wake_max_moves,
+            max_mouse_delta=config.max_mouse_delta,
+            dead_zone_px=config.wake_dead_zone_px,
+            min_target_confidence=config.wake_min_target_confidence,
+            thought_hook=None if wake_state is None else _wake_thought_hook(wake_state),
+        )
+
+        wake_recorder = WakeRecorder(
+            wake_dir,
+            run_id=recorder.run_id,
+            plan={
+                "title": target_title,
+                "handle": target_handle,
+                "width": window_width,
+                "height": window_height,
+            },
+            settings={
+                "salience_grid": config.wake_salience_grid,
+                "view_grid": config.wake_view_grid,
+                "scan_counts": config.wake_scan_counts,
+                "max_scan_moves": config.wake_max_scan_moves,
+                "max_target_candidates": config.wake_max_target_candidates,
+                "max_center_moves": config.wake_max_center_moves,
+                "max_moves": config.wake_max_moves,
+                "max_seconds": config.wake_max_seconds,
+                "dead_zone_px": config.wake_dead_zone_px,
+                "min_target_confidence": config.wake_min_target_confidence,
+            },
+            clock=time.time,
+        )
+
+        def on_observation(observation: Any) -> None:
+            if wake_state is None:
+                return
+            try:
+                if observation.has_frame:
+                    wake_state.publish_frame(observation.frame, source="wake-test")
+            except Exception:  # noqa: BLE001 - display must never break the run
+                pass
+
+        runner = WakeRunner(
+            config=config,
+            observer=runtime.observer,
+            guard=guard,
+            policy=policy,
+            recorder=wake_recorder,
+            executor=executor,
+            run_recorder=recorder,
+            max_seconds=config.wake_max_seconds,
+            clock=time.time,
+            sleeper=time.sleep,
+            on_event=_wake_event_printer(wake_state, args.quiet),
+            on_status=_wake_publisher(
+                wake_state, run_id=recorder.run_id, window=(window_width, window_height)
+            ),
+        )
+
+        result: WakeResult | None = None
+        interrupted = False
+        # Whether the agent loop ran to completion. The loop performs the whole
+        # release-sweep-finalize-close sequence itself, so when it did, this
+        # command must not try to sweep again into a recorder that has closed.
+        behaviour_ran = False
+        try:
+            guard.release_all("wake-test start")
+
+            print()
+            _print_table([("run id", recorder.run_id), ("experiment", WAKE_EXPERIMENT_NAME)])
+            print()
+            caution = coordinate_scaling_note(target_handle)
+            if caution:
+                print(f"  caution - {caution}.")
+                print("  the run is still recorded, but what it looks at may not be the game.")
+                print()
+            print("  Focus the game window now.")
+            print("  It is checked again before every movement, not just once.")
+            _focus_countdown(handoff, stream=sys.stdout)
+
+            ready, refusal = _confirm_target_focus(runtime.locator, expected_handle=target_handle)
+            if not ready:
+                print()
+                sys.stdout.flush()
+                print(f"  refused: {refusal}", file=sys.stderr)
+                print("  nothing was sent", file=sys.stderr)
+                print(f"  hint: click into {target_title!r} during the countdown,", file=sys.stderr)
+                print("        or allow more time with --focus-delay 20", file=sys.stderr)
+                result = wake_recorder.finish(
+                    status=WAKE_STATUS_ABORTED, stop_reason=refusal, state=policy.state.value
+                )
+                exit_code = 1
+            else:
+                result = runner.run()
+                behaviour_ran = True
+                exit_code = 0 if result.status == WAKE_STATUS_COMPLETED else 1
+        except KeyboardInterrupt:
+            interrupted = True
+            result = wake_recorder.finish(
+                status=WAKE_STATUS_ABORTED, stop_reason="Ctrl+C", state=policy.state.value
+            )
+            print("\ninterrupted by Ctrl+C; releasing everything")
+            exit_code = 130
+        finally:
+            # Order matters, and it is the whole point of this block, because it
+            # is the order the telemetry contract requires:
+            #
+            #   1. the behaviour has ended
+            #   2. release held input
+            #   3. record the final safety events
+            #   4. finalize the required run telemetry
+            #   5. close the recorder
+            #   6. and only then, nonessential presentation
+            #
+            # Releasing input is safety, not reporting, so it goes first and
+            # unguarded. ``shutdown`` records a lifecycle event, so it has to
+            # precede the sweep that is supposed to capture it. The measurement
+            # (wake_result.json) is finalized before any reporting is attempted.
+            # Reporting then happens through helpers that attempt each piece
+            # separately, so one presentational failure can no longer skip the
+            # observer shutdown or the printed summary - which is exactly what
+            # happened on the first live run.
+            released = guard.release_all("wake-test end")
+            guard.shutdown("wake-test finished")
+            if result is None:
+                result = wake_recorder.finish(
+                    status=WAKE_STATUS_ABORTED,
+                    stop_reason="stopped before the behaviour began",
+                    state=policy.state.value,
+                )
+            run_record = _finish_wake_run_recorder(recorder, result, guard, owned=not behaviour_ran)
+            _present_wake_outcome(
+                result,
+                run_record=run_record,
+                wake_state=wake_state,
+                publisher=publisher,
+                observer_server=observer_server,
+                policy=policy,
+                window=(window_width, window_height),
+                released=released,
+                interrupted=interrupted,
+            )
+        return exit_code
+    finally:
+        runtime.close()
+
+
+def _wake_thought_hook(state: ObserverState) -> Any:
+    """A display-only thought sink. Nothing reads these back.
+
+    The behaviour layer hands over a one-word mood and a ready-made sentence. The
+    sentence is passed through unchanged and the mood only picks the tone, so the
+    thought model is not asked to invent anything about what the agent is seeing.
+    """
+    tones = {member.value: member for member in ThoughtTone}
+
+    def hook(mood: str, text: str) -> None:
+        try:
+            state.publish_thought(
+                ThoughtEvent(
+                    text=str(text),
+                    tone=tones.get(str(mood), ThoughtTone.NEUTRAL),
+                    trigger_type=ThoughtTrigger.DISCOVERY,
+                    trigger_reference="wake-001",
+                    generated_by="wake-template",
+                )
+            )
+        except Exception:  # noqa: BLE001 - display must never break the run
+            pass
+
+    return hook
+
+
+def _wake_progress_series(progress: Sequence[float]) -> str:
+    """Render the distance series as a single arrow chain, oldest first."""
+    if not progress:
+        return "not measured"
+    return " -> ".join(f"{float(value):g}" for value in progress)
+
+
+def _wake_cadence_rows(cadence: Mapping[str, float]) -> list[tuple[str, str]]:
+    """Turn the measured cadence into printable rows, or nothing at all.
+
+    Nothing is printed for a run that took no timed steps, because a table of
+    dashes reads like a measurement that came back zero.
+    """
+    if not cadence:
+        return []
+    labels = (
+        ("capture_mean", "mean capture"),
+        ("decide_mean", "mean decision"),
+        ("act_mean", "mean movement"),
+        ("verify_mean", "mean verify"),
+        ("verify_settle_mean", "mean of that spent waiting to redraw"),
+        ("since_previous_move_mean", "mean gap between movements"),
+        ("total_mean", "mean step time"),
+    )
+    rows = [(label, f"{cadence[key]:.1f} ms") for key, label in labels if key in cadence]
+    if not rows:
+        return []
+    steps = int(cadence.get("steps_timed", 0))
+    moves = int(cadence.get("moves_timed", 0))
+    rows.append(("measured over", f"{steps} step(s), {moves} movement(s)"))
+    return rows
+
+
+def _print_wake_summary(result: WakeResult, *, released: bool, telemetry: Any) -> None:
+    """Print what the run measured, and no verdict about it."""
+    print()
+    print("WAKE-001 summary")
+    _print_table(
+        [
+            ("experiment", result.experiment),
+            ("status", result.status),
+            ("state", result.state),
+            ("stop reason", result.summary_line),
+            ("run id", result.run_id),
+            ("duration", f"{result.duration:.2f}s"),
+            ("result file", str(Path(result.directory) / "wake_result.json")),
+            (
+                "successful completion",
+                "not judged (the run never reached a terminal state)"
+                if result.successful_completion is None
+                else ("yes" if result.successful_completion else "no"),
+            ),
+            ("movements sent", f"{result.moves_sent} of {result.max_moves} allowed"),
+            ("scan moves", result.scan_moves),
+            ("centring moves", result.centering_moves),
+            ("unique views", f"{result.unique_views} ({result.revisited_views} revisits)"),
+            ("candidate regions", result.candidate_count),
+            ("target changes", result.target_changes),
+            ("overshoots", result.overshoots),
+            ("failed strategies", result.failed_strategies),
+            (
+                "stuck patterns",
+                f"{result.stuck_patterns_detected} detected, {result.stuck_patterns_broken} broken",
+            ),
+        ]
+    )
+
+    rows: list[tuple[str, Any]] = []
+    if result.window_width and result.window_height:
+        rows.append(("frame size", f"{result.window_width}x{result.window_height}"))
+    if result.target_centre is not None:
+        rows.append(("target centre", f"({result.target_centre[0]:.1f}, {result.target_centre[1]:.1f}) px"))
+    if result.target_bbox is not None:
+        rows.append(("target bbox", "({}, {}, {}, {})".format(*result.target_bbox)))
+    if result.target_salience is not None:
+        rows.append(("target salience", f"{result.target_salience:.3f}"))
+    if result.final_target_offset is not None:
+        rows.append(
+            (
+                "final target offset",
+                f"({result.final_target_offset[0]:+.1f}, {result.final_target_offset[1]:+.1f}) px",
+            )
+        )
+    if result.final_target_distance is not None:
+        rows.append(("final distance", f"{result.final_target_distance:.1f} px from centre"))
+    if result.confidence is not None:
+        rows.append(("match confidence", f"{result.confidence:.3f}"))
+    rows.append(("progress", _wake_progress_series(result.progress)))
+    if result.strategy:
+        rows.append(("last strategy", result.strategy))
+    if result.mapping_source == "unmeasured":
+        rows.append(
+            (
+                "mouse mapping",
+                "unmeasured - corrections were sized by a fixed band count, "
+                "so the agent did not know how far a count would move the view",
+            )
+        )
+    else:
+        rows.append(
+            (
+                "mouse mapping",
+                f"{result.mapping_source} "
+                f"{result.pixels_per_delta_x if result.pixels_per_delta_x is not None else '-'} px/count x, "
+                f"{result.pixels_per_delta_y if result.pixels_per_delta_y is not None else '-'} px/count y",
+            )
+        )
+    if result.dead_repetition_ratio is not None:
+        rows.append(("dead repetition", f"{result.dead_repetition_ratio:.3f}"))
+    if result.productive_repetition_ratio is not None:
+        rows.append(("productive repetition", f"{result.productive_repetition_ratio:.3f}"))
+    rows.append(("released inputs", "none" if not released else ", ".join(released)))
+    rows.append(("telemetry", telemetry))
+    cadence = _wake_cadence_rows(result.cadence)
+    if rows:
+        print()
+        _print_table(rows)
+    if cadence:
+        print()
+        _print_table(cadence)
+
+    lines = result.stream_lines()
+    if lines:
+        print()
+        print("  what it did, in its own words:")
+        for line in lines:
+            print(f"  - {line}")
+
+    if result.notes:
+        print()
+        print("  notes recorded with the result:")
+        for note in result.notes:
+            print(f"  - {note}")
+
+    print()
+    print("No pass/fail threshold was applied. Read the numbers above, and see")
+    print("wake_result.json for the per-event detail.")
+    print("Nothing else will be sent. AutoCraft is idle.")
+
+
 def cmd_loop(args: argparse.Namespace) -> int:
     """Run the bounded agent loop. V0's only policy is no-op."""
     config, source = _load(args)
@@ -934,7 +2408,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="autocraft",
         description=(
             "AutoCraft V0: a pixel-in, human-controls-out foundation for an embodied agent. "
-            "Observation commands never send input; only 'input-test' can, and only with --yes."
+            "Observation commands never send input; only 'input-test', 'look-test' and "
+            "'wake-test' can, and only with --yes."
         ),
     )
     parser.add_argument("--version", action="version", version=f"autocraft {__version__}")
@@ -963,6 +2438,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="also serve the read-only observer page for this run (never enables input)",
     )
     p_observe.set_defaults(func=cmd_observe)
+
+    p_perceive = sub.add_parser(
+        "perceive-test",
+        help="learn the scene from live frames and report what changed (never sends input)",
+    )
+    p_perceive.add_argument("--seconds", type=float, default=30.0, help="how long to watch (default: 30)")
+    p_perceive.add_argument("--steps", type=int, default=None, help="stop after this many frames")
+    p_perceive.set_defaults(func=cmd_perceive_test)
 
     p_loop = sub.add_parser("loop", help="run the bounded agent loop (V0 policy is no-op)")
     p_loop.add_argument("--steps", type=int, default=5, help="maximum loop iterations (default: 5)")
@@ -1016,6 +2499,82 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_input.add_argument("--yes", action="store_true", help="required confirmation; without it nothing is sent")
     p_input.set_defaults(func=cmd_input_test)
+
+    p_look = sub.add_parser(
+        "look-test",
+        help="LOOK-001: inject one known mouse movement and measure how far the picture moved",
+    )
+    p_look.add_argument("--dx", type=int, default=10, help="x delta to inject per trial (default: 10)")
+    p_look.add_argument("--dy", type=int, default=0, help="y delta to inject per trial (default: 0)")
+    p_look.add_argument(
+        "--steps",
+        type=int,
+        default=1,
+        help="how many identical trials to run (default: 1; capped by config look_max_steps)",
+    )
+    p_look.add_argument(
+        "--settle",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="seconds to let the picture settle between a movement and its capture (default: config look_settle_seconds)",
+    )
+    p_look.add_argument(
+        "--focus-delay",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "seconds to wait for you to focus the game before the final foreground "
+            f"check (default: {FOCUS_HANDOFF_SECONDS:g})"
+        ),
+    )
+    p_look.add_argument(
+        "--output",
+        metavar="PATH",
+        help="directory for the frames and look_result.json (default: <runs dir>/look)",
+    )
+    look_calibration = p_look.add_mutually_exclusive_group()
+    look_calibration.add_argument(
+        "--calibrate-horizontal",
+        action="store_true",
+        help="run the bounded x calibration series instead of a single delta",
+    )
+    look_calibration.add_argument(
+        "--calibrate-vertical",
+        action="store_true",
+        help="run the bounded y calibration series instead of a single delta",
+    )
+    p_look.add_argument("--observer", action="store_true", help="also serve the read-only observer page for this run")
+    p_look.add_argument("--quiet", action="store_true", help="do not print per-step progress")
+    p_look.add_argument("--yes", action="store_true", help="required confirmation; without it nothing is sent")
+    p_look.set_defaults(func=cmd_look_test)
+
+    p_wake = sub.add_parser(
+        "wake-test",
+        help="WAKE-001: look around, pick a region that stands out, turn toward it, and stop",
+        description=(
+            "Wake up, look around, notice a visually salient region, turn toward it, "
+            "centre it, and stop. This command chooses its own mouse movements, so it "
+            "says what it will do, prints the whole movement budget, and refuses to run "
+            "without --yes. It never presses a key and never reads game state: pixels "
+            "in, mouse movements out."
+        ),
+    )
+    p_wake.add_argument(
+        "--focus-delay",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "seconds to wait for you to focus the game before the final foreground "
+            f"check (default: {FOCUS_HANDOFF_SECONDS:g})"
+        ),
+    )
+    p_wake.add_argument("--observer", action="store_true", help="also serve the read-only observer page for this run")
+    p_wake.add_argument("--quiet", action="store_true", help="do not print per-step progress")
+    p_wake.add_argument("--yes", action="store_true", help="required confirmation; without it nothing is sent")
+    p_wake.set_defaults(func=cmd_wake_test)
 
     p_keys = sub.add_parser("keys", help="list supported key names")
     p_keys.add_argument("--json", action="store_true", help="emit JSON")
