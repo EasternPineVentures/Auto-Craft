@@ -34,6 +34,8 @@ class WindowGeometry:
     """
 
     handle: int | None = None
+    # Zero means "not measured", not "measured as zero". The seed is taken
+    # before the first capture, so it has a client area and no frame yet.
     client_width: int = 0
     client_height: int = 0
     frame_width: int = 0
@@ -41,7 +43,11 @@ class WindowGeometry:
 
     @property
     def empty(self) -> bool:
-        """True when this records no window and no frame at all."""
+        """True when this records no window and no frame at all.
+
+        All-or-nothing, so it cannot speak for a geometry that measured some of
+        its fields. ``changes_from`` compares field by field for that reason.
+        """
         return (
             self.handle is None
             and self.client_width == 0
@@ -66,20 +72,35 @@ class WindowGeometry:
         An empty geometry on either side is not a change. Losing sight of the
         window for a step and getting it back has not resized anything, and
         reporting it as a geometry change would bury the real one in noise.
+
+        Neither is a field only one side ever measured. Zero is how this type
+        spells "not known", and the seed is taken before the first capture, so it
+        carries a 0x0 frame. Comparing that 0x0 against the first real frame
+        reports a change that did not happen, and it did so on every run: the
+        first event of the third live WAKE-001 run was ``WINDOW_GEOMETRY_CHANGED``
+        with ``before.frame_width 0`` and ``after.frame_width 2102``, while the
+        client area was 2102x1061 on both sides and had not moved at all.
+
+        That is not only noise. The event calls ``_rebaseline_after_resize``,
+        which discards the view memory, the progress model, the repetition guard,
+        the strategy cooldowns and the measured calibration, so a step that
+        happened to capture no frame would silently wipe the run's state.
+
+        The client area is still compared whenever both sides measured it, which
+        is what catches the disagreement this instrumentation exists for: the
+        second live run reported a 3222-pixel client area and a 3591-pixel frame,
+        and that is a ``client_width`` change with a real number on both sides.
         """
         if self.empty or other.empty:
             return ()
         changed = []
-        if self.handle != other.handle:
+        if self.handle is not None and other.handle is not None and self.handle != other.handle:
             changed.append("handle")
-        if self.client_width != other.client_width:
-            changed.append("client_width")
-        if self.client_height != other.client_height:
-            changed.append("client_height")
-        if self.frame_width != other.frame_width:
-            changed.append("frame_width")
-        if self.frame_height != other.frame_height:
-            changed.append("frame_height")
+        for name in ("client_width", "client_height", "frame_width", "frame_height"):
+            mine = getattr(self, name)
+            theirs = getattr(other, name)
+            if mine and theirs and mine != theirs:
+                changed.append(name)
         return tuple(changed)
 
     @classmethod

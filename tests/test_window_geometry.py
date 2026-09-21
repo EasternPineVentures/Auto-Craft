@@ -347,6 +347,13 @@ class TestObserverGeometry:
         That is exactly where run #2's two sizes appeared, so the seed has to be
         what the first observation is compared against. Without it the very
         disagreement the instrumentation exists to catch is the one it misses.
+
+        The seed carries no frame, and a frame that was never measured is not
+        news, so the change is reported once - as the client area - rather than
+        three times. This test used to require ``frame_width`` and
+        ``frame_height`` here as well, and that is what made the event fire on
+        every run: the third live run announced a resize at step 0 with a client
+        area of 2102x1061 on both sides of the comparison.
         """
         fake_windows.windows.clear()
         window = fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(0, 0, 3591, 1928))
@@ -363,12 +370,54 @@ class TestObserverGeometry:
         )
 
         first = observer.observe(0)
-        assert first.geometry_change == ("client_width", "frame_width", "frame_height"), (
-            "the seed carried no frame at all, so both frame extents are news"
+        assert first.geometry_change == ("client_width",), (
+            "the seed carried no frame, so the frame extents are not news; the "
+            "client area is, and that is the run #2 disagreement"
         )
         assert first.geometry_changed_from is not None
         assert first.geometry_changed_from.client_width == 3222
         assert observer.last_geometry == first.geometry
+
+    def test_a_first_frame_after_a_frameless_seed_is_not_a_resize(
+        self, fake_windows, fake_capture, clock
+    ) -> None:
+        """The whole run, at its own scale, with nothing resized at all.
+
+        The third live run opened with ``WINDOW_GEOMETRY_CHANGED``: a seed with
+        ``frame_width 0`` against a first frame of 2102, while the client area
+        read 2102x1061 on both sides. Nothing had moved. The event is not only
+        printed - it rebaselines the policy and discards the view memory, the
+        progress model, the repetition guard, the cooldowns and the calibration -
+        so a false one costs the run its state.
+        """
+        fake_windows.windows.clear()
+        window = fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(0, 0, 2102, 1061))
+        fake_windows.focus(window.handle)
+        observer = self._observer(fake_windows, fake_capture, clock)
+        observer.seed_geometry(
+            WindowGeometry(
+                handle=window.handle,
+                client_width=2102,
+                client_height=1061,
+                frame_width=0,
+                frame_height=0,
+            )
+        )
+
+        first = observer.observe(0)
+        assert first.geometry.frame_width == 2102, (
+            "in this fixture the frame is the client area, as it was in the run"
+        )
+        assert first.geometry_changed_from is None, (
+            "a frame that was captured for the first time is not a window that "
+            "changed size"
+        )
+        assert first.geometry_change == ()
+
+        for index in (1, 2, 3):
+            assert observer.observe(index).geometry_changed_from is None, (
+                "nothing moved, so nothing may be reported on any later step either"
+            )
 
     def test_a_geometry_that_was_never_seen_is_not_a_change(
         self, fake_windows, fake_capture, clock
