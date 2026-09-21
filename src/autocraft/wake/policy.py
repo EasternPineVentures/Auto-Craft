@@ -488,25 +488,99 @@ class WakeDecisionPolicy:
     # --------------------------------------------------------------------- states
 
     def _note_geometry(self, observation: Observation) -> None:
-        """Record a change in the window's geometry, if there was one.
+        """Record a change in the window's geometry, and rebaseline for it.
 
         The geometry recorded on each observation already carries the before and
-        after numbers, so this only turns them into an event. It deliberately does
-        nothing about the change: AutoCraft does not resize the game window, does
-        not restart the run, and does not adjust its thresholds to suit a new
-        resolution. Sizing the window is the operator's business, and the run's job
-        is to say plainly what it saw.
+        after numbers, so this turns them into an event and then acts on them.
+        AutoCraft still does not resize the game window and does not restart the
+        run: sizing the window is the operator's business, and the run's job is to
+        say plainly what it saw. What it must not do is go on measuring in a scale
+        that no longer exists.
         """
         previous = observation.geometry_changed_from
         if previous is None:
             return
         current = observation.geometry
+        dropped = self._rebaseline_after_resize()
         self._emit(
             WakeEventKind.WINDOW_GEOMETRY_CHANGED,
             changed=list(observation.geometry_change),
             before=previous.to_dict(),
             after=current.to_dict(),
+            rebaselined=bool(dropped),
+            dropped=dropped,
         )
+
+    def _rebaseline_after_resize(self) -> list[str]:
+        """Discard everything that was measured in the old pixel scale.
+
+        A resize does not change the game, but it changes what a pixel means.
+        Every quantity cleared here is either a fingerprint taken over a grid that
+        no longer exists, or a distance in pixels that no longer covers the same
+        part of the scene. Carrying any of them across the change would leave the
+        agent acting on a stale scale - and acting confidently, because a stale
+        number does not look stale.
+
+        The scan position is deliberately kept. The camera is pointing where it
+        was pointing; only the units changed. Restarting the scan would re-send
+        movements that have already been made, which is the dead repetition this
+        milestone exists to avoid.
+
+        The run's tallies are deliberately kept too. They are a record of what
+        happened, and what happened is that the window changed size mid-run.
+
+        Returns:
+            The names of what was dropped, for the event that reports the change.
+        """
+        dropped: list[str] = []
+        if self.memory.unique_views:
+            dropped.append("view memory")
+        self.memory.reset()
+        self.progress.reset()
+        self.guard.reset()
+        self.cooldown.reset()
+        self.controller.reset()
+        if self.start_fingerprint is not None:
+            dropped.append("start view")
+        self.start_fingerprint = None
+        if self.target is not None:
+            dropped.append("chosen target")
+        self.target = None
+        if self.offset_history:
+            dropped.append("offset history")
+        self.offset_history = []
+        for name in (
+            "last_offset",
+            "last_seen_offset",
+            "last_seen_distance",
+            "last_relocation_confidence",
+            "last_move",
+        ):
+            if getattr(self, name) is not None:
+                dropped.append(name.replace("_", " "))
+            setattr(self, name, None)
+        # The calibration is the one piece of state `reset()` keeps on purpose, and
+        # the one place where a resize genuinely invalidates a measurement: it is
+        # pixels per mouse count, and the pixels have changed size. Keeping it
+        # would make every predicted correction wrong by the resize factor. An
+        # adopted LOOK-001 ratio is cleared too - it was measured at the old size.
+        if (
+            self.calibration.samples
+            or self.calibration.pixels_per_count_x is not None
+            or self.calibration.pixels_per_count_y is not None
+        ):
+            dropped.append("motion calibration")
+        self.calibration.reset()
+        self._last_salience = None
+        self.centering_moves = 0
+        self.reacquire_moves = 0
+        if self.state in (WakeState.SELECTING, WakeState.CENTERING, WakeState.REACQUIRING):
+            # A target chosen under the old geometry is not a target any more, so
+            # there is nothing left to centre on. Scanning again is the honest
+            # response; it costs a step and invents nothing.
+            self.state = WakeState.SCANNING
+            dropped.append("target in progress")
+        return dropped
 
     def _start(self, frame: Frame) -> Action:
         """Take in the starting view, then begin scanning in the same step."""

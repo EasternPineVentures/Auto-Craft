@@ -16,6 +16,7 @@ from .window import (
     WindowInfo,
     WindowLocator,
     Win32WindowBackend,
+    coordinate_scaling_note,
     ensure_dpi_awareness,
     title_matches,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "TargetStatus",
     "UnsupportedPlatformError",
     "Win32WindowBackend",
+    "coordinate_scaling_note",
     "WindowBackend",
     "WindowError",
     "WindowInfo",

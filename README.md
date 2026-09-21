@@ -1381,6 +1381,89 @@ and the policy emits `WINDOW_GEOMETRY_CHANGED` with `changed`, `before` and
 pre-countdown answer is seeded as the baseline, so the comparison is against the
 reading the operator was actually shown.
 
+##### That question led somewhere much bigger: the process was not DPI aware
+
+Following the discrepancy meant comparing AutoCraft's capture against the whole
+virtual desktop, and the capture turned out to be pointed at the wrong place. On
+a 125%-scaled secondary monitor, `GetClientRect` and `ClientToScreen` were
+returning coordinates in the system-DPI virtual space instead of physical pixels,
+so the region handed to `mss` was about 2.4x too wide linearly — 5.8x by area —
+and landed mostly outside the game window on a dark desktop.
+
+That is the real explanation of the 65%-black capture that had been blamed on
+Luanti throttling while unfocused. It is not throttling: a correctly-addressed
+capture of the same *unfocused* window is 0.00% black.
+
+The cause was one missing ctypes declaration. `SetProcessDpiAwarenessContext`
+takes a `DPI_AWARENESS_CONTEXT`, which is a **handle, not an `int`** — and it was
+the one user32 call in `_win32()` with no `argtypes`, so the literal `-4` was
+marshalled as a 32-bit int. The call failed with `ERROR_INVALID_PARAMETER` (87)
+and the process silently stayed DPI-unaware. Every other call was declared, which
+is exactly why this survived review: the code read as though awareness had been
+requested, and the return value was never checked.
+
+`ensure_dpi_awareness()` now binds the argument as a pointer, falls back to
+`shcore.SetProcessDpiAwareness(2)` if the context call is unavailable, and
+**returns the mode it actually measured** rather than the mode it attempted.
+That measured mode is what `status` and `wake-test` print, and both print a
+caution naming the consequence when it is not per-monitor: relative mouse counts
+are unaffected, but the capture region may not be the game.
+
+Same live window, same handle, `GetDpiForWindow` 120 under both:
+
+| | unaware (before) | per-monitor (after) |
+|---|---|---|
+| `GetClientRect` | 1960x1041 | **817x434** |
+| capture mean luma | 13.08 | 41.52 |
+| capture black | 65.2% | **0.00%** |
+
+**This invalidates the absolute resolutions quoted throughout this section.**
+Every run so far was executed by a DPI-unaware process, so the client areas it
+recorded — 3222x1928, 2246x1159, 1960x1041 — were inflated by about 2.4x
+linearly and 5.8x by area. The *proportional* findings survive, because both
+runs were inflated by the same factor on the same monitor: behaviour time still
+tracks pixel area almost exactly, and the focus countdown is still a fixed ~20 s
+constant. But the real client area was always about **817x434 (354,578 pixels)**
+— comfortably under the ~1,000,000 pixel figure this milestone treats as the
+design point. The size gate was never genuinely failing. The operator was
+resizing a window that had already been the right size; the reported size was
+the defect.
+
+##### A resize is now acted on, not merely reported
+
+The run-2 instrumentation recorded geometry changes, but the policy only emitted
+an event and then carried on — a resize was detected and ignored. That is worse
+than not detecting it, because every quantity the agent holds is measured in the
+pixel scale that just changed: view fingerprints over a grid that no longer
+exists, offsets in pixels that no longer cover the same part of the scene, and a
+pixels-per-count calibration taken at the old size.
+
+`_note_geometry` now calls a rebaseline on a change. It discards everything
+measured in the old scale and **names what it dropped** in the event (`dropped`,
+alongside `rebaselined`):
+
+| dropped | why it cannot survive the change |
+|---|---|
+| view memory, start view | fingerprints taken over a grid that no longer exists |
+| chosen target, offset history, last offset / distance / confidence / move | pixel distances that no longer cover the same part of the scene |
+| motion calibration | pixels per mouse count, measured at the old size — including an adopted LOOK-001 ratio |
+| progress, guards, cooldowns, controller | counters and deadlines scoped to the old scale |
+
+Two things are deliberately **kept**:
+
+- **The scan position.** The camera is still pointing where it was pointing; only
+  the units changed. Restarting the scan would re-send movements that have
+  already been made, which is the dead repetition this milestone exists to avoid.
+- **The run's tallies** (`moves`, `scan_moves`, `candidate_count`,
+  `target_changes`). They are a record of what happened, and what happened is
+  that the window changed size mid-run.
+
+A run that was centring on a target when the resize arrived returns to
+`SCANNING`: a target chosen under the old geometry is not a target any more, so
+there is nothing left to centre on. It costs a step and invents nothing.
+AutoCraft still never resizes the window itself, and a resize is still not a
+reason to restart the run.
+
 ##### The final safety sweep ran after the recorder had closed
 
 Run 2 completed its primary result and then printed:
@@ -1457,22 +1540,32 @@ Two things fall out of this, and both are more useful than the headline number:
 The 2246x1159 re-run is still above the 1 Mpx the design assumes, and it produced
 the same outcome as run 2 — 5 unique views, 9 revisits, 0 candidates, the same
 stop reason. A smaller window made it faster; it did not make it see anything.
+(As the DPI finding above shows, that 2246x1159 was itself an inflated reading;
+the real client area was under 1 Mpx the whole time.)
 
 #### Before the next live run
 
-Both of the runs above were far larger than the size the behaviour was designed
-around, and step time tracks frame area almost exactly, so the next run is worth
-doing at a genuinely small client area. **AutoCraft will not resize the window
-for you** — the window is the thing being measured — so this is a manual step.
+Both of the runs above were recorded by a DPI-unaware process, and step time
+tracks frame area almost exactly, so the numbers they produced describe the
+inflation as much as they describe the agent. With awareness fixed, the next run
+is the first one whose resolution, cadence and geometry are all real.
 
-1. Resize the Luanti window by hand, then confirm what AutoCraft can see:
+**AutoCraft will not resize the window for you** — the window is the thing being
+measured — so the size is a manual step, but the first thing to check is not the
+size:
+
+1. Confirm AutoCraft can see the game, and that it is DPI aware:
 
    ```powershell
    python -m autocraft status
    ```
 
-   The reported client area should be roughly **1280x720**, or at least below
-   about 1,000,000 pixels. Do not proceed on a larger window.
+   `DPI awareness` must read **`per-monitor`**. If it does not, the capture
+   region may not be the game, and `status` prints a caution saying so — fix that
+   before reading anything else. On this machine the real client area is about
+   **817x434**, well under the ~1,000,000 pixels the design assumes. Roughly
+   **1280x720** or anything else below that figure is also fine. There is no
+   longer a size gate to chase.
 
 2. Then run the behaviour:
 
@@ -1487,7 +1580,10 @@ that nothing was), centring moves, target path, dead repetition, and the stop
 reason. There is no pass/fail threshold: a run that scans a bounded set of views
 and reports honestly that it found nothing is a valid result, and lowering the
 salience threshold until a candidate appears would destroy the measurement the
-whole milestone rests on.
+whole milestone rests on. Note also that the absolute resolutions and cadence
+figures from the earlier runs are inflated, so compare *shapes* — does time track
+area, do views repeat, does anything survive selection — not the raw
+milliseconds.
 
 The next run is also the first one that will record a per-phase `timings`
 breakdown and a per-observation `WINDOW_GEOMETRY_CHANGED` comparison, so it is the
@@ -1853,14 +1949,25 @@ covered:
   top-cell-score list are covered too, and the summary is asserted to carry no
   pixel data
 - the WAKE-001 geometry instrumentation: `WINDOW_GEOMETRY_CHANGED` fires on a
-  real client-area/frame-size disagreement and *not* on an unchanged run, and
-  every observation records its handle and both sizes
+  real client-area/frame-size disagreement and *not* on an unchanged run, every
+  observation records its handle and both sizes, and the real `Observer` — not a
+  fabricated change — is driven through the disagreement so the detection seam
+  itself is covered
+- the WAKE-001 resize response: a resize discards the view memory, the chosen
+  target, the offset history and the motion calibration, and says so by name in
+  the event; an ordinary step and an ordinary `reset()` keep the calibration; the
+  scan position and the run's tallies survive; a centring run returns to
+  scanning; and a rebaseline reports only what it actually dropped
+- the WAKE-001 DPI awareness: a fresh process really does end up per-monitor
+  aware, the mode reported is the mode measured rather than the mode attempted,
+  and the awareness context is bound as a handle rather than an int — the exact
+  defect that made the capture point at the wrong place
 - the WAKE-001 cadence: the per-phase breakdown reaches the step record, the
   means and their sample counts reach `wake_result.json`, an unreadable timing
   is dropped rather than failing the record, a run that timed nothing reports an
   empty cadence rather than zeros, and a successful cleanup prints no warning
 
-The suite is 854 tests and runs in about 28 seconds. Everything that talks to
+The suite is 878 tests and runs in about 31 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -2068,12 +2175,13 @@ worktree than the branch — see
 
 **After that**, the ordering that follows from what has actually been measured:
 
-1. **Run WAKE-001 live again at a genuinely small client area, and read what it
+1. **Run WAKE-001 live again with the DPI defect fixed, and read what it
    records.** The behaviour has now faced a real scene three times without ever
-   finding a target, and the two most recent runs operated at 6.2 and 2.6
-   million pixels — well above the size the design assumes. The next live run is
-   the first one that is both instrumented and small enough for its numbers to
-   mean what they say.
+   finding a target, and every one of those runs was made by a DPI-unaware
+   process, so the 6.2 and 2.6 million pixel client areas it recorded were
+   inflated readings of a window that was under a million pixels all along. The
+   next live run is the first one that is both instrumented and measured in real
+   pixels, so its numbers can mean what they say.
 2. **Feed the measured mapping back in.** Once `look-test` produces a ratio,
    `wake-test` can adopt it as a starting calibration instead of beginning from a
    fixed band count, which is the difference between a first correction that is

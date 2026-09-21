@@ -7,10 +7,27 @@ running.
 
 from __future__ import annotations
 
+import ctypes
+import json
+import os
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 
+from autocraft.agent.observation import Observer, WindowGeometry
+from autocraft.vision.capture import ScreenCapturer
 from autocraft.vision.frame import ScreenRegion
-from autocraft.vision.window import TargetStatus, WindowInfo, WindowLocator, title_matches
+from autocraft.vision.window import (
+    TargetStatus,
+    WindowInfo,
+    WindowLocator,
+    _scaling_note,
+    coordinate_scaling_note,
+    title_matches,
+)
 
 
 class TestTitleMatching:
@@ -269,3 +286,231 @@ class TestTargetStatus:
 
         status = TargetStatus(found=False, reason="no match")
         assert json.loads(json.dumps(status.to_dict()))["reason"] == "no match"
+
+
+class TestObserverGeometry:
+    """Finding 1: the observer is where a window that changed size is noticed.
+
+    Run #2 reported a 3222x1928 client area before its countdown and a 3591x1928
+    frame on every step after it. The policy-level test builds that disagreement
+    by hand, which proves the *event* but not the *detection*. These drive the
+    real ``Observer`` - the object a live run actually uses - across a window
+    that changed size underneath it, because that seam is the one a live run
+    depends on and the one no test covered.
+    """
+
+    def _observer(self, fake_windows, fake_capture, clock) -> Observer:
+        locator = WindowLocator(fake_windows, ("Luanti",), clock=clock, rediscover_after=0.0)
+        return Observer(locator, ScreenCapturer(fake_capture, clock=clock), clock=clock)
+
+    def test_a_window_that_changed_size_is_reported(self, fake_windows, fake_capture, clock) -> None:
+        fake_windows.windows.clear()
+        window = fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(0, 0, 3222, 1928))
+        fake_windows.focus(window.handle)
+        observer = self._observer(fake_windows, fake_capture, clock)
+
+        first = observer.observe(0)
+        assert first.geometry.client_width == 3222
+        assert first.geometry.frame_width == 3222, "the frame is the client area here"
+        assert first.geometry_changed_from is None, "there is nothing to compare against yet"
+
+        fake_windows.windows[:] = [
+            replace(w, region=ScreenRegion(0, 0, 3591, 1928)) if w.handle == window.handle else w
+            for w in fake_windows.windows
+        ]
+
+        second = observer.observe(1)
+        assert second.geometry_changed_from is not None
+        assert second.geometry_changed_from.client_width == 3222
+        assert second.geometry_change == ("client_width", "frame_width"), (
+            "the height never moved, so the change must not claim it did"
+        )
+        assert second.to_dict()["geometry_changed_fields"] == ["client_width", "frame_width"]
+
+    def test_an_unchanged_window_reports_no_change(self, fake_windows, fake_capture, clock) -> None:
+        fake_windows.windows.clear()
+        window = fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(0, 0, 1280, 720))
+        fake_windows.focus(window.handle)
+        observer = self._observer(fake_windows, fake_capture, clock)
+
+        observer.observe(0)
+        for index in (1, 2, 3):
+            assert observer.observe(index).geometry_changed_from is None, (
+                "a window that held still must not re-report its geometry every step"
+            )
+
+    def test_a_seeded_geometry_is_the_baseline_for_the_first_look(
+        self, fake_windows, fake_capture, clock
+    ) -> None:
+        """The plan is sampled before the countdown and the run after it.
+
+        That is exactly where run #2's two sizes appeared, so the seed has to be
+        what the first observation is compared against. Without it the very
+        disagreement the instrumentation exists to catch is the one it misses.
+        """
+        fake_windows.windows.clear()
+        window = fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(0, 0, 3591, 1928))
+        fake_windows.focus(window.handle)
+        observer = self._observer(fake_windows, fake_capture, clock)
+        observer.seed_geometry(
+            WindowGeometry(
+                handle=window.handle,
+                client_width=3222,
+                client_height=1928,
+                frame_width=0,
+                frame_height=0,
+            )
+        )
+
+        first = observer.observe(0)
+        assert first.geometry_change == ("client_width", "frame_width", "frame_height"), (
+            "the seed carried no frame at all, so both frame extents are news"
+        )
+        assert first.geometry_changed_from is not None
+        assert first.geometry_changed_from.client_width == 3222
+        assert observer.last_geometry == first.geometry
+
+    def test_a_geometry_that_was_never_seen_is_not_a_change(
+        self, fake_windows, fake_capture, clock
+    ) -> None:
+        """Losing sight of the window and getting it back has resized nothing.
+
+        An empty geometry is a missing reading, not a change, so a step that
+        failed to find the window must not bury the real change in noise.
+        """
+        fake_windows.windows.clear()
+        window = fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(0, 0, 1280, 720))
+        fake_windows.focus(window.handle)
+        observer = self._observer(fake_windows, fake_capture, clock)
+        observer.seed_geometry(WindowGeometry())
+
+        first = observer.observe(0)
+        assert first.geometry_changed_from is None
+        assert first.geometry_change == ()
+        assert observer.last_geometry == first.geometry, (
+            "an empty seed must not stop the real geometry being remembered"
+        )
+
+
+# ---------------------------------------------------------------------------
+# DPI awareness
+# ---------------------------------------------------------------------------
+
+#: Run in a fresh interpreter, because DPI awareness is process-global and can
+#: only be chosen once. Asking for it twice in the pytest process would measure
+#: whatever the first caller had already arranged.
+_AWARENESS_SCRIPT = """
+import json
+from autocraft.vision.window import _measured_dpi_awareness, ensure_dpi_awareness
+
+requested = ensure_dpi_awareness()
+print(json.dumps({"requested": requested, "measured": _measured_dpi_awareness()}))
+"""
+
+
+def _source_root() -> str:
+    """Return the directory that has ``autocraft`` in it."""
+    import autocraft
+
+    return str(Path(autocraft.__file__).resolve().parents[1])
+
+
+def _awareness_in_a_fresh_process() -> dict[str, object]:
+    """Ask a new interpreter to arrange DPI awareness and report the result."""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = _source_root()
+    completed = subprocess.run(
+        [sys.executable, "-c", _AWARENESS_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+class TestDpiAwareness:
+    """Windows virtualises coordinates unless the process asks not to be.
+
+    A virtualised client rectangle is still a plausible rectangle, and the
+    capture backend still returns exactly the pixels it was asked for, so a
+    failure here cannot be detected downstream - only prevented here.
+    """
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="DPI awareness is Win32 only")
+    def test_the_process_really_becomes_per_monitor_aware(self) -> None:
+        """The per-monitor context must actually take effect.
+
+        This is the assertion that catches an awareness context passed as a
+        truncated integer: the call still looks like it succeeded, and the
+        process quietly stays merely system aware.
+        """
+        report = _awareness_in_a_fresh_process()
+        assert report["measured"] == "per-monitor", (
+            "ensure_dpi_awareness returned "
+            f"{report['requested']!r}, but the process ended up "
+            f"{report['measured']!r}"
+        )
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="DPI awareness is Win32 only")
+    def test_the_reported_mode_is_the_measured_mode(self) -> None:
+        """Report what was achieved, never what was attempted.
+
+        The old code returned the name of the API it had just called, so a
+        failure was reported as a success and ``status`` said ``system`` as if
+        that had been the plan all along.
+        """
+        report = _awareness_in_a_fresh_process()
+        assert report["requested"] == report["measured"]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="DPI awareness is Win32 only")
+    def test_the_awareness_context_is_bound_as_a_handle(self) -> None:
+        """``DPI_AWARENESS_CONTEXT`` is a pointer, not an int.
+
+        Without an ``argtypes`` declaration ctypes marshals the literal ``-4``
+        as a 32-bit C ``int``; the API wants a 64-bit handle and rejects the
+        call with ``ERROR_INVALID_PARAMETER``.
+        """
+        from autocraft.vision.window import _win32
+
+        user32 = _win32()["user32"]
+        assert user32.SetProcessDpiAwarenessContext.argtypes == [ctypes.c_void_p]
+
+
+class TestCoordinateScalingNote:
+    """Saying out loud when Windows is scaling a window's coordinates.
+
+    Split from the Win32 reading so the decision itself is testable without a
+    desktop to read DPI from.
+    """
+
+    def test_per_monitor_awareness_needs_no_caution(self) -> None:
+        assert _scaling_note("per-monitor", 120, 288) is None
+
+    def test_matching_scales_need_no_caution(self) -> None:
+        """The same DPI everywhere means nothing is being virtualised."""
+        assert _scaling_note("system", 120, 120) is None
+
+    @pytest.mark.parametrize(("window_dpi", "system_dpi"), [(0, 288), (120, 0), (-1, 288)])
+    def test_an_unreadable_dpi_is_not_a_caution(self, window_dpi: int, system_dpi: int) -> None:
+        """A missing reading must not be reported as a problem."""
+        assert _scaling_note("system", window_dpi, system_dpi) is None
+
+    @pytest.mark.parametrize("mode", ["system", "unaware"])
+    def test_a_scale_mismatch_is_explained_with_both_numbers(self, mode: str) -> None:
+        note = _scaling_note(mode, 120, 288)
+        assert note is not None
+        assert mode in note
+        assert "120" in note
+        assert "288" in note
+
+    def test_no_target_means_nothing_to_warn_about(self) -> None:
+        assert coordinate_scaling_note(None) is None
+
+    def test_the_note_is_a_single_line(self) -> None:
+        """It is printed after a table row, so it must not wrap the layout."""
+        note = _scaling_note("system", 120, 288)
+        assert note is not None
+        assert "\n" not in note

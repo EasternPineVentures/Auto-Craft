@@ -638,6 +638,297 @@ def _status_with_region(*, width: int, height: int, handle: int) -> WindowStatus
     )
 
 
+# ---------------------------------------------------------------------------
+# THE RESIZE RESPONSE
+# ---------------------------------------------------------------------------
+#
+# A window that changes size mid-run changes what a pixel means, and every
+# quantity the policy carries is denominated in pixels: view fingerprints over a
+# grid that no longer exists, a target chosen at the old size, offset history and
+# a pixels-per-mouse-count calibration measured at the old size. Before this the
+# run logged the change and carried all of it forward, which is worse than having
+# none of it, because a stale number does not look stale.
+
+# A bounded blob kept well away from the frame edges, so the candidate group
+# never touches a border and is refused for spanning the frame.
+_BLOB_KWARGS = {"y0": 20, "y1": 55, "x0": 25, "x1": 65}
+
+
+def _drive_to_a_live_target(
+    policy: WakeDecisionPolicy,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    limit: int = 6,
+) -> Observation:
+    """Drive the policy until it has picked the blob out of the frame.
+
+    The world pans a few pixels each step on purpose. The scan refuses to choose
+    anything until it has seen more than one distinct view, which is what keeps it
+    from locking onto the first frame it is handed - so a frozen frame never
+    reaches a target at all.
+
+    The blob stays well inside the frame, so the target is bounded and the
+    selection succeeds. By then there is a chosen target, a start view, offset
+    history and view memory, all denominated in the old pixel scale.
+    """
+    base = with_blob(scene(), **_BLOB_KWARGS)
+    status = _status_with_region(width=width, height=height, handle=11)
+    last: Observation | None = None
+    for step in range(limit):
+        last = Observation(
+            index=step,
+            timestamp=float(step),
+            window=status,
+            frame=frame_of(panned(base, 8 * step, 0), step),
+        )
+        policy.decide(last)
+        assert policy.state not in {
+            WakeState.COMPLETE,
+            WakeState.FAILED,
+            WakeState.SAFE_STOP,
+        }, "the run ended before the resize could be tested"
+        if policy.state in {WakeState.SELECTING, WakeState.CENTERING, WakeState.REACQUIRING}:
+            return last
+    raise AssertionError("the policy never picked the blob out of the frame")
+
+
+def _resize(
+    policy: WakeDecisionPolicy,
+    last: Observation,
+    *,
+    width: int = 640,
+    height: int = 360,
+) -> dict:
+    """Hand the policy a look captured after the window changed size.
+
+    Returns:
+        The detail of the single WINDOW_GEOMETRY_CHANGED event it produced.
+    """
+    index = last.index + 1
+    image = with_blob(scene(), **_BLOB_KWARGS)
+    policy.decide(
+        Observation(
+            index=index,
+            timestamp=float(index),
+            window=_status_with_region(width=width, height=height, handle=11),
+            frame=frame_of(image, index),
+            geometry_changed_from=last.geometry,
+        )
+    )
+    events = [e for e in policy.drain_events() if e.kind is WakeEventKind.WINDOW_GEOMETRY_CHANGED]
+    assert len(events) == 1, "a resize must be reported exactly once"
+    return events[0].detail
+
+
+def test_a_resize_drops_everything_measured_in_the_old_pixel_scale() -> None:
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+    last = _drive_to_a_live_target(policy)
+
+    before_views = policy.memory.unique_views
+    assert before_views >= 1, "the test is vacuous unless a view was stored"
+    assert policy.start_fingerprint is not None
+    assert policy.target is not None, "the bounded blob should have been selected"
+
+    detail = _resize(policy, last)
+
+    # The resize step carries on into the scan, which records the single view it
+    # has just taken. Every view from before the change is gone, so only that one
+    # survives - and the view it recorded is in the new pixel scale, not the old.
+    assert policy.memory.unique_views == 1
+    assert before_views > policy.memory.unique_views
+    assert policy.start_fingerprint is None
+    assert policy.target is None
+    assert policy.offset_history == []
+    assert policy.last_offset is None
+    assert policy.last_seen_offset is None
+    assert policy.last_seen_distance is None
+    assert policy.last_move is None
+    assert policy.last_relocation_confidence is None
+    assert detail["rebaselined"] is True
+
+
+def test_the_resize_event_names_what_it_dropped() -> None:
+    """The event has to say what was invalidated, not merely that something was.
+
+    An operator reading the record needs to know whether the run quietly kept
+    acting on a target it chose at a size that no longer exists.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+    last = _drive_to_a_live_target(policy)
+
+    dropped = _resize(policy, last)["dropped"]
+
+    assert isinstance(dropped, list)
+    assert all(isinstance(name, str) for name in dropped)
+    assert "view memory" in dropped
+    assert "start view" in dropped
+    assert "chosen target" in dropped
+
+
+def test_a_rebaseline_reports_only_what_it_actually_dropped() -> None:
+    """A fixed list would be a lie. An empty run drops nothing and must say so."""
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+
+    assert policy._rebaseline_after_resize() == []
+
+    last = _drive_to_a_live_target(policy)
+    assert policy._rebaseline_after_resize(), "a run in progress has something to drop"
+
+
+def test_a_resize_does_not_rewind_the_scan() -> None:
+    """Replaying movements already made is the dead repetition WAKE-001 exists to avoid.
+
+    The camera is still pointing where it was pointing; only the units changed, so
+    the scan position and the run's tallies carry over untouched.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+    last = _drive_to_a_live_target(policy)
+    before = (
+        policy.scan_index,
+        policy.scan_offset,
+        policy.moves,
+        policy.scan_moves,
+        policy.total_centering_moves,
+    )
+
+    _resize(policy, last)
+
+    after = (
+        policy.scan_index,
+        policy.scan_offset,
+        policy.moves,
+        policy.scan_moves,
+        policy.total_centering_moves,
+    )
+    assert after[0] >= before[0], "the scan must never rewind to a view it has already paid for"
+    assert after[2] >= before[2], "the movement tally is a record of what happened"
+    assert after[3] >= before[3]
+    assert after[4] >= before[4]
+
+
+def test_a_resize_returns_a_centring_run_to_scanning() -> None:
+    """A target chosen at the old size is not a target any more.
+
+    Scanning again costs one step and invents nothing, which is the honest
+    response. The alternative - centring on a stale rectangle - would send real
+    input toward a place the target is no longer known to be.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+    last = _drive_to_a_live_target(policy)
+    assert policy.state in {WakeState.SELECTING, WakeState.CENTERING, WakeState.REACQUIRING}
+
+    _resize(policy, last)
+
+    assert policy.state is not WakeState.CENTERING
+    assert policy.target is None
+
+
+def test_an_ordinary_reset_keeps_the_calibration_but_a_resize_does_not() -> None:
+    """This is the one piece of state ``reset()`` keeps on purpose, and a resize kills it.
+
+    The calibration is pixels per mouse count, so a resize scales every predicted
+    correction by the resize factor. ``reset()`` keeps it because it is a
+    measurement of how the game responds to this mouse rather than a belief about
+    this run - but a measurement taken at the old size is exactly what a resize
+    invalidates.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.calibration.adopt(pixels_per_delta_x=2.5, pixels_per_delta_y=2.5, quality=0.9)
+    policy.reset()
+    assert policy.calibration.pixels_per_count_x == 2.5, (
+        "reset() keeps the calibration on purpose"
+    )
+
+    last = _drive_to_a_live_target(policy)
+    detail = _resize(policy, last)
+
+    assert policy.calibration.pixels_per_count_x is None
+    assert policy.calibration.pixels_per_count_y is None
+    assert policy.calibration.samples == 0
+    assert policy.calibration.source == "unmeasured"
+    assert "motion calibration" in detail["dropped"]
+
+
+def test_an_unchanged_window_drops_nothing() -> None:
+    """The rebaseline must be driven by a real change, not by every step."""
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+    last = _drive_to_a_live_target(policy)
+    index = last.index + 1
+    image = with_blob(scene(), **_BLOB_KWARGS)
+
+    policy.decide(
+        Observation(
+            index=index,
+            timestamp=float(index),
+            window=_status_with_region(width=1280, height=720, handle=11),
+            frame=frame_of(image, index),
+        )
+    )
+
+    assert policy.memory.unique_views >= 1, "an ordinary step must not clear the view memory"
+    assert policy.start_fingerprint is not None
+    kinds = [e.kind for e in policy.drain_events()]
+    assert kinds.count(WakeEventKind.WINDOW_GEOMETRY_CHANGED) == 0
+
+
+def test_a_real_observer_hands_the_policy_a_geometry_change(
+    fake_windows, fake_capture, clock
+) -> None:
+    """The detection seam and the response seam, joined.
+
+    Every other test in this group hands the policy a geometry change it built
+    itself. This one lets the real Observer produce it, because the rebaseline
+    only ever runs if observe() actually sets geometry_changed_from - and until
+    this test existed, the real Observer had never been driven through a change
+    at all.
+    """
+    from autocraft.agent.observation import Observer
+    from autocraft.vision.capture import ScreenCapturer
+    from autocraft.vision.frame import ScreenRegion
+    from autocraft.vision.window import WindowLocator
+
+    fake_windows.windows.clear()
+    fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(100, 50, 1280, 720))
+    observer = Observer(
+        WindowLocator(fake_windows, ["Luanti"], clock=clock, rediscover_after=0.0),
+        ScreenCapturer(fake_capture, clock=clock),
+        clock=clock,
+    )
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+
+    first = observer.observe(index=0)
+    policy.decide(first)
+    assert first.geometry_changed_from is None, "the first look has nothing to compare against"
+    assert policy.start_fingerprint is not None
+
+    # The window changes size under the run, and the Observer is what notices.
+    fake_windows.windows.clear()
+    fake_windows.add(0x100, "Luanti 5.17.0", region=ScreenRegion(100, 50, 640, 360))
+    resized = observer.observe(index=1)
+
+    assert resized.geometry_changed_from is not None, "the Observer must notice the change"
+    assert "client_width" in resized.geometry_change
+
+    policy.decide(resized)
+
+    events = [e for e in policy.drain_events() if e.kind is WakeEventKind.WINDOW_GEOMETRY_CHANGED]
+    assert len(events) == 1, "the Observer's change must reach the policy exactly once"
+    detail = events[0].detail
+    assert detail["rebaselined"] is True
+    assert "view memory" in detail["dropped"]
+    assert "start view" in detail["dropped"]
+    assert detail["after"]["client_width"] == 640
+    assert policy.start_fingerprint is None
+
+
 def test_no_geometry_event_without_a_change() -> None:
     policy = WakeDecisionPolicy(max_moves=45)
     _run_policy(policy, [with_blob(scene(), y0=30, y1=70, x0=40, x1=90)])

@@ -73,6 +73,7 @@ from .vision.window import (
     WindowError,
     WindowLocator,
     Win32WindowBackend,
+    coordinate_scaling_note,
     ensure_dpi_awareness,
 )
 from .wake import (
@@ -265,6 +266,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print()
         print("Target window")
         _print_table(_status_lines(status))
+        caution = coordinate_scaling_note(None if status.window is None else status.window.handle)
+        if caution:
+            print()
+            print(f"  caution - {caution}.")
         print()
         print("Subsystems")
         _print_table(
@@ -2025,6 +2030,11 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
             print()
             _print_table([("run id", recorder.run_id), ("experiment", WAKE_EXPERIMENT_NAME)])
             print()
+            caution = coordinate_scaling_note(target_handle)
+            if caution:
+                print(f"  caution - {caution}.")
+                print("  the run is still recorded, but what it looks at may not be the game.")
+                print()
             print("  Focus the game window now.")
             print("  It is checked again before every movement, not just once.")
             _focus_countdown(handoff, stream=sys.stdout)
