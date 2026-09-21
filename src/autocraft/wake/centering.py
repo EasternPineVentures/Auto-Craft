@@ -103,6 +103,7 @@ class CenteringMove:
     overshoot: bool = False
     reversed_axes: tuple[str, ...] = ()
     expected_pixels: float | None = None
+    unachievable: bool = False
 
     @property
     def is_noop(self) -> bool:
@@ -126,6 +127,7 @@ class CenteringMove:
             "overshoot": self.overshoot,
             "reversed_axes": list(self.reversed_axes),
             "expected_pixels": None if self.expected_pixels is None else round(self.expected_pixels, 3),
+            "unachievable": self.unachievable,
         }
 
 
@@ -419,6 +421,50 @@ class CenteringController:
             max_mouse_delta=self.max_mouse_delta,
         )
         expected = _expected_pixels(steps, self.calibration)
+        if expected is not None and _step_is_hopeless(expected, distance, self.dead_zone_px):
+            # The controller's own arithmetic says this correction cannot work.
+            # It is worth spelling out why, because the alternative - and what
+            # actually happened - is to send the step anyway.
+            #
+            # ``_step_counts`` floors the ratio at ``_MIN_PIXELS_PER_COUNT``, so a
+            # mapping that is real but far too small divides the offset by almost
+            # nothing and the request lands on ``max_mouse_delta``: the largest
+            # movement the safety limit allows. ``_expected_pixels`` uses the raw
+            # ratio, so it still knows the truth - that 200 counts will displace
+            # the view by about a pixel and a half. The two functions disagree,
+            # and the one telling the truth is the one that is not allowed to
+            # choose the step. This is the check that reconciles them.
+            #
+            # The live WAKE-001 run ``20260921T045955Z-4b6dd88b`` is the evidence.
+            # Its measured mapping was 0.0075 px per count on y, so every step was
+            # capped at 200 counts and displaced the view by 1.5 px. Its first
+            # target took eight centring moves to go from 171.9 px to 168.0 px -
+            # four pixels of a hundred-and-seventy-two pixel gap - and the distance
+            # series wanders up as often as down: 171.9, 172.9, 171.9, 170.0,
+            # 169.0, 170.0, 168.0, 169.0. That is not a controller failing to
+            # converge; it is a controller marching on a signal too small to
+            # measure. Reporting the correction as impossible is the honest
+            # answer, and it is a fact about the measurement rather than about the
+            # target.
+            reason = (
+                f"the target is {distance:.1f} px from centre, but the measured mapping "
+                f"({self.calibration.ratio_for('x') or 0:.4f} px per count on x, "
+                f"{self.calibration.ratio_for('y') or 0:.4f} on y) means the largest "
+                f"correction available moves it {expected:.1f} px, below the "
+                f"{self.dead_zone_px:g} px dead zone - this correction cannot be made"
+            )
+            move = CenteringMove(
+                dx=0,
+                dy=0,
+                band=band,
+                direction="still",
+                reason=reason,
+                expected_pixels=expected,
+                unachievable=True,
+            )
+            self._last_move = move
+            self._pending = False
+            return move
         direction = direction_of(*steps)
         if reversed_axes:
             reason = (
@@ -489,6 +535,14 @@ def _step_counts(
     bounds the step is ``max_mouse_delta``, which is a safety limit rather than a
     control decision, and the band still governs which fraction of the error is
     taken and how the attempt is named.
+
+    The floor on the ratio is what turns a useless mapping into a capped step: a
+    measured ratio of 0.0075 px per count divides the offset by 0.05 instead, so
+    the request lands on ``max_mouse_delta`` every time. Nothing here can tell that
+    apart from a genuinely large error, which is why the caller checks the
+    resulting move against its own dead zone via :func:`_step_is_hopeless` before
+    sending it. This function sizes a step; it does not judge whether the step can
+    work.
     """
     ceiling = max(1, int(max_mouse_delta))
     band_counts = int(BAND_COUNTS.get(band, BAND_COUNTS["fine"]))
@@ -523,6 +577,24 @@ def _expected_pixels(steps: tuple[int, int], calibration: MotionCalibration) -> 
     if x_ratio is None and y_ratio is None:
         return None
     return math.hypot(expected_x, expected_y)
+
+
+def _step_is_hopeless(expected: float, distance: float, dead_zone: float) -> bool:
+    """Whether a correction worth ``expected`` pixels is too small to be worth sending.
+
+    Two things have to be true. The step must displace the view by less than the
+    dead zone, because a movement smaller than the tolerance the loop is trying to
+    reach is indistinguishable from not moving: the next look cannot say whether
+    the correction worked, so the loop would be steering on noise. And the step
+    must also fail to close the gap in this one move, so that a target which is a
+    single nudge from success is not abandoned for being close.
+
+    The second condition guards the first rather than standing on its own. A
+    target 13 px from centre with a mapping worth 9 px per step is below the dead
+    zone and about to be centred, and refusing it would be a false positive of
+    exactly the kind this check exists to catch.
+    """
+    return expected <= dead_zone and expected < (distance - dead_zone)
 
 
 def _smaller_band(left: str, right: str) -> str:

@@ -269,15 +269,55 @@ def test_a_frame_covering_region_is_refused_when_named_directly() -> None:
     assert candidate_from_cells(sky, every_cell, grid=8) is None
 
 
-def test_a_region_larger_than_the_frame_is_still_refused() -> None:
-    """The rule is about covering the frame, not about an exact match on its size."""
+def test_a_region_spanning_the_frame_width_is_refused() -> None:
+    """The rule is about spanning the frame, not about an exact match on its size.
+
+    The full-width band used to be allowed through here, on the reasoning that a
+    band spanning the full width "is a real feature". The live WAKE-001 run
+    ``20260921T045955Z-4b6dd88b`` is what retired that reasoning: it selected
+    three boxes - ``[0, 266, 2102, 1061]``, ``[0, 0, 2102, 665]`` and
+    ``[16, 300, 2118, 1095]`` - out of a 2102x1061 frame, all three the full frame
+    width, and measured the same unusable mapping from each. A region that wide
+    occupies every column the matcher can search, so the only place it can be
+    found is where it was told to look. See :func:`_spans_frame` for the full
+    account.
+    """
     from autocraft.wake.salience import _spans_frame
 
-    assert _spans_frame((0, 0, 160, 120), 160, 120) is True
-    assert _spans_frame((-4, -4, 200, 200), 160, 120) is True
-    # A band spanning the full width is a real feature and must survive.
-    assert _spans_frame((0, 40, 160, 80), 160, 120) is False
-    assert _spans_frame((10, 10, 150, 110), 160, 120) is False
+    assert _spans_frame((0, 0, 160, 120), 160) is True
+    assert _spans_frame((-4, -4, 200, 200), 160) is True
+    # Wider than the frame, and reaching past it on both sides.
+    assert _spans_frame((-40, 40, 200, 80), 160) is True
+    # The band that used to survive. It is the ``20260921T045955Z-4b6dd88b`` case
+    # in miniature: full width, part height, so it has no horizontal position to
+    # be tracked by.
+    assert _spans_frame((0, 40, 160, 80), 160) is True
+    # A box that leaves a column to spare is still a region, and still survives.
+    assert _spans_frame((10, 10, 150, 110), 160) is False
+    assert _spans_frame((0, 0, 159, 120), 160) is False
+    # Height is deliberately not tested - see the docstring.
+    assert _spans_frame((10, 0, 150, 120), 160) is False
+
+
+def test_a_full_width_band_is_not_offered_as_a_candidate() -> None:
+    """The live WAKE-001 run ``20260921T045955Z-4b6dd88b``, in one assertion.
+
+    The run selected three boxes out of a 2102x1061 frame and every one of them
+    was the full frame width: ``[0, 266, 2102, 1061]``, ``[0, 0, 2102, 665]`` and
+    ``[16, 300, 2118, 1095]``. A bright horizontal band is the same shape in
+    miniature. It is a real feature of the picture and it is still not a region,
+    because a box that wide occupies every column the matcher can search.
+    """
+    from autocraft.wake.salience import SalienceDiagnostics
+
+    image = with_blob(scene(), y0=20, y1=70, x0=0, x1=160)
+    diagnostics = SalienceDiagnostics()
+    found = find_candidates(image, grid=8, diagnostics=diagnostics)
+
+    assert found == [], "a full-width band is not a target"
+    assert diagnostics.groups == 1, "the band does form a group; that is the problem"
+    assert diagnostics.rejected_frame_span == 1
+    assert diagnostics.surviving_candidates == 0
 
 
 def test_a_frame_sized_patch_cannot_be_located() -> None:
@@ -1224,6 +1264,66 @@ def test_a_ceiling_limited_mapping_is_bounded_by_the_hardware_not_the_estimate()
         assert move.dx == 200, "the ceiling is the bound here, and it is honest"
         offset -= move.dx * 0.5
     assert offset > 800.0, "eight moves genuinely cannot close this distance"
+
+
+def test_a_mapping_too_small_to_move_the_target_is_refused_rather_than_capped() -> None:
+    """The live WAKE-001 run ``20260921T045955Z-4b6dd88b``, in one assertion.
+
+    That run measured 0.0075 px per mouse count on y - a real measurement, taken
+    from consistent observations, of a target that could not be relocated.
+    ``_step_counts`` floors the ratio at 0.05, so every request landed on the
+    200-count safety ceiling and displaced the view by 1.5 px. The controller then
+    spent eight centring moves on its first target taking the distance from
+    171.9 px to 168.0 px - four pixels of a hundred-and-seventy-two pixel gap,
+    against a 12 px dead zone - and the distance series reads 171.9, 172.9, 171.9,
+    170.0, 169.0, 170.0, 168.0, 169.0: eight moves, no convergence, and nothing in
+    the record saying why.
+
+    The controller's own ``expected_pixels`` knew. It said 1.5 px while the step
+    was the largest the hardware would take, and that number was reported, never
+    consulted. This is the assertion that it is consulted.
+    """
+    calibration = MotionCalibration()
+    for _ in range(4):
+        calibration.observe(dx_counts=0, dy_counts=200, shift_x=0.0, shift_y=1.5)
+    assert calibration.measured is True
+    assert calibration.pixels_per_count_y == pytest.approx(0.0075)
+
+    controller = CenteringController(
+        dead_zone_px=12.0, max_mouse_delta=200, calibration=calibration
+    )
+    move = controller.decide(offset_x=0.0, offset_y=169.0, frame_width=2102, frame_height=1061)
+
+    assert move.expected_pixels == pytest.approx(1.5, abs=0.01)
+    assert move.unachievable is True
+    assert move.dx == 0 and move.dy == 0, "the 200-count cap must not be sent"
+    assert move.is_noop is True, "the caller treats this as a declined correction"
+    assert "cannot be made" in move.reason
+    assert controller.to_dict()["awaiting_observation"] is False
+
+
+def test_a_target_one_nudge_from_success_is_not_called_unachievable() -> None:
+    """The guard on that refusal, so it cannot abandon a target it can still fix.
+
+    A step smaller than the dead zone is normally a step the loop cannot verify,
+    because the next look cannot tell it from no movement. It is not that when the
+    single step is enough to land inside the dead zone: a target 13 px out with a
+    mapping worth 9 px per count is about to be centred, and calling it
+    unachievable would be the false positive this check exists to avoid.
+    """
+    calibration = MotionCalibration()
+    for _ in range(4):
+        calibration.observe(dx_counts=100, dy_counts=0, shift_x=900.0, shift_y=0.0)
+    assert calibration.pixels_per_count_x == pytest.approx(9.0)
+
+    controller = CenteringController(
+        dead_zone_px=12.0, max_mouse_delta=200, calibration=calibration
+    )
+    move = controller.decide(offset_x=13.0, offset_y=0.0, frame_width=3222, frame_height=1928)
+
+    assert move.unachievable is False
+    assert move.expected_pixels == pytest.approx(9.0)
+    assert move.dx > 0, "one step from the dead zone is still a step worth taking"
 
 
 # ---------------------------------------------------------------------------

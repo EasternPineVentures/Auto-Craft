@@ -1160,12 +1160,14 @@ The defect is fixed at the source, in `wake/salience.py`, by refusing the two
 degenerate shapes rather than by tuning any threshold. Two small predicates do
 it:
 
-- `_spans_frame(bbox, width, height)` — true when a box covers the frame from
-  edge to edge. `find_candidates` skips such a group, and
+- `_spans_frame(bbox, width)` — true when a box spans the frame's width.
+  `find_candidates` skips such a group, and
   `candidate_from_cells` returns `None` for it. This is the upstream fix and the
-  clean statement of the defect: the whole frame has no surroundings, so it is
+  clean statement of the defect: a region that wide has no surroundings, so it is
   not a local feature of the scene at all, and its "salience" is the frame's
-  global contrast wearing a region's clothing.
+  global contrast wearing a region's clothing. It is untrackable for the same
+  reason — it occupies every column the matcher can search, so the only position
+  it can be found at is the one it was told to look at.
 - `_has_search_room(region_width, region_height, patch_width, patch_height)` —
   false when a search region offers the template only one legal position.
   `refine` and `_refine_scaled` return `None` in that case. This is the general
@@ -1177,10 +1179,21 @@ it:
   still say whether the target moved up or down.
 
 Both predicates are deliberately narrow, and the tests pin that narrowness. A
-region larger than the frame is refused too, but a band that spans the full width
-is not (it is a real feature), and a large-but-bounded 120x90 region in a
-160x120 frame is still found and still relocated. The rule is about covering the
-frame, not about size.
+region larger than the frame is refused too, and a large-but-bounded 120x90 region
+in a 160x120 frame is still found and still relocated. The rule is about spanning
+the frame, not about size.
+
+The width test is a later extension of the original rule, which required all four
+edges and so let a full-width band through on the reasoning that it "is a real
+feature". The live WAKE-001 run `20260921T045955Z-4b6dd88b` retired that reasoning.
+It selected `[0, 266, 2102, 1061]`, `[0, 0, 2102, 665]` and `[16, 300, 2118, 1095]`
+out of a 2102x1061 frame — every one of them the full frame width — and measured
+the same unusable mapping from each: 0.0075 px per mouse count on y, so the
+largest movement the safety cap allows displaced the view by 1.5 px against a
+12 px dead zone. A target that wide has no horizontal position left to correct
+with, which is why the mapping it yields is not a mapping at all. Height is
+deliberately *not* tested. A tall narrow region still carries a usable horizontal
+position, and no live run has offered one.
 
 There is no scene-specific threshold anywhere in the fix, no "never look down",
 no hardcoded direction, and no change to `BAND_COUNTS`, the salience weights, the
@@ -2138,7 +2151,7 @@ covered:
   than once per capture; the shipped default is non-zero; and the runner threads
   the configured value from `Config` into the loop
 
-The suite is 894 tests and runs in about 40 seconds. Everything that talks to
+The suite is 898 tests and runs in about 40 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---

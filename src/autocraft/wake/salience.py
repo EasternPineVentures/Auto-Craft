@@ -161,8 +161,8 @@ def _has_search_room(
     return int(region_width) > int(patch_width) or int(region_height) > int(patch_height)
 
 
-def _spans_frame(bbox: Sequence[int], width: int, height: int) -> bool:
-    """Whether a box covers the entire frame.
+def _spans_frame(bbox: Sequence[int], width: int) -> bool:
+    """Whether a box spans the frame width.
 
     A region that covers everything has no surroundings, so it is not a local
     feature of the scene at all - its "salience" is the frame's global contrast
@@ -170,13 +170,31 @@ def _spans_frame(bbox: Sequence[int], width: int, height: int) -> bool:
     frame-sized patch leaves the matcher no position to search. Both problems
     are the same problem, and the honest answer to it is to decline the region
     rather than to name the whole screen as a target.
+
+    The rule used to require all four edges, so only a box that covered the frame
+    outright was refused and a box as wide as the frame but half its height was
+    allowed through as "a real feature". The live WAKE-001 run
+    ``20260921T045955Z-4b6dd88b`` selected three of those in a 2102x1061 frame:
+
+        [0, 266, 2102, 1061]   [0, 0, 2102, 665]   [16, 300, 2118, 1095]
+
+    Every one is 2102 px wide, and a region that wide has no horizontal position
+    to speak of - it occupies every column the matcher could look in, so the only
+    place it can be found is the place it was told to look. All three produced
+    the same measured mapping, ``0.0075`` px per mouse count, so the largest step
+    the safety cap allows moved the view by 1.5 px against a 12 px dead zone, and
+    the centring loop spent eight moves on its first target taking the distance
+    from 171.9 px to 168.0 px. The width is what makes a region untrackable, so
+    the width is what is tested.
+
+    Height is deliberately not tested, and this is a judgement rather than an
+    oversight. A tall narrow region - a trunk against the sky - spans the frame
+    vertically but still carries a usable horizontal position, and no live run has
+    offered one. Refusing it would be symmetry for its own sake. The width case
+    is the one with evidence behind it.
     """
-    return (
-        int(bbox[0]) <= 0
-        and int(bbox[1]) <= 0
-        and int(bbox[2]) >= int(width)
-        and int(bbox[3]) >= int(height)
-    )
+    x0, _y0, x1, _y1 = (int(value) for value in bbox)
+    return (x1 - x0) >= int(width)
 
 #: How many cell scores a diagnostic summary keeps. The point is to show whether
 #: a frame was flat or merely below one threshold, which the strongest few cells
@@ -696,8 +714,8 @@ def find_candidates(
 
     Returns:
         Candidates sorted by salience, strongest first. Empty for a flat frame,
-        and empty for a frame whose only candidate would be the whole frame -
-        see :func:`_spans_frame`.
+        and empty for a frame whose only candidate would span its width - see
+        :func:`_spans_frame`.
     """
     image = frame.image if isinstance(frame, Frame) else np.asarray(frame)
     if image.ndim != 3 or image.shape[2] != 3:
@@ -745,7 +763,7 @@ def find_candidates(
         y1 = max(box[3] for box in cell_boxes_group)
         if diagnostics is not None:
             diagnostics.groups += 1
-        if _spans_frame((x0, y0, x1, y1), width, height):
+        if _spans_frame((x0, y0, x1, y1), width):
             # Every cell cleared the threshold, which on a low-contrast frame
             # means the threshold said nothing about the scene. The whole frame
             # is not a region, and it cannot be tracked, so it is not offered.
@@ -823,9 +841,9 @@ def candidate_from_cells(
     y0 = min(box[1] for box in group)
     x1 = max(box[2] for box in group)
     y1 = max(box[3] for box in group)
-    if _spans_frame((x0, y0, x1, y1), width, height):
-        # Same refusal as find_candidates: a box covering the whole frame is not
-        # a region, and a frame-sized patch cannot be located.
+    if _spans_frame((x0, y0, x1, y1), width):
+        # Same refusal as find_candidates: a box as wide as the frame is not a
+        # region, and a frame-wide patch cannot be located.
         if diagnostics is not None:
             diagnostics.rejected_frame_span += 1
         return None
