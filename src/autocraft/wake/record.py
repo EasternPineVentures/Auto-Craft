@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -99,6 +99,12 @@ class WakeResult:
         pixels_per_delta_y: Measured vertical pixels per mouse count.
         events: The structured event stream, in order.
         steps: How many loop steps the run took.
+        cadence: Where the run's wall clock went, averaged over its steps, in
+            milliseconds. Keys are ``capture``, ``decide``, ``act``, ``verify``,
+            ``since_previous_move`` and ``total``, each with a ``*_mean``
+            companion, plus ``steps_timed`` and ``moves_timed``. Empty on a run
+            that took no steps. This is a measurement, not a control: nothing
+            reads it back to change how fast the run goes.
         notes: Free-text notes worth keeping with the record.
         measured_at: Wall clock when the record was last written.
     """
@@ -141,6 +147,7 @@ class WakeResult:
     pixels_per_delta_y: float | None = None
     events: tuple[WakeEvent, ...] = ()
     steps: int = 0
+    cadence: Mapping[str, float] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
     measured_at: float | None = None
 
@@ -151,6 +158,7 @@ class WakeResult:
         object.__setattr__(self, "state", str(self.state))
         object.__setattr__(self, "stop_reason", str(self.stop_reason))
         object.__setattr__(self, "events", tuple(self.events))
+        object.__setattr__(self, "cadence", _coerce_cadence(self.cadence))
         object.__setattr__(self, "progress", tuple(float(value) for value in self.progress))
         object.__setattr__(self, "notes", tuple(str(note) for note in self.notes))
         for name in (
@@ -281,6 +289,7 @@ class WakeResult:
             },
             "successful_completion": self.successful_completion,
             "steps": self.steps,
+            "cadence": {key: round(value, 3) for key, value in self.cadence.items()},
             "events": [event.to_dict() for event in self.events],
             "stream": self.stream_lines(),
             "notes": list(self.notes),
@@ -414,6 +423,7 @@ class WakeRecorder:
             pixels_per_delta_y=_optional_float(metrics.get("pixels_per_delta_y")),
             events=self._events,
             steps=self._steps,
+            cadence=_coerce_cadence(metrics.get("cadence")),
             notes=self._notes,
             measured_at=float(self._clock()),
         )
@@ -493,6 +503,23 @@ class WakeRecorder:
             )
         except OSError:
             pass
+
+
+def _coerce_cadence(value: Any) -> dict[str, float]:
+    """Coerce a cadence metric to a float mapping, dropping anything unreadable.
+
+    A partially timed run is still worth reading, so an unreadable entry is
+    dropped rather than failing the whole record - the alternative is a run whose
+    timings vanish because one of them was ``None``.
+    """
+    if not isinstance(value, Mapping):
+        return {}
+    cadence: dict[str, float] = {}
+    for key, item in value.items():
+        number = _optional_float(item)
+        if number is not None:
+            cadence[str(key)] = number
+    return cadence
 
 
 def _optional_float(value: Any) -> float | None:

@@ -21,7 +21,7 @@ import pytest
 
 from autocraft import cli
 from autocraft.agent.action import Action, ActionResult
-from autocraft.agent.observation import Observation, WindowStatus
+from autocraft.agent.observation import Observation, WindowGeometry, WindowStatus
 from autocraft.config import Config
 from autocraft.control.safety import SafetyDecision
 from autocraft.vision.frame import Frame, ScreenRegion
@@ -356,7 +356,17 @@ class FakeGuard:
 
     def shutdown(self, reason: str = "shutdown") -> list[str]:
         self.shutdown_calls.append(reason)
+        self._note("lifecycle", reason)
         return []
+
+    def _note(self, kind: str, detail: str) -> None:
+        """Append a safety event the way the real guard does.
+
+        Faithful on purpose. The second live run's cleanup defect was an
+        ordering bug that only shows up when a safety event exists *after* the
+        recorder has closed, so a fake that never records one cannot see it.
+        """
+        self.events.append({"timestamp": 0.0, "kind": kind, "detail": detail})
 
 
 class FakeExecutor:
@@ -1651,6 +1661,11 @@ class WakeObserver:
         rng = np.random.default_rng(3)
         self.image = rng.integers(120, 140, size=(height, width, 3), dtype=np.uint8)
         self.calls = 0
+        self.seeded: list[WindowGeometry] = []
+
+    def seed_geometry(self, geometry: WindowGeometry) -> None:
+        """Record the baseline ``cmd_wake_test`` primes the observer with."""
+        self.seeded.append(geometry)
 
     def observe(
         self, index: int = 0, *, capture: bool = True, force_discovery: bool = False
@@ -1851,6 +1866,42 @@ class TestWakePlanPayload:
         rows = cli._wake_plan(Config())
         assert all(isinstance(row, tuple) and len(row) == 2 for row in rows)
 
+    def test_the_cadence_table_names_every_phase_it_measured(self) -> None:
+        rows = cli._wake_cadence_rows(
+            {
+                "capture_mean": 141.2,
+                "decide_mean": 3.4,
+                "act_mean": 0.9,
+                "verify_mean": 120.0,
+                "since_previous_move_mean": 289.7,
+                "total_mean": 300.1,
+                "steps_timed": 14.0,
+                "moves_timed": 12.0,
+            }
+        )
+        labels = [label for label, _ in rows]
+        assert labels == [
+            "mean capture",
+            "mean decision",
+            "mean movement",
+            "mean verify",
+            "mean gap between movements",
+            "mean step time",
+            "measured over",
+        ]
+        assert rows[0][1] == "141.2 ms"
+        # The sample counts are printed, so a mean over three steps is never
+        # read as a mean over thirty.
+        assert rows[-1][1] == "14 step(s), 12 movement(s)"
+
+    def test_a_run_with_no_cadence_prints_no_cadence_table(self) -> None:
+        assert cli._wake_cadence_rows({}) == []
+
+    def test_a_cadence_without_counts_still_prints_its_phases(self) -> None:
+        rows = cli._wake_cadence_rows({"total_mean": 12.0})
+
+        assert rows == [("mean step time", "12.0 ms"), ("measured over", "0 step(s), 0 movement(s)")]
+
 class TestWakeFinalisation:
     """``wake-test`` must survive to the end of a run on every exit path.
 
@@ -1955,7 +2006,100 @@ class TestWakeFinalisation:
         assert "wake-test start" in harness.guard.release_all_calls
         assert "wake-test end" in harness.guard.release_all_calls
         assert "wake-test finished" in harness.guard.shutdown_calls
-        assert harness.run_payload()["safety_events"] == []
+
+        # And the safety event that the guard records when it shuts down reached
+        # the telemetry. It did not before: the guard was shut down *after* the
+        # recorder had already written ``run.json``, so the lifecycle event was
+        # appended to a list nobody would ever read again. Every live wake run
+        # lost it.
+        events = harness.run_payload()["safety_events"]
+        assert [event["kind"] for event in events] == ["lifecycle"]
+        assert events[0]["detail"] == "run finished"
+
+    def test_a_successful_cleanup_prints_no_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The second live run finished its behaviour, saved its result, and then
+        # printed "the final safety sweep failed: RuntimeError: run ... is already
+        # closed" - because the sweep was unconditional and the loop had already
+        # closed the recorder. Nothing is allowed to append to a closed recorder,
+        # so the successful path must be silent.
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        captured = capsys.readouterr()
+
+        assert "warning" not in captured.err, captured.err
+        assert "already closed" not in captured.err, captured.err
+
+    def test_no_telemetry_is_written_after_the_recorder_closes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The invariant in full: release, then sweep, then finalize, then close -
+        # and nothing after the close. The guard is shut down a second time by
+        # this command, after the loop has finished, which is exactly the append
+        # that used to raise.
+        from autocraft.telemetry.recorder import RunRecorder
+
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+        writes: list[tuple[str, object]] = []
+
+        original_sweep = RunRecorder.record_safety_events
+
+        def watched(self: RunRecorder, events: object) -> None:
+            writes.append(("sweep", self.closed))
+            return original_sweep(self, events)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(RunRecorder, "record_safety_events", watched)
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        assert writes, "the loop's own sweep should still have happened"
+        assert all(closed is False for _, closed in writes), writes
+
+    def test_the_recorder_closes_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        from autocraft.telemetry.recorder import RunRecorder
+
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+        finishes: list[bool] = []
+
+        original_finish = RunRecorder.finish
+
+        def watched(self: RunRecorder, **kwargs: object) -> object:
+            finishes.append(self.closed)
+            return original_finish(self, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(RunRecorder, "finish", watched)
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        # The loop finalizes, and the command asks again - and the second call is
+        # the idempotent one that must find the recorder already closed.
+        assert finishes.count(False) == 1, finishes
+        assert finishes.count(True) >= 1, finishes
+        # And the single real write is what the operator can still read.
+        assert harness.run_payload()["status"] == "stopped"
+
+    def test_the_geometry_baseline_is_seeded_before_the_behaviour_runs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+    ) -> None:
+        # The plan's geometry is sampled before the focus countdown and the run's
+        # observations are sampled after it, by a different component. Seeding the
+        # observer with the plan-time answer is what lets the first observation
+        # report that the two disagree - which they did on the second live run.
+        harness = _install_wake_harness(monkeypatch, tmp_path, [_wake_status()])
+
+        _run_wake_test("--yes")
+        capsys.readouterr()
+
+        assert len(harness.world.seeded) == 1
+        seeded = harness.world.seeded[0]
+        assert seeded.handle == _wake_status().window.handle
+        assert (seeded.client_width, seeded.client_height) == (1280, 720)
 
     def test_an_early_stop_also_leaves_a_readable_result(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
@@ -1986,7 +2130,13 @@ class TestWakeFinalisation:
 
         _run_wake_test("--yes")
 
-        assert "WAKE-001 summary" in capsys.readouterr().out
+        output = capsys.readouterr().out
+        assert "WAKE-001 summary" in output
+        # The cadence reaches the operator, not just the JSON: a run that says
+        # what it did but not how long each part took cannot be compared with
+        # the next one.
+        assert "mean step time" in output
+        assert "measured over" in output
 
 
 class TestWakeReportingCannotBreakTheRun:
@@ -2076,7 +2226,7 @@ class TestFinishWakeRunRecorder:
         result = wake_recorder.finish(status="aborted", stop_reason="nothing to do")
         guard = FakeGuard()
 
-        record = cli._finish_wake_run_recorder(recorder, result, guard)
+        record = cli._finish_wake_run_recorder(recorder, result, guard, owned=False)
 
         assert record is not None
         assert record.run_id == recorder.run_id
@@ -2095,4 +2245,4 @@ class TestFinishWakeRunRecorder:
         wake_recorder = WakeRecorder(tmp_path / "wake", run_id="x", clock=lambda: 0.0)
         result = wake_recorder.finish(status="aborted", stop_reason="nothing to do")
 
-        assert cli._finish_wake_run_recorder(recorder, result, FakeGuard()) is None
+        assert cli._finish_wake_run_recorder(recorder, result, FakeGuard(), owned=False) is None

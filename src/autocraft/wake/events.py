@@ -54,6 +54,8 @@ class WakeEventKind(str, Enum):
     TARGET_CENTERED = "TARGET_CENTERED"
     WAKE_COMPLETE = "WAKE_COMPLETE"
     WAKE_ABORTED = "WAKE_ABORTED"
+    SALIENCE_SCAN_SUMMARY = "SALIENCE_SCAN_SUMMARY"
+    WINDOW_GEOMETRY_CHANGED = "WINDOW_GEOMETRY_CHANGED"
 
 
 #: One plain-language line per event kind, for the streaming view of a run.
@@ -81,6 +83,8 @@ STREAM_SUMMARY: Mapping[WakeEventKind, str] = {
     WakeEventKind.TARGET_CENTERED: "Target centred.",
     WakeEventKind.WAKE_COMPLETE: "Done - stopping here.",
     WakeEventKind.WAKE_ABORTED: "Stopping early.",
+    WakeEventKind.SALIENCE_SCAN_SUMMARY: "Recording what this frame offered.",
+    WakeEventKind.WINDOW_GEOMETRY_CHANGED: "The game window is not the size it was.",
 }
 
 

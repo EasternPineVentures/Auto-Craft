@@ -858,7 +858,11 @@ that is killed mid-way leaves behind what it had measured, and it cannot be
 mistaken for a finished run because its status is still `running`.
 
 The window size in the record is taken from the first frame that actually
-arrived, not from the plan: what the agent looked at is a measurement.
+arrived, not from the plan: what the agent looked at is a measurement. Every
+observation additionally records the window handle, the client-area size and the
+captured-frame size, so a disagreement between the plan and the frame is visible
+in the record instead of being averaged away — see
+[the second live run](#the-window-was-two-different-sizes-in-one-run).
 
 #### Known weaknesses
 
@@ -1287,6 +1291,209 @@ frame-sized patch cannot be located, and a sky-only scene ends with a truthful
 "nothing there" — but an offline reproduction is not the operator's screen. Only
 a live run can say the view stops walking into the ground.
 
+That run then happened. It answered the question, and it surfaced two defects
+nobody had been looking for.
+
+#### The second live run, and what it exposed
+
+Run 2 happened on the same machine, at the same 3222x1928 client area, with the
+same command:
+
+```powershell
+python -m autocraft wake-test --focus-delay 20 --yes
+```
+
+Run `20260921T004907Z-b066177e`. It failed, and **this time the failure is the
+fix working**:
+
+```
+status            : FAILED
+stop reason       : nothing visually salient was found in 12 scan movement(s)
+scan moves        : 12
+centring moves    : 0
+unique views      : 5 (9 revisits)
+candidate regions : 0
+target changes    : 0
+stuck patterns    : 0
+duration          : 29.77s
+```
+
+(`FAILED` is how the WAKE report renders it; `run.json` records the same run as
+`status: "stopped"` with that stop reason, which is the loop's own vocabulary for
+"the policy decided there was nothing to do".)
+
+The frame-sized false target is gone. Run 1 named the whole frame a target threetimes and then walked into the ground chasing it; run 2 scanned its bounded set
+of views, found nothing it could call a region, and **said so**. A run that
+reports "nothing there" has succeeded at being honest, not failed at centring,
+and that outcome is preserved exactly as it happened — it was not tuned until it
+looked better.
+
+What run 2 did expose was two defects in the machinery around the behaviour, and
+one thing nobody had measured.
+
+##### The window was two different sizes in one run
+
+The startup banner reported a client area of **3222x1928**. The finished report
+said the frame was **3591x1928**:
+
+| | left | top | width | height |
+|---|---|---|---|---|
+| startup (`status`) | 615 | 85 | **3222** | 1928 |
+| every loop step | 246 | 85 | **3591** | 1928 |
+
+Same right edge (3837), same top and bottom, same height — the capture region
+was 369 px wider on the left, and every one of the 13 loop steps agreed with the
+wider figure. The two numbers were not competing measurements of one window;
+they came from **two different code paths**, which is why the discrepancy
+survived a run that otherwise worked:
+
+- The startup banner, the printed table and the plan step all come from a single
+  `WindowLocator.status(force=True)` taken *before* the focus countdown.
+- The `window` field in the finished report comes from the **first captured
+  frame** (`WakeRunner._after_observation`), not from the locator at all.
+
+`ScreenCapturer.capture_region` refuses to return a frame whose size does not
+match the region it was asked for, so the wider region was a real, separately
+obtained `ScreenRegion` — the locator's own answer had changed between the
+pre-countdown reading and the first capture. The handle check before injection
+passed, so this is not "it measured the wrong window", and the two readings share
+a right edge, a top and a bottom, differing only on the left: a genuine geometry
+change on the same handle is the leading explanation, and the 20-second focus
+handoff is exactly the window in which the operator is being asked to click into
+the game.
+
+The useful negative evidence came from the operator's next run, at a resized
+**2246x1159**: there, the startup region and *every* loop step were byte-identical.
+So this is not a systematic DPI-scaling bug that would fire on every run — it is a
+timing-and-selection effect, which is exactly the kind of thing that only shows up
+live. The preserved record cannot settle which of those it is; the next run's
+instrumentation can.
+
+AutoCraft does not resize the window to make this go away, and it does not paper
+over the disagreement. Instead **every observation now carries its own geometry**:
+
+```
+window_handle, client_width, client_height, frame_width, frame_height
+```
+
+and the policy emits `WINDOW_GEOMETRY_CHANGED` with `changed`, `before` and
+`after` when the client area and the captured frame stop agreeing. The locator's
+pre-countdown answer is seeded as the baseline, so the comparison is against the
+reading the operator was actually shown.
+
+##### The final safety sweep ran after the recorder had closed
+
+Run 2 completed its primary result and then printed:
+
+```
+warning: the final safety sweep failed:
+RuntimeError: run <id> is already closed; telemetry can no longer be recorded
+```
+
+The cause was an ordering bug, not a reporting bug. `AgentLoop.run()`'s `finally`
+block released inputs, then recorded safety events, then finalised the run, then
+shut the guard down — but `SafetyGuard.shutdown()` **is itself a safety event**
+(it records a `KIND_LIFECYCLE` entry). So the shutdown event was produced *after*
+the last sweep had already run, and was silently lost on every wake run. The CLI
+then swept `guard.events` a second time, after `AgentLoop` had already finalised
+the recorder, which is what raised.
+
+Two things were wrong and both are fixed:
+
+1. The order is now **release → shutdown → record the final safety events →
+   finalise the run**. The lifecycle event exists before the sweep that carries
+   it, so it is recorded rather than dropped.
+2. The CLI's sweep now runs **only when the loop never ran**. On the path where
+   the behaviour ran, the loop already swept its own events. As it stood, the
+   CLI passed the *entire* event list rather than a cursor, so had that call ever
+   succeeded it would have duplicated every safety event in the record.
+
+Nothing suppresses the warning; the ordering that produced it is gone, and a
+regression test asserts a successful cleanup prints no warning at all.
+
+##### Nobody had measured where the time went
+
+`steps.ndjson` recorded one number per step: `duration`. It did not record how
+much of that was capture, how much was deciding, or how long the game sat still
+between two inputs — so "the run took 29.77 s" was the only cadence fact
+available, and it turned out to be misleading. Every step now records a phase
+breakdown:
+
+```json
+"timings": {
+  "capture": 141.2, "decide": 3.4, "act": 0.9, "verify": 120.0,
+  "since_previous_move": 289.7, "total": 300.1
+}
+```
+
+milliseconds, per step, and `wake_result.json` carries the means plus the sample
+counts (`steps_timed`, `moves_timed`) so a mean over three steps can never be
+read as a mean over thirty. Nothing smooths them and nothing reads them back.
+
+Reading the two preserved runs with that decomposition finally explains the
+headline durations:
+
+| | run 2 (3222x1928) | re-run (2246x1159) |
+|---|---|---|
+| recorded `duration` | 29.77 s | 24.11 s |
+| **focus countdown** | **20.02 s** | **20.02 s** |
+| behaviour (sum of steps) | 9.71 s | 4.07 s |
+| mean step | 747.2 ms | 313.1 ms |
+| slowest / fastest step | 870.8 / 617.4 ms | 440.0 / 246.0 ms |
+| gap between steps | 2-4 ms | 2-3 ms |
+
+Two things fall out of this, and both are more useful than the headline number:
+
+- **67-83% of the run's recorded duration is the focus countdown**, not
+  behaviour. The `--focus-delay 20` handoff is inside the run, so `duration`
+  mixes a fixed human-paced wait into a measurement of the agent. Comparing two
+  runs by `duration` is comparing their countdowns.
+- **Behaviour time scales with pixels, and nothing else does.** Halving the
+  resolution by area (6.21 → 2.60 Mpx, a factor of 2.39) cut the mean step from
+  747 ms to 313 ms — a factor of 2.39. The gap between steps stayed at 2-4 ms, so
+  the loop is never idle and `step_interval` is doing nothing here. Capture and
+  analysis *are* the step time.
+
+The 2246x1159 re-run is still above the 1 Mpx the design assumes, and it produced
+the same outcome as run 2 — 5 unique views, 9 revisits, 0 candidates, the same
+stop reason. A smaller window made it faster; it did not make it see anything.
+
+#### Before the next live run
+
+Both of the runs above were far larger than the size the behaviour was designed
+around, and step time tracks frame area almost exactly, so the next run is worth
+doing at a genuinely small client area. **AutoCraft will not resize the window
+for you** — the window is the thing being measured — so this is a manual step.
+
+1. Resize the Luanti window by hand, then confirm what AutoCraft can see:
+
+   ```powershell
+   python -m autocraft status
+   ```
+
+   The reported client area should be roughly **1280x720**, or at least below
+   about 1,000,000 pixels. Do not proceed on a larger window.
+
+2. Then run the behaviour:
+
+   ```powershell
+   python -m autocraft wake-test --focus-delay 20 --yes
+   ```
+
+Read the result against the two runs above on: mean step time, capture duration,
+unique views, revisits, candidate count, **candidate rejection reasons** (the
+`SALIENCE_SCAN_SUMMARY` events, which say *why* nothing was found rather than only
+that nothing was), centring moves, target path, dead repetition, and the stop
+reason. There is no pass/fail threshold: a run that scans a bounded set of views
+and reports honestly that it found nothing is a valid result, and lowering the
+salience threshold until a candidate appears would destroy the measurement the
+whole milestone rests on.
+
+The next run is also the first one that will record a per-phase `timings`
+breakdown and a per-observation `WINDOW_GEOMETRY_CHANGED` comparison, so it is the
+first one whose numbers can say where the time went and whether the geometry
+moved.
+
 #### What it does not do
 
 No semantic object recognition, no tree recognition, no LLM in the motor path,
@@ -1638,8 +1845,22 @@ covered:
 - the `wake-test` crash regression: the exact `dict()`-on-a-2-tuple defect that
   killed the first live run is pinned as still raising, so the fix cannot be
   undone by a plausible-looking tidy-up
+- the WAKE-001 salience funnel, keyed on the case run 2 actually hit: a
+  sky-only frame reports `every_group_refused` with `rejected_frame_span: 1`
+  beside `surviving_candidates: 0`, so a diagnostic can never read as
+  "candidates survived" when none did. The relocation refusals
+  (`rejected_search_room`, `rejected_score`, `rejected_flat_patch`) and the
+  top-cell-score list are covered too, and the summary is asserted to carry no
+  pixel data
+- the WAKE-001 geometry instrumentation: `WINDOW_GEOMETRY_CHANGED` fires on a
+  real client-area/frame-size disagreement and *not* on an unchanged run, and
+  every observation records its handle and both sizes
+- the WAKE-001 cadence: the per-phase breakdown reaches the step record, the
+  means and their sample counts reach `wake_result.json`, an unreadable timing
+  is dropped rather than failing the record, a run that timed nothing reports an
+  empty cadence rather than zeros, and a successful cleanup prints no warning
 
-The suite is 820 tests and runs in about 25 seconds. Everything that talks to
+The suite is 854 tests and runs in about 28 seconds. Everything that talks to
 the real OS is exercised manually, through the commands above.
 
 ---
@@ -1816,10 +2037,13 @@ python -m autocraft look-test --calibrate-horizontal --yes
 
 ## Where this goes next
 
-**The first behaviour is now built, and the mapping is still the open question.**
-`wake-test` (WAKE-001) looks around, picks the most visually salient region it can
-find, centres it, and stops — bounded at every phase, with the mouse mapping
-self-measured as it goes. It has not been run live yet.
+**The first behaviour is now built, has now run live three times, and the
+mapping is still the open question.** `wake-test` (WAKE-001) looks around, picks
+the most visually salient region it can find, centres it, and stops — bounded at
+every phase, with the mouse mapping self-measured as it goes. It has now been run
+against a real Luanti scene three times, and none of those runs has yet produced
+a target (see
+[the second live run, and what it exposed](#the-second-live-run-and-what-it-exposed)).
 
 **The mapping is what it is still missing.** LOOK-001's `(+200, +0)` probe
 settled that relative mouse input turns the camera; it did not produce a
@@ -1844,11 +2068,12 @@ worktree than the branch — see
 
 **After that**, the ordering that follows from what has actually been measured:
 
-1. **Run WAKE-001 live once, and read what it records.** The behaviour is built
-   and tested against synthetic frames, but it has never faced a real scene. The
-   first live run is the only way to find out whether the salience it computes on
-   a real Luanti frame picks anything sensible, and whether its self-measured
-   mapping settles.
+1. **Run WAKE-001 live again at a genuinely small client area, and read what it
+   records.** The behaviour has now faced a real scene three times without ever
+   finding a target, and the two most recent runs operated at 6.2 and 2.6
+   million pixels — well above the size the design assumes. The next live run is
+   the first one that is both instrumented and small enough for its numbers to
+   mean what they say.
 2. **Feed the measured mapping back in.** Once `look-test` produces a ratio,
    `wake-test` can adopt it as a starting calibration instead of beginning from a
    fixed band count, which is the difference between a first correction that is

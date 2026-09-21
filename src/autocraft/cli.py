@@ -32,7 +32,7 @@ from . import __version__
 from .agent.action import Action, ActionExecutor
 from .agent.decision import NoOpDecisionPolicy
 from .agent.loop import AgentLoop
-from .agent.observation import Observer
+from .agent.observation import Observer, WindowGeometry
 from .config import Config, ConfigError, DEFAULT_CONFIG_FILENAME, load_config
 from .control.errors import ControlError, InputBlocked
 from .control.keyboard import Keyboard
@@ -1723,21 +1723,34 @@ def _note_reporting_failure(what: str, exc: BaseException) -> None:
 
 
 def _finish_wake_run_recorder(
-    recorder: RunRecorder, result: WakeResult, guard: Any
+    recorder: RunRecorder, result: WakeResult, guard: Any, *, owned: bool
 ) -> RunRecord | None:
-    """Sweep the last safety events and close out the run telemetry.
+    """Sweep any unrecorded safety events, then close out the run telemetry.
 
-    Both calls are best-effort. The agent loop writes ``run.json`` and closes
-    the recorder from its own ``finally`` block, so by the time the behaviour
-    ends this is the idempotent second call that hands back the same record -
-    and the safety sweep has normally already happened too. Neither may be the
-    reason a finished run loses its cleanup or its summary.
+    The order is release, sweep, finalize, close - and nothing may append after
+    the close. The agent loop performs all of it from its own ``finally`` block
+    when it runs, so on the normal path there is nothing left to sweep and the
+    ``finish`` below is the idempotent second call that hands back the same
+    record.
+
+    ``owned`` says whether this command owns the shutdown. It does when the
+    behaviour never ran - a refusal, or an error on the way in - and then the
+    safety events in ``guard`` have never been written and must be. When the loop
+    did run, it already recorded the tail it produced, and appending here would
+    both duplicate what it wrote and, since it also closed the recorder, raise
+    ``run ... is already closed``. That warning was the whole of the second live
+    run's cleanup defect: the sweep was unconditional, so the successful path
+    always tried to write to a closed recorder.
+
+    The sweep is also passed the whole event list rather than a slice, because it
+    only runs on the path where the loop never got to record anything.
     """
     run_record: RunRecord | None = None
-    try:
-        recorder.record_safety_events(guard.events)
-    except Exception as exc:  # noqa: BLE001 - telemetry must not break the run
-        _note_reporting_failure("the final safety sweep", exc)
+    if owned and not recorder.closed:
+        try:
+            recorder.record_safety_events(guard.events)
+        except Exception as exc:  # noqa: BLE001 - telemetry must not break the run
+            _note_reporting_failure("the final safety sweep", exc)
     try:
         run_record = recorder.finish(
             status="wake-test",
@@ -1851,6 +1864,15 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
         region = status.window.region
         window_width, window_height = region.width, region.height
         wake_dir = Path(runtime.config.runs_dir) / "wake"
+
+        # The geometry printed above and written into the plan was sampled now,
+        # before the focus countdown. The run's own observations are sampled after
+        # it, by a different component. Priming the observer with this answer is
+        # what makes the first observation able to say whether the two agree, and
+        # a live run has already been recorded where they did not.
+        runtime.observer.seed_geometry(
+            WindowGeometry.of(handle=target_handle, region=region)
+        )
 
         print("WAKE-001: WAKE UP, LOOK AROUND, TURN TOWARD SOMETHING")
         print()
@@ -1993,6 +2015,10 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
 
         result: WakeResult | None = None
         interrupted = False
+        # Whether the agent loop ran to completion. The loop performs the whole
+        # release-sweep-finalize-close sequence itself, so when it did, this
+        # command must not try to sweep again into a recorder that has closed.
+        behaviour_ran = False
         try:
             guard.release_all("wake-test start")
 
@@ -2017,6 +2043,7 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
                 exit_code = 1
             else:
                 result = runner.run()
+                behaviour_ran = True
                 exit_code = 0 if result.status == WAKE_STATUS_COMPLETED else 1
         except KeyboardInterrupt:
             interrupted = True
@@ -2026,13 +2053,24 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
             print("\ninterrupted by Ctrl+C; releasing everything")
             exit_code = 130
         finally:
-            # Order matters, and it is the whole point of this block. Releasing
-            # input is safety, not reporting, so it goes first and unguarded.
-            # The measurement (wake_result.json) is finalized next, before any
-            # reporting is attempted. Reporting then happens through helpers
-            # that attempt each piece separately, so one presentational failure
-            # can no longer skip the observer shutdown or the printed summary -
-            # which is exactly what happened on the first live run.
+            # Order matters, and it is the whole point of this block, because it
+            # is the order the telemetry contract requires:
+            #
+            #   1. the behaviour has ended
+            #   2. release held input
+            #   3. record the final safety events
+            #   4. finalize the required run telemetry
+            #   5. close the recorder
+            #   6. and only then, nonessential presentation
+            #
+            # Releasing input is safety, not reporting, so it goes first and
+            # unguarded. ``shutdown`` records a lifecycle event, so it has to
+            # precede the sweep that is supposed to capture it. The measurement
+            # (wake_result.json) is finalized before any reporting is attempted.
+            # Reporting then happens through helpers that attempt each piece
+            # separately, so one presentational failure can no longer skip the
+            # observer shutdown or the printed summary - which is exactly what
+            # happened on the first live run.
             released = guard.release_all("wake-test end")
             guard.shutdown("wake-test finished")
             if result is None:
@@ -2041,7 +2079,7 @@ def cmd_wake_test(args: argparse.Namespace) -> int:
                     stop_reason="stopped before the behaviour began",
                     state=policy.state.value,
                 )
-            run_record = _finish_wake_run_recorder(recorder, result, guard)
+            run_record = _finish_wake_run_recorder(recorder, result, guard, owned=not behaviour_ran)
             _present_wake_outcome(
                 result,
                 run_record=run_record,
@@ -2089,6 +2127,31 @@ def _wake_progress_series(progress: Sequence[float]) -> str:
     if not progress:
         return "not measured"
     return " -> ".join(f"{float(value):g}" for value in progress)
+
+
+def _wake_cadence_rows(cadence: Mapping[str, float]) -> list[tuple[str, str]]:
+    """Turn the measured cadence into printable rows, or nothing at all.
+
+    Nothing is printed for a run that took no timed steps, because a table of
+    dashes reads like a measurement that came back zero.
+    """
+    if not cadence:
+        return []
+    labels = (
+        ("capture_mean", "mean capture"),
+        ("decide_mean", "mean decision"),
+        ("act_mean", "mean movement"),
+        ("verify_mean", "mean verify"),
+        ("since_previous_move_mean", "mean gap between movements"),
+        ("total_mean", "mean step time"),
+    )
+    rows = [(label, f"{cadence[key]:.1f} ms") for key, label in labels if key in cadence]
+    if not rows:
+        return []
+    steps = int(cadence.get("steps_timed", 0))
+    moves = int(cadence.get("moves_timed", 0))
+    rows.append(("measured over", f"{steps} step(s), {moves} movement(s)"))
+    return rows
 
 
 def _print_wake_summary(result: WakeResult, *, released: bool, telemetry: Any) -> None:
@@ -2171,9 +2234,13 @@ def _print_wake_summary(result: WakeResult, *, released: bool, telemetry: Any) -
         rows.append(("productive repetition", f"{result.productive_repetition_ratio:.3f}"))
     rows.append(("released inputs", "none" if not released else ", ".join(released)))
     rows.append(("telemetry", telemetry))
+    cadence = _wake_cadence_rows(result.cadence)
     if rows:
         print()
         _print_table(rows)
+    if cadence:
+        print()
+        _print_table(cadence)
 
     lines = result.stream_lines()
     if lines:

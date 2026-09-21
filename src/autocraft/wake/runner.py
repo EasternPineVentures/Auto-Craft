@@ -37,7 +37,7 @@ anything and the record must not imply that it did.
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from ..agent.loop import AgentLoop
 from ..agent.observation import Observation, Observer
@@ -142,6 +142,11 @@ class WakeRunner:
         self._events: list[WakeEvent] = []
         self._steps = 0
         self._loop: AgentLoop | None = None
+        #: Per-phase millisecond samples, one list per timing key. Kept raw
+        #: rather than averaged as it goes so a single number cannot quietly
+        #: stand in for a distribution - the operator asked to compare runs, and
+        #: the first honest comparison is of the same statistic across both.
+        self._timings: dict[str, list[float]] = {}
 
     # -- read side --------------------------------------------------------
 
@@ -185,7 +190,7 @@ class WakeRunner:
         record = loop.run(max_steps=self.max_steps, max_seconds=self.max_seconds)
         self._drain()
         self.recorder.update(
-            metrics=self.policy.report(),
+            metrics=self._metrics(),
             events=self._events,
             steps=self._steps,
             state=self.policy.state.value,
@@ -225,7 +230,7 @@ class WakeRunner:
         self._publish_status()
 
     def _after_step(self, record: Any) -> None:
-        """Count a completed step and refresh the record on disk.
+        """Count a completed step, absorb its timings, and refresh the record.
 
         The record is rewritten per step rather than only at the end, so a run
         that is killed mid-way still leaves what it had measured. A partial record
@@ -233,12 +238,56 @@ class WakeRunner:
         run because its status is still ``running``.
         """
         self._steps += 1
+        self._absorb_timings(record)
         self.recorder.update(
-            metrics=self.policy.report(),
+            metrics=self._metrics(),
             events=self._events,
             steps=self._steps,
             state=self.policy.state.value,
         )
+
+    def _absorb_timings(self, record: Any) -> None:
+        """Collect one step's phase timings, if it reported any.
+
+        ``getattr`` rather than an attribute read because the runner is handed
+        whatever the loop produced, and a step that predates the timing
+        instrumentation must not break the run that is being measured.
+        """
+        timings = getattr(record, "timings", None)
+        if not isinstance(timings, Mapping):
+            return
+        for key, value in timings.items():
+            try:
+                milliseconds = float(value)
+            except (TypeError, ValueError):
+                continue
+            self._timings.setdefault(str(key), []).append(milliseconds)
+
+    def _metrics(self) -> dict[str, Any]:
+        """The policy's report, plus the cadence the loop measured."""
+        metrics = dict(self.policy.report())
+        cadence = self.cadence()
+        if cadence:
+            metrics["cadence"] = cadence
+        return metrics
+
+    def cadence(self) -> dict[str, float]:
+        """Mean milliseconds per phase across the run's steps, and the counts.
+
+        Reported as means rather than totals because that is what makes two runs
+        of different lengths comparable, and reported *alongside* the sample
+        counts so a mean over three steps is never mistaken for one over thirty.
+        Nothing smooths these numbers and nothing reads them back.
+        """
+        cadence: dict[str, float] = {}
+        for key, samples in self._timings.items():
+            if not samples:
+                continue
+            cadence[f"{key}_mean"] = round(sum(samples) / len(samples), 3)
+        if cadence:
+            cadence["steps_timed"] = float(self._steps)
+            cadence["moves_timed"] = float(len(self._timings.get("since_previous_move", ())))
+        return cadence
 
     def _drain(self) -> None:
         """Forward every pending event, in order, to the callback and the record."""

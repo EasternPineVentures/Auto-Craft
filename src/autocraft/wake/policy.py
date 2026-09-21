@@ -91,6 +91,7 @@ from .salience import (
     DEFAULT_PEAK_FRACTION,
     CandidateTarget,
     Relocation,
+    SalienceDiagnostics,
     SalienceMap,
     SelectionWeights,
     TargetPatch,
@@ -414,6 +415,13 @@ class WakeDecisionPolicy:
         self.stop_reason = ""
         self.thought_tick = 0
         self._last_salience: SalienceMap | None = None
+        # Diagnostics for the salience pipeline. The scan accumulator describes
+        # one frame and is replaced at the start of every scan; the relocation one
+        # accumulates across the run, because the refusals it counts can only
+        # happen once a target has been chosen.
+        self._scan_diagnostics = SalienceDiagnostics()
+        self._relocation_diagnostics = SalienceDiagnostics()
+        self._last_view_key = ""
 
     # ------------------------------------------------------------------- protocol
 
@@ -433,6 +441,8 @@ class WakeDecisionPolicy:
 
         if self.state in TERMINAL_STATES:
             return Action.stop(self.stop_reason or self.state.value)
+
+        self._note_geometry(observation)
 
         if observation.frame is None:
             self.capture_failures += 1
@@ -477,6 +487,27 @@ class WakeDecisionPolicy:
 
     # --------------------------------------------------------------------- states
 
+    def _note_geometry(self, observation: Observation) -> None:
+        """Record a change in the window's geometry, if there was one.
+
+        The geometry recorded on each observation already carries the before and
+        after numbers, so this only turns them into an event. It deliberately does
+        nothing about the change: AutoCraft does not resize the game window, does
+        not restart the run, and does not adjust its thresholds to suit a new
+        resolution. Sizing the window is the operator's business, and the run's job
+        is to say plainly what it saw.
+        """
+        previous = observation.geometry_changed_from
+        if previous is None:
+            return
+        current = observation.geometry
+        self._emit(
+            WakeEventKind.WINDOW_GEOMETRY_CHANGED,
+            changed=list(observation.geometry_change),
+            before=previous.to_dict(),
+            after=current.to_dict(),
+        )
+
     def _start(self, frame: Frame) -> Action:
         """Take in the starting view, then begin scanning in the same step."""
         self.start_fingerprint = ViewFingerprint.of(frame, grid=self.view_grid)
@@ -501,6 +532,7 @@ class WakeDecisionPolicy:
         self._observe_view(frame)
 
         candidates = self._find(frame)
+        self._emit_scan_summary(frame, candidates)
         if candidates:
             for candidate in candidates:
                 self.memory.note_candidate(candidate)
@@ -1002,6 +1034,9 @@ class WakeDecisionPolicy:
         """Fingerprint the view and record whether it has been seen before."""
         fingerprint = ViewFingerprint.of(frame, grid=self.view_grid)
         observation = self.memory.note_view(fingerprint, index=self.step_index, timestamp=self.clock())
+        # Kept so the salience summary can name the view it is describing. A
+        # summary of a frame is only useful if you can tell which view it was.
+        self._last_view_key = fingerprint.key
         self.progress.note_scan(new_view=not observation.revisited)
         if observation.revisited:
             self._emit(
@@ -1026,7 +1061,12 @@ class WakeDecisionPolicy:
         self._emit(WakeEventKind.VIEW_CAPTURED, index=self.step_index, size=list(self.frame_size or ()))
 
     def _find(self, frame: Frame) -> list[CandidateTarget]:
-        """Find and score the candidates in this frame."""
+        """Find and score the candidates in this frame.
+
+        The diagnostics accumulator is replaced here, so it always describes the
+        frame this call was given rather than a mixture of frames.
+        """
+        self._scan_diagnostics = SalienceDiagnostics()
         self._last_salience = salience_map(frame, grid=self.salience_grid)
         candidates = find_candidates(
             frame,
@@ -1035,10 +1075,45 @@ class WakeDecisionPolicy:
             peak_fraction=self.peak_fraction,
             min_salience=self.min_salience,
             limit=CANDIDATE_LIMIT,
+            diagnostics=self._scan_diagnostics,
         )
         if not candidates:
             return []
         return score_candidates(candidates, frame_size=self.frame_size or (frame.width, frame.height), weights=self.weights)
+
+    def _emit_scan_summary(self, frame: Frame, candidates: list[CandidateTarget]) -> None:
+        """Say why this frame yielded the candidates it did.
+
+        A run that ends with "nothing visually salient was found" is telling the
+        truth and explaining nothing: several different rules can empty the
+        candidate list, and until this event existed they were indistinguishable
+        in the record. Every number here is read back out of the pipeline that
+        actually ran - the same thresholds, the same grouping, the same refusals -
+        so it is evidence about this frame rather than a second opinion on it.
+        Nothing here changes a decision; the event is written after the decision
+        has already been made.
+        """
+        detail = self._scan_diagnostics.to_dict()
+        # The four relocation counters come from the run-level accumulator, not
+        # from this frame's: the rules they count live in the patch matcher, which
+        # only runs once a target has been chosen. Reporting them here keeps every
+        # refusal reason in one place, and `relocation_attempts` is what tells a
+        # reader whether a zero means "nothing was refused" or "nothing was ever
+        # attempted" - which, for a run that found no candidates at all, is the
+        # difference between a mystery and an answer.
+        relocation = self._relocation_diagnostics
+        detail.update(
+            view_id=self._last_view_key,
+            frame_width=int(frame.width),
+            frame_height=int(frame.height),
+            surviving_candidates=len(candidates),
+            candidates_in_memory=len(self.memory.strongest_candidates(CANDIDATE_LIMIT)),
+            relocation_attempts=relocation.relocation_attempts,
+            rejected_search_room=relocation.rejected_search_room,
+            rejected_score=relocation.rejected_score,
+            rejected_flat_patch=relocation.rejected_flat_patch,
+        )
+        self._emit(WakeEventKind.SALIENCE_SCAN_SUMMARY, **detail)
 
     def _locate(self, frame: Frame, target: _Target, *, wide: bool = False) -> tuple[Any, float] | None:
         """Find the selected region in a new frame, and say how sure we are.
@@ -1057,12 +1132,14 @@ class WakeDecisionPolicy:
         if wide:
             window = None
 
+        self._relocation_diagnostics.relocation_attempts += 1
         found = locate(
             frame,
             target.patch,
             predicted=predicted,
             window=window,
             coarse_scale=self.coarse_scale,
+            diagnostics=self._relocation_diagnostics,
         )
         if found is None:
             return None

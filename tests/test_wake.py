@@ -43,6 +43,7 @@ from autocraft.agent.observation import Observation, WindowStatus
 from autocraft.config import Config
 from autocraft.observer.snapshot import WakeReport
 from autocraft.observer.state import ObserverState
+from autocraft.telemetry.recorder import RunRecorder
 from autocraft.vision.frame import Frame
 from autocraft.wake import (
     EXPERIMENT_NAME,
@@ -338,6 +339,351 @@ def test_a_sky_only_scene_selects_no_target_at_all() -> None:
     assert kinds.count(WakeEventKind.CENTERING_PROGRESS) == 0
     assert policy.scan_moves <= policy.max_scan_moves
     assert "nothing visually salient" in (policy.stop_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# SALIENCE DIAGNOSTICS
+#
+# Three different rules can empty the candidate list, and before this they all
+# returned the same bare ``[]``. The second live run ended with "nothing
+# visually salient was found in 12 scan movement(s)" - a true statement that
+# explained nothing. These tests pin the evidence that was added to explain it.
+# ---------------------------------------------------------------------------
+
+
+def _diagnostics_for(image: np.ndarray, **kwargs: object) -> dict:
+    from autocraft.wake.salience import SalienceDiagnostics
+
+    accumulator = SalienceDiagnostics()
+    find_candidates(image, grid=8, diagnostics=accumulator, **kwargs)  # type: ignore[arg-type]
+    return accumulator.to_dict()
+
+
+def test_a_flat_frame_says_the_frame_itself_was_flat() -> None:
+    """A featureless frame is not "the threshold found nothing", it is "no contrast"."""
+    report = _diagnostics_for(np.zeros((120, 160, 3), dtype=np.uint8))
+
+    assert report["refusal"] == "flat_frame"
+    assert report["max_cell_score"] == 0.0
+    assert report["groups"] == 0, "no group should have formed"
+    assert report["cells_above_threshold"] == 0
+
+
+def test_a_sky_frame_says_the_group_was_refused_for_spanning_the_frame() -> None:
+    """The second live run, in one assertion.
+
+    Every cell of the sky cleared the threshold, so the map formed exactly one
+    group - and that group was the whole frame, which is refused. The record has
+    to say that, because it is the difference between "this frame offered nothing"
+    and "this frame offered one thing and it was not a region".
+    """
+    report = _diagnostics_for(gradient_sky())
+
+    assert report["refusal"] == "every_group_refused"
+    assert report["groups"] == 1, "the sky does form a group; that is the problem"
+    assert report["cells_above_threshold"] == 64, "every cell cleared the threshold"
+    assert report["rejected_frame_span"] == 1
+    assert report["surviving_candidates"] == 0
+    assert report["max_cell_score"] > report["min_salience"], "the frame was not flat"
+
+
+def test_a_frame_that_yields_a_candidate_reports_no_refusal() -> None:
+    """A refusal is only recorded when something was refused."""
+    image = with_blob(scene(), y0=30, y1=70, x0=40, x1=90)
+    report = _diagnostics_for(image)
+
+    assert report["refusal"] == ""
+    assert report["surviving_candidates"] == 1
+    assert report["groups"] == 1
+    assert report["rejected_frame_span"] == 0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"min_salience": 99.0}, "flat_frame"),
+        ({"peak_fraction": 2.0}, "below_threshold"),
+    ],
+)
+def test_the_diagnostics_name_which_rule_emptied_the_list(
+    kwargs: dict, expected: str
+) -> None:
+    """Each early exit has its own name, so a zero is not a shrug.
+
+    ``min_salience`` above the frame's peak means the frame was judged flat;
+    ``peak_fraction`` above 1.0 leaves the threshold unreachable, which is a
+    threshold decision rather than a flatness one. Those are different facts.
+    """
+    image = with_blob(scene(), y0=30, y1=70, x0=40, x1=90)
+    report = _diagnostics_for(image, **kwargs)
+
+    assert report["refusal"] == expected
+    assert report["surviving_candidates"] == 0
+
+
+def test_the_top_cell_scores_are_bounded_and_ordered() -> None:
+    """The strongest cells are kept as evidence, and only a handful of them."""
+    image = with_blob(scene(), y0=30, y1=70, x0=40, x1=90)
+    report = _diagnostics_for(image)
+    scores = report["top_cell_scores"]
+
+    assert len(scores) == 8, "eight is the cap, and a full grid has more cells than that"
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0] == pytest.approx(report["max_cell_score"], abs=1e-4)
+
+
+def test_the_top_cell_scores_never_exceed_the_cap() -> None:
+    from autocraft.wake.salience import _TOP_CELL_SCORES
+
+    report = _diagnostics_for(gradient_sky(height=240, width=320))
+    assert len(report["top_cell_scores"]) == _TOP_CELL_SCORES
+    assert _TOP_CELL_SCORES < 8 * 8, "the cap has to be smaller than the grid to mean anything"
+
+
+def test_the_diagnostics_carry_no_pixel_data() -> None:
+    """This is telemetry, not a frame dump: every value is a number or a label."""
+    report = _diagnostics_for(gradient_sky())
+
+    assert json.loads(json.dumps(report)) == report, "it must survive a round trip"
+    for key, value in report.items():
+        assert isinstance(value, (int, float, str, list)), f"{key} is {type(value).__name__}"
+        if isinstance(value, list):
+            assert all(isinstance(item, float) for item in value), key
+    assert len(report) < 24, "a diagnostic that grows without bound is a second problem"
+
+
+def test_the_diagnostics_are_per_call_and_not_shared() -> None:
+    """Two accumulators, two frames, no cross-talk.
+
+    Module-level counters would have been the easy way to do this and would have
+    made the numbers depend on whatever else happened to run first.
+    """
+    from autocraft.wake.salience import SalienceDiagnostics
+
+    sky = SalienceDiagnostics()
+    blob = SalienceDiagnostics()
+    find_candidates(gradient_sky(), grid=8, diagnostics=sky)
+    find_candidates(with_blob(scene(), y0=30, y1=70, x0=40, x1=90), grid=8, diagnostics=blob)
+
+    assert sky.rejected_frame_span == 1 and blob.rejected_frame_span == 0
+    assert blob.surviving_candidates == 1 and sky.surviving_candidates == 0
+
+
+def test_a_relocation_refused_for_search_room_says_so() -> None:
+    """The patch matcher's own refusals are counted too, in their own slots."""
+    from autocraft.wake.salience import SalienceDiagnostics, refine
+
+    sky = gradient_sky()
+    patch = TargetPatch(image=sky, origin=(0, 0), centre=(80.0, 60.0))
+    accumulator = SalienceDiagnostics()
+
+    assert refine(frame_of(sky), patch, diagnostics=accumulator) is None
+    assert accumulator.rejected_search_room == 1
+    assert accumulator.rejected_score == 0
+    assert accumulator.rejected_flat_patch == 0
+
+
+def test_a_relocation_refused_for_its_score_says_so() -> None:
+    from autocraft.wake.salience import SalienceDiagnostics, refine
+
+    image = with_blob(scene(), y0=25, y1=95, x0=25, x1=135)
+    frame = frame_of(image)
+    candidate = find_candidates(frame, grid=8)[0]
+    patch = TargetPatch.of(frame, candidate.bbox, centre=candidate.centre)
+    accumulator = SalienceDiagnostics()
+
+    assert refine(frame, patch, min_score=1.5, diagnostics=accumulator) is None
+    assert accumulator.rejected_score == 1
+    assert accumulator.rejected_search_room == 0
+
+
+def test_a_relocation_refused_for_a_flat_patch_says_so() -> None:
+    from autocraft.wake.salience import SalienceDiagnostics, refine
+
+    flat = np.zeros((60, 60, 3), dtype=np.uint8)
+    patch = TargetPatch.of(flat, (10, 10, 50, 50))
+    accumulator = SalienceDiagnostics()
+
+    assert refine(flat, patch, window=None, diagnostics=accumulator) is None
+    assert accumulator.rejected_flat_patch == 1
+
+
+def test_the_scan_summary_is_emitted_once_per_scanned_frame() -> None:
+    """One event per frame the scan looked at, and no more."""
+    policy = WakeDecisionPolicy(max_moves=45)
+    _run_policy(policy, [gradient_sky(height=240, width=320)])
+
+    summaries = [e for e in policy.drain_events() if e.kind is WakeEventKind.SALIENCE_SCAN_SUMMARY]
+    assert len(summaries) == policy.scan_moves + 1, (
+        "the starting view is scanned too, so there is one summary per frame in hand"
+    )
+
+
+def test_the_scan_summary_explains_the_second_live_run() -> None:
+    """The whole point: a zero-candidate run has to say why it found nothing.
+
+    The second live run scanned twelve movements, found nothing, and said so.
+    These are the numbers that turn that sentence into an explanation.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    _run_policy(policy, [gradient_sky(height=240, width=320)])
+
+    summaries = [e for e in policy.drain_events() if e.kind is WakeEventKind.SALIENCE_SCAN_SUMMARY]
+    assert summaries, "a scan that found nothing must still report"
+    detail = summaries[0].detail
+
+    assert set(detail) >= {
+        "view_id",
+        "max_cell_score",
+        "groups",
+        "rejected_frame_span",
+        "rejected_search_room",
+        "rejected_score",
+        "surviving_candidates",
+        "relocation_attempts",
+        "frame_width",
+        "frame_height",
+    }
+    assert detail["surviving_candidates"] == 0
+    assert detail["groups"] == 1
+    assert detail["rejected_frame_span"] == 1
+    assert detail["refusal"] == "every_group_refused"
+    assert detail["frame_width"] == 320 and detail["frame_height"] == 240
+    assert detail["view_id"], "the frame has to be identifiable in the record"
+
+
+def test_the_scan_summary_says_when_nothing_was_ever_relocated() -> None:
+    """``relocation_attempts == 0`` is what makes the three zeros mean something.
+
+    A run that never chose a target reports zero rejections for search room, for
+    score and for a flat patch - not because nothing was refused, but because
+    nothing was ever attempted. Without the attempt count the three zeros read as
+    three findings.
+    """
+    policy = WakeDecisionPolicy(max_moves=45)
+    _run_policy(policy, [gradient_sky(height=240, width=320)])
+
+    detail = [
+        e.detail for e in policy.drain_events() if e.kind is WakeEventKind.SALIENCE_SCAN_SUMMARY
+    ][-1]
+    assert detail["relocation_attempts"] == 0
+    assert detail["rejected_search_room"] == 0
+    assert detail["rejected_score"] == 0
+    assert detail["rejected_flat_patch"] == 0
+
+
+def test_the_scan_summary_holds_no_pixels() -> None:
+    policy = WakeDecisionPolicy(max_moves=45)
+    _run_policy(policy, [gradient_sky(height=240, width=320)])
+
+    for event in policy.drain_events():
+        if event.kind is WakeEventKind.SALIENCE_SCAN_SUMMARY:
+            payload = event.to_dict()
+            assert json.loads(json.dumps(payload)) == payload
+            assert "image" not in json.dumps(payload)
+
+
+def test_a_geometry_change_is_recorded_as_an_event() -> None:
+    """Finding 1: the run has to say when the window is not the size it was.
+
+    The second live run printed a 3222x1928 client area at startup and reported
+    3591x1928 in its final summary, and the record had nowhere to put either
+    number. Now every observation carries both sizes and the change is an event.
+
+    This builds the change from a real observation's own geometry so that only
+    the client width differs - which is the point: the event has to name the
+    client area and the captured frame separately, not blur them into one
+    "the window changed" flag.
+    """
+    from dataclasses import replace
+
+    policy = WakeDecisionPolicy(max_moves=45)
+    policy.reset()
+    image = with_blob(scene(), y0=30, y1=70, x0=40, x1=90)
+    status = _status_with_region(width=3591, height=1928, handle=11)
+    first = Observation(index=0, timestamp=0.0, window=status, frame=frame_of(image))
+    before = replace(first.geometry, client_width=3222)
+
+    policy.decide(first)
+    policy.decide(
+        Observation(
+            index=1,
+            timestamp=1.0,
+            window=status,
+            frame=frame_of(image, 1),
+            geometry_changed_from=before,
+        )
+    )
+
+    events = [e for e in policy.drain_events() if e.kind is WakeEventKind.WINDOW_GEOMETRY_CHANGED]
+    assert len(events) == 1, "only the observation that carries a change may emit one"
+    detail = events[0].detail
+    assert detail["before"] == before.to_dict()
+    assert detail["after"]["client_width"] == 3591
+    assert detail["after"]["frame_width"] == 160, "the captured frame is the fake 160-wide one"
+    assert detail["changed"] == ["client_width"], (
+        "the height did not move, and the event must not claim it did"
+    )
+
+
+def _status_with_region(*, width: int, height: int, handle: int) -> WindowStatus:
+    from autocraft.vision.frame import ScreenRegion
+
+    return WindowStatus(
+        found=True,
+        title="Fake",
+        is_foreground=True,
+        handle=handle,
+        region=ScreenRegion(left=0, top=0, width=width, height=height),
+    )
+
+
+def test_no_geometry_event_without_a_change() -> None:
+    policy = WakeDecisionPolicy(max_moves=45)
+    _run_policy(policy, [with_blob(scene(), y0=30, y1=70, x0=40, x1=90)])
+
+    kinds = [e.kind for e in policy.drain_events()]
+    assert kinds.count(WakeEventKind.WINDOW_GEOMETRY_CHANGED) == 0
+
+
+def test_an_observation_reports_the_geometry_it_was_captured_with() -> None:
+    """Every observation carries handle, client area and captured frame size.
+
+    The client area and the captured frame are recorded separately on purpose:
+    a disagreement between them is exactly what the second live run hid.
+    """
+    status = _status_with_region(width=1280, height=720, handle=99)
+    observation = Observation(
+        index=0, timestamp=0.0, window=status, frame=frame_of(scene())
+    )
+
+    payload = observation.to_dict()
+    assert payload["window_handle"] == 99
+    assert payload["client_width"] == 1280
+    assert payload["client_height"] == 720
+    assert payload["frame_width"] == 160, "the frame is the fake 160x120 one, not the client area"
+    assert payload["frame_height"] == 120
+    assert observation.geometry.empty is False
+    assert observation.geometry_change == (), "nothing to compare against on the first look"
+
+
+def test_the_geometry_names_the_fields_that_changed() -> None:
+    from autocraft.agent.observation import WindowGeometry
+
+    before = WindowGeometry(
+        handle=11, client_width=3222, client_height=1928, frame_width=3222, frame_height=1928
+    )
+    after = WindowGeometry(
+        handle=11, client_width=3591, client_height=1928, frame_width=3591, frame_height=1928
+    )
+
+    assert after.changes_from(before) == ("client_width", "frame_width")
+    assert after.changes_from(after) == ()
+    assert after.changes_from(WindowGeometry()) == (), (
+        "an empty geometry is a missing reading, not a change"
+    )
+    assert WindowGeometry().empty is True
+    assert after.empty is False
 
 
 def test_salience_map_renders_as_rows_of_text() -> None:
@@ -1012,6 +1358,7 @@ def _build_runner(
         sleeper=lambda _: None,
         on_event=events.append,
         on_status=statuses.append,
+        run_recorder=RunRecorder.new_run(config.runs_dir, clock=clock),
     )
     return runner, recorder, policy, events, statuses
 
@@ -1105,6 +1452,145 @@ def test_the_runner_always_terminates_on_a_scene_with_nothing_in_it(tmp_path: Pa
     assert result.status in {STATUS_FAILED, STATUS_ABORTED}
     assert result.steps <= runner.max_steps
     assert result.moves_sent <= result.max_moves
+
+
+# ---------------------------------------------------------------------------
+# cadence: where the time in a step actually goes
+# ---------------------------------------------------------------------------
+
+
+def _ticking_clock(step_seconds: float = 0.005):
+    """A clock that advances a fixed amount per reading.
+
+    Cadence is the only thing in AutoCraft that is measured rather than decided,
+    so it is the one place a test needs a clock it controls. The absolute values
+    below are artefacts of how many times the loop reads the clock; what the
+    tests assert is the *shape* - which phases are recorded, that they add up
+    sensibly, and that nothing is smoothed or invented.
+    """
+    ticks = {"n": 0}
+
+    def clock() -> float:
+        ticks["n"] += 1
+        return ticks["n"] * step_seconds
+
+    return clock
+
+
+def test_the_runner_reports_how_long_each_phase_of_a_step_took(tmp_path: Path) -> None:
+    runner, recorder, _, _, _ = _build_runner(tmp_path, clock=_ticking_clock(), name="cadence")
+    result = runner.run()
+
+    cadence = result.cadence
+    # Every phase the loop can observe, named for what it is.
+    assert set(cadence) >= {
+        "capture_mean",
+        "decide_mean",
+        "act_mean",
+        "total_mean",
+        "steps_timed",
+        "moves_timed",
+    }, sorted(cadence)
+    assert "verify_mean" in cadence, "a movement that changed the frame was not timed"
+    assert "since_previous_move_mean" in cadence
+
+    # The counts say how much evidence each mean rests on, so a mean over three
+    # steps can never be read as a mean over thirty.
+    assert cadence["steps_timed"] == float(result.steps)
+    assert cadence["moves_timed"] == float(result.moves_sent)
+
+    # Means, not totals: a per-step figure cannot exceed the whole run.
+    for key, value in cadence.items():
+        assert value >= 0.0, (key, value)
+    assert cadence["total_mean"] < result.duration * 1000.0
+    assert cadence["capture_mean"] <= cadence["total_mean"]
+    assert cadence["act_mean"] <= cadence["total_mean"]
+
+
+def test_the_cadence_is_written_to_the_result_file(tmp_path: Path) -> None:
+    runner, recorder, _, _, _ = _build_runner(tmp_path, clock=_ticking_clock(), name="cadence-file")
+    result = runner.run()
+
+    payload = json.loads(recorder.result_path.read_text(encoding="utf-8"))
+    assert payload["cadence"] == result.cadence
+    assert payload["cadence"]["total_mean"] > 0.0
+
+
+def test_a_run_that_timed_nothing_reports_no_cadence_rather_than_zeros() -> None:
+    """An empty cadence says "not measured"; zeros would say "measured as zero"."""
+    result = WakeResult(run_id="untimed", experiment="WAKE-001")
+
+    assert result.cadence == {}
+    assert result.to_dict()["cadence"] == {}
+
+
+def test_unreadable_cadence_entries_are_dropped_rather_than_failing_the_record() -> None:
+    result = WakeResult(
+        run_id="partial",
+        experiment="WAKE-001",
+        cadence={"capture_mean": 12.5, "decide_mean": None, "act_mean": "nonsense"},
+    )
+
+    assert result.cadence == {"capture_mean": 12.5}
+
+
+def test_the_gap_between_movements_is_measured_and_not_smoothed(tmp_path: Path) -> None:
+    """The felt cadence is the pause between inputs, so it is recorded as given."""
+    runner, recorder, _, _, _ = _build_runner(tmp_path, clock=_ticking_clock(), name="gap")
+    result = runner.run()
+
+    payload = json.loads(recorder.result_path.read_text(encoding="utf-8"))
+    gap = payload["cadence"]["since_previous_move_mean"]
+    total = payload["cadence"]["total_mean"]
+
+    # A mean of raw intervals, not of an averaged or decayed series: it sits
+    # between the shortest and longest possible step and cannot be smaller than
+    # the first interval's floor.
+    assert 0.0 < gap
+    assert gap <= result.duration * 1000.0
+    assert total > 0.0
+
+
+def test_the_first_movement_of_a_run_is_timed_but_has_no_predecessor(tmp_path: Path) -> None:
+    """The first input has no previous movement, so its interval is zero.
+
+    Recording it as zero keeps ``moves_timed`` equal to the number of movements
+    actually sent, which is what makes the mean trustworthy.
+    """
+    runner, recorder, _, _, _ = _build_runner(tmp_path, clock=_ticking_clock(), name="first")
+    result = runner.run()
+
+    payload = json.loads(recorder.result_path.read_text(encoding="utf-8"))
+    assert payload["cadence"]["moves_timed"] == float(result.moves_sent)
+    assert result.moves_sent >= 1
+
+    intervals = [
+        row["timings"]["since_previous_move"]
+        for row in runner.run_recorder.steps
+        if "since_previous_move" in row.get("timings", {})
+    ]
+    assert intervals, "no step recorded an inter-movement interval"
+    assert intervals[0] == 0.0, intervals
+
+
+def test_every_step_records_a_phase_breakdown_without_pixels(tmp_path: Path) -> None:
+    runner, _, _, _, _ = _build_runner(tmp_path, clock=_ticking_clock(), name="phases")
+    runner.run()
+
+    rows = [row for row in runner.run_recorder.steps if "timings" in row]
+    assert rows
+    for row in rows:
+        timings = row["timings"]
+        # Every step captures a frame and asks the policy what to do, so those
+        # two phases are always present. ``act`` is only present when something
+        # was actually sent, which is why the run's final STOP step has no
+        # movement phase - reporting one would invent a movement that never
+        # happened.
+        assert set(timings) >= {"capture", "decide", "total"}
+        assert all(isinstance(value, float) for value in timings.values())
+        assert all(value >= 0.0 for value in timings.values())
+        assert timings["total"] >= timings["decide"]
+    assert any("act" in row["timings"] for row in rows), "no step timed a movement"
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ __all__ = [
     "CandidateTarget",
     "Relocation",
     "SalienceError",
+    "SalienceDiagnostics",
     "SalienceMap",
     "TargetPatch",
     "candidate_from_cells",
@@ -176,6 +177,84 @@ def _spans_frame(bbox: Sequence[int], width: int, height: int) -> bool:
         and int(bbox[2]) >= int(width)
         and int(bbox[3]) >= int(height)
     )
+
+#: How many cell scores a diagnostic summary keeps. The point is to show whether
+#: a frame was flat or merely below one threshold, which the strongest few cells
+#: answer; the whole 8x8 grid would be noise in the telemetry.
+_TOP_CELL_SCORES = 8
+
+
+@dataclass
+class SalienceDiagnostics:
+    """Why one frame's candidate pipeline produced what it produced.
+
+    Every refusal in :func:`find_candidates` and :func:`refine` used to be
+    silent. Three different rules can empty the candidate list, and they all
+    returned the same bare ``[]``, so a run that ended with "nothing visually
+    salient was found" was telling the truth and explaining nothing. This records
+    the counts where the decisions are actually made.
+
+    It is an ordinary per-call accumulator that the caller creates and passes in.
+    Nothing is module-level and nothing is shared between calls, so two frames
+    can be analysed at once, and a test can inspect one pass without resetting
+    anything.
+
+    Lifetimes differ, deliberately, and the distinction is the whole reason
+    ``relocation_attempts`` sits next to the two counters it explains:
+
+    * The scan counters describe *this frame*. They are what
+      :func:`find_candidates` did with the grid it was handed.
+    * ``rejected_search_room``, ``rejected_score`` and ``rejected_flat_patch``
+      can only be produced by :func:`refine`, which is reached only once a target
+      has been chosen and is being relocated. A run that never chose anything
+      reports all three as zero *because it never got that far*, which is exactly
+      what ``relocation_attempts == 0`` says out loud.
+    """
+
+    #: Highest raw cell salience in the frame, before any threshold was applied.
+    max_cell_score: float = 0.0
+    #: The absolute floor and the peak-relative threshold actually used.
+    min_salience: float = 0.0
+    threshold: float = 0.0
+    #: Cells at or above ``threshold``, and the connected groups they formed.
+    cells_above_threshold: int = 0
+    groups: int = 0
+    #: Refusals by the rule that refused them.
+    rejected_frame_span: int = 0
+    rejected_empty_group: int = 0
+    rejected_rank: int = 0
+    rejected_search_room: int = 0
+    rejected_score: int = 0
+    rejected_flat_patch: int = 0
+    #: Which early exit ended the frame, or ``""`` when candidates survived.
+    refusal: str = ""
+    #: Strongest cell scores, strongest first.
+    top_cell_scores: tuple[float, ...] = ()
+    #: Candidates that survived every scan check.
+    surviving_candidates: int = 0
+    #: Relocations of an already-chosen target attempted, over the whole run.
+    relocation_attempts: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable view. No pixel data, ever."""
+        return {
+            "max_cell_score": round(self.max_cell_score, 4),
+            "min_salience": self.min_salience,
+            "threshold": round(self.threshold, 4),
+            "cells_above_threshold": self.cells_above_threshold,
+            "groups": self.groups,
+            "rejected_frame_span": self.rejected_frame_span,
+            "rejected_empty_group": self.rejected_empty_group,
+            "rejected_rank": self.rejected_rank,
+            "rejected_search_room": self.rejected_search_room,
+            "rejected_score": self.rejected_score,
+            "rejected_flat_patch": self.rejected_flat_patch,
+            "surviving_candidates": self.surviving_candidates,
+            "relocation_attempts": self.relocation_attempts,
+            "refusal": self.refusal,
+            "top_cell_scores": [round(value, 4) for value in self.top_cell_scores],
+        }
+
 
 #: How much of the relocation score is given up for being far from where the
 #: target was predicted to be. Small, because the prediction is only a hint - the
@@ -593,6 +672,7 @@ def find_candidates(
     peak_fraction: float = DEFAULT_PEAK_FRACTION,
     min_salience: float = DEFAULT_MIN_SALIENCE,
     limit: int = CANDIDATE_LIMIT,
+    diagnostics: SalienceDiagnostics | None = None,
 ) -> list[CandidateTarget]:
     """Find the salient regions of one frame, strongest first.
 
@@ -611,6 +691,8 @@ def find_candidates(
         peak_fraction: Threshold as a fraction of the frame's peak salience.
         min_salience: Absolute floor; below it the frame is treated as flat.
         limit: Maximum number of candidates to return.
+        diagnostics: Optional accumulator to fill with the counts behind this
+            call's answer, so an empty result can say which rule emptied it.
 
     Returns:
         Candidates sorted by salience, strongest first. Empty for a flat frame,
@@ -625,12 +707,28 @@ def find_candidates(
     salience = salience_map(image, grid=grid) if precomputed is None else precomputed
     values = np.asarray(salience.values, dtype=np.float64)
     peak = float(values.max()) if values.size else 0.0
+    if diagnostics is not None:
+        diagnostics.max_cell_score = peak
+        diagnostics.min_salience = float(min_salience)
+        diagnostics.top_cell_scores = tuple(
+            float(value) for value in np.sort(values.reshape(-1))[::-1][:_TOP_CELL_SCORES]
+        )
     if peak < min_salience:
+        # The frame has no contrast worth naming. Recorded as its own refusal
+        # because it means something quite different from "the threshold was
+        # right and nothing cleared it".
+        if diagnostics is not None:
+            diagnostics.refusal = "flat_frame"
         return []
 
     threshold = max(min_salience, peak_fraction * peak)
     chosen = {int(index) for index in np.flatnonzero(values.reshape(-1) >= threshold)}
+    if diagnostics is not None:
+        diagnostics.threshold = threshold
+        diagnostics.cells_above_threshold = len(chosen)
     if not chosen:
+        if diagnostics is not None:
+            diagnostics.refusal = "below_threshold"
         return []
 
     features = cell_features(image, grid)
@@ -645,13 +743,19 @@ def find_candidates(
         y0 = min(box[1] for box in cell_boxes_group)
         x1 = max(box[2] for box in cell_boxes_group)
         y1 = max(box[3] for box in cell_boxes_group)
+        if diagnostics is not None:
+            diagnostics.groups += 1
         if _spans_frame((x0, y0, x1, y1), width, height):
             # Every cell cleared the threshold, which on a low-contrast frame
             # means the threshold said nothing about the scene. The whole frame
             # is not a region, and it cannot be tracked, so it is not offered.
+            if diagnostics is not None:
+                diagnostics.rejected_frame_span += 1
             continue
         total = float(weights.sum())
         if total <= 0.0:
+            if diagnostics is not None:
+                diagnostics.rejected_empty_group += 1
             continue
         centres = np.array(
             [((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0) for box in cell_boxes_group],
@@ -675,7 +779,21 @@ def find_candidates(
         )
 
     found.sort(key=lambda candidate: (-candidate.salience, candidate.bbox))
-    return found[: max(1, int(limit))]
+    kept = found[: max(1, int(limit))]
+    if diagnostics is not None:
+        diagnostics.rejected_rank = len(found) - len(kept)
+        diagnostics.surviving_candidates = len(kept)
+        if not kept and diagnostics.groups:
+            # Groups were formed and none of them survived. Which rule refused
+            # them is in the counters above; this only says that the frame did
+            # offer something and the answer is still no. It is deliberately
+            # keyed on ``groups`` rather than on ``found``, because the whole
+            # point of the second live run was a frame where the single group was
+            # refused for spanning it - and ``found`` is empty in that case, so a
+            # ``not kept and found`` test would report ``refusal == ""``, which
+            # reads as "candidates survived" beside ``surviving_candidates: 0``.
+            diagnostics.refusal = "every_group_refused"
+    return kept
 
 
 def candidate_from_cells(
@@ -684,6 +802,7 @@ def candidate_from_cells(
     *,
     grid: int = 8,
     precomputed: SalienceMap | None = None,
+    diagnostics: SalienceDiagnostics | None = None,
 ) -> CandidateTarget | None:
     """Build one candidate from an explicit set of cell indices.
 
@@ -707,6 +826,8 @@ def candidate_from_cells(
     if _spans_frame((x0, y0, x1, y1), width, height):
         # Same refusal as find_candidates: a box covering the whole frame is not
         # a region, and a frame-sized patch cannot be located.
+        if diagnostics is not None:
+            diagnostics.rejected_frame_span += 1
         return None
     weights = flat[chosen]
     total = float(weights.sum())
@@ -808,6 +929,7 @@ def refine(
     window: int | None = None,
     min_score: float = DEFAULT_REFINE_SCORE,
     scale: int = 1,
+    diagnostics: SalienceDiagnostics | None = None,
 ) -> Relocation | None:
     """Locate a patch by normalised cross-correlation.
 
@@ -828,6 +950,9 @@ def refine(
         scale: Integer block-average factor to search at. A result found at scale
             ``s`` is accurate to about ``s`` original pixels, which is why
             :func:`locate` follows a coarse pass with a full-resolution one.
+        diagnostics: Optional accumulator to fill with the reason for a refusal.
+            Only the two score-and-geometry refusals are counted; the "no such
+            thing to match" refusals are the caller's own bad input.
 
     Returns:
         A :class:`Relocation` whose ``centre`` is the target's centre, or ``None``
@@ -846,6 +971,8 @@ def refine(
     if template.ndim != 3 or template.shape[2] != 3 or template.size == 0:
         return None
     if patch.contrast < _MIN_PATCH_CONTRAST:
+        if diagnostics is not None:
+            diagnostics.rejected_flat_patch += 1
         return None
 
     factor = max(1, int(scale))
@@ -857,6 +984,7 @@ def refine(
             window=window,
             min_score=min_score,
             factor=factor,
+            diagnostics=diagnostics,
         )
 
     patch_height, patch_width = int(template.shape[0]), int(template.shape[1])
@@ -883,6 +1011,8 @@ def refine(
         # The region is exactly the patch, so there is one legal position and the
         # match would be the patch's own origin echoed back at a perfect score.
         # That is the identity, not a location.
+        if diagnostics is not None:
+            diagnostics.rejected_search_room += 1
         return None
     region = np.ascontiguousarray(image[top:bottom, left:right])
 
@@ -890,6 +1020,8 @@ def refine(
     result = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
     _, score, _, location = cv2.minMaxLoc(result)
     if not math.isfinite(float(score)) or float(score) < float(min_score):
+        if diagnostics is not None:
+            diagnostics.rejected_score += 1
         return None
     matched_origin = (left + int(location[0]), top + int(location[1]))
     return _relocation_of(patch, matched_origin, float(score), width)
@@ -903,6 +1035,7 @@ def _refine_scaled(
     window: int | None,
     min_score: float,
     factor: int,
+    diagnostics: SalienceDiagnostics | None = None,
 ) -> Relocation | None:
     """The ``scale > 1`` branch of :func:`refine`, kept separate for readability."""
     small_frame = _downscale(image, factor)
@@ -930,6 +1063,8 @@ def _refine_scaled(
         # One legal position at this scale too, so the coarse pass would return
         # the patch's own origin. Refusing lets locate fall through to the
         # full-resolution pass, which applies the same rule.
+        if diagnostics is not None:
+            diagnostics.rejected_search_room += 1
         return None
     region = np.ascontiguousarray(small_frame[top:bottom, left:right])
 
@@ -937,6 +1072,8 @@ def _refine_scaled(
     result = cv2.matchTemplate(region, small_patch, cv2.TM_CCOEFF_NORMED)
     _, score, _, location = cv2.minMaxLoc(result)
     if not math.isfinite(float(score)) or float(score) < float(min_score):
+        if diagnostics is not None:
+            diagnostics.rejected_score += 1
         return None
     # The match is accurate to about one downscaled pixel, so the origin is scaled
     # back up and the residual error is left for the full-resolution pass.
@@ -953,6 +1090,7 @@ def locate(
     coarse_scale: int = 4,
     min_score: float = DEFAULT_REFINE_SCORE,
     fine_margin: int = 12,
+    diagnostics: SalienceDiagnostics | None = None,
 ) -> Relocation | None:
     """Find a patch anywhere in a frame, to pixel precision.
 
@@ -977,6 +1115,7 @@ def locate(
         min_score: Reject a match scoring below this.
         fine_margin: Extra pixels added to the fine window beyond the coarse pass's
             error bound.
+        diagnostics: Optional accumulator to fill with the reason for a refusal.
 
     Returns:
         The best :class:`Relocation`, or ``None`` if neither pass found a match.
@@ -986,14 +1125,36 @@ def locate(
     factor = max(1, int(coarse_scale))
     coarse: Relocation | None = None
     if factor > 1:
-        coarse = refine(frame, patch, predicted=predicted, window=None, min_score=min_score, scale=factor)
+        coarse = refine(
+            frame,
+            patch,
+            predicted=predicted,
+            window=None,
+            min_score=min_score,
+            scale=factor,
+            diagnostics=diagnostics,
+        )
     if coarse is None:
         # Nothing from the coarse pass, or no coarse pass was asked for: fall back
         # to a full-resolution search, which is slower but never wrong.
-        return refine(frame, patch, predicted=predicted, window=window, min_score=min_score)
+        return refine(
+            frame,
+            patch,
+            predicted=predicted,
+            window=window,
+            min_score=min_score,
+            diagnostics=diagnostics,
+        )
 
     fine_window = max(int(fine_margin), 4 * factor) if window is None else int(window)
-    fine = refine(frame, patch, predicted=coarse.centre, window=fine_window, min_score=min_score)
+    fine = refine(
+        frame,
+        patch,
+        predicted=coarse.centre,
+        window=fine_window,
+        min_score=min_score,
+        diagnostics=diagnostics,
+    )
     if fine is None:
         return coarse
     # Prefer the full-resolution answer, but never let it be worse than the coarse
